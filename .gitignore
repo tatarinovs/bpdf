@@ -1,0 +1,10 @@
+/target/
+/.edge-test-profile/
+/prototype-output/
+/config.yaml
+/dist/
+*.xls*
+*.doc*
+*.pdf
+*.yaml
+*.txt
