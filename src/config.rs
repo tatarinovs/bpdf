@@ -2,13 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 
 pub const DEFAULT_OCR_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.6-27b";
 pub const DEFAULT_OCR_PROMPT: &str = "You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
 pub struct Config {
+    #[serde(skip)]
     pub source_path: Option<PathBuf>,
     pub groq_api_key: String,
     pub proxy: String,
@@ -31,6 +34,7 @@ pub struct Config {
     pub ocr_jobs: usize,
     pub ocr_cache: bool,
     pub ocr_cache_dir: PathBuf,
+    pub image_dpi: u32,
 }
 
 impl Default for Config {
@@ -58,6 +62,7 @@ impl Default for Config {
             ocr_jobs: 2,
             ocr_cache: true,
             ocr_cache_dir: default_cache_dir(),
+            image_dpi: 150,
         }
     }
 }
@@ -92,65 +97,28 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let mut config = Self::default();
+        let mut clean_json = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        for (index, raw_line) in text.lines().enumerate() {
-            let line = strip_yaml_comment(raw_line).trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Some((key, raw_value)) = line.split_once(':') else {
-                bail!("line {}: expected key: value", index + 1);
-            };
-            let key = key.trim();
-            let value = parse_scalar(raw_value.trim())
-                .with_context(|| format!("line {} ({key})", index + 1))?;
+        clean_json = expand_env_vars(clean_json);
 
-            match key {
-                "groq_api_key" => config.groq_api_key = value,
-                "proxy" => config.proxy = value,
-                "author" => config.author = value,
-                "creator" => config.creator = value,
-                "auto_rotate" => config.auto_rotate = parse_bool(&value, key)?,
-                "keep_icc" => config.keep_icc = parse_bool(&value, key)?,
-                "optimize" => config.optimize = parse_bool(&value, key)?,
-                "page_size" => config.page_size = value,
-                "strip_metadata" => config.strip_metadata = parse_bool(&value, key)?,
-                "ocr_model" => config.ocr_model = value,
-                "ocr_prompt" => config.ocr_prompt = value,
-                "ocr_endpoint" => config.ocr_endpoint = value,
-                "ffmpeg" => config.ffmpeg = PathBuf::from(value),
-                "powershell" => config.powershell = PathBuf::from(value),
-                "font_path" => {
-                    config.font_path = (!value.is_empty()).then(|| PathBuf::from(value));
-                }
-                "jpeg_quality" => {
-                    config.jpeg_quality = value
-                        .parse::<u8>()
-                        .with_context(|| format!("{key} must be between 1 and 100"))?;
-                    if !(1..=100).contains(&config.jpeg_quality) {
-                        bail!("{key} must be between 1 and 100");
-                    }
-                }
-                "office_timeout_seconds" => {
-                    config.office_timeout_seconds = parse_positive_u64(&value, key)?;
-                }
-                "ocr_timeout_seconds" => {
-                    config.ocr_timeout_seconds = parse_positive_u64(&value, key)?;
-                }
-                "ocr_jobs" => {
-                    config.ocr_jobs = parse_positive_u64(&value, key)?
-                        .try_into()
-                        .context("ocr_jobs is too large")?;
-                }
-                "ocr_cache" => config.ocr_cache = parse_bool(&value, key)?,
-                "ocr_cache_dir" => {
-                    if !value.is_empty() {
-                        config.ocr_cache_dir = PathBuf::from(value);
-                    }
-                }
-                _ => crate::output::warn(format!("unknown config key {key}, ignoring")),
-            }
+        let config: Self = serde_json::from_str(&clean_json)
+            .context("syntax error or invalid field type")?;
+
+        if !(1..=100).contains(&config.jpeg_quality) {
+            bail!("jpeg_quality must be between 1 and 100");
+        }
+        if config.office_timeout_seconds == 0 {
+            bail!("office_timeout_seconds must be positive");
+        }
+        if config.ocr_timeout_seconds == 0 {
+            bail!("ocr_timeout_seconds must be positive");
+        }
+        if config.ocr_jobs == 0 {
+            bail!("ocr_jobs must be positive");
         }
 
         Ok(config)
@@ -168,74 +136,48 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn config_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("config.yaml")];
+    let mut candidates = vec![PathBuf::from("config.jsonc"), PathBuf::from("config.json")];
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
-        let next_to_executable = directory.join("config.yaml");
-        if next_to_executable != candidates[0] {
-            candidates.push(next_to_executable);
+        let next_to_executable_jsonc = directory.join("config.jsonc");
+        if !candidates.contains(&next_to_executable_jsonc) {
+            candidates.push(next_to_executable_jsonc);
+        }
+        let next_to_executable_json = directory.join("config.json");
+        if !candidates.contains(&next_to_executable_json) {
+            candidates.push(next_to_executable_json);
         }
     }
     candidates
 }
 
-fn strip_yaml_comment(line: &str) -> &str {
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote == Some('"') {
-            escaped = true;
-            continue;
-        }
-        if character == '\'' || character == '"' {
-            if quote == Some(character) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(character);
+fn expand_env_vars(mut text: String) -> String {
+    let mut i = 0;
+    while let Some(start) = text[i..].find('%') {
+        let absolute_start = i + start;
+        if let Some(end) = text[absolute_start + 1..].find('%') {
+            let absolute_end = absolute_start + 1 + end;
+            let var_name = &text[absolute_start + 1..absolute_end];
+            
+            // Reject variable names with whitespace (avoids treating '% 10 % 20' as an env var)
+            if var_name.contains(|c: char| c.is_whitespace()) || var_name.is_empty() {
+                i = absolute_start + 1;
+                continue;
             }
-            continue;
+            
+            if let Ok(val) = std::env::var(var_name) {
+                let escaped = val.replace('\\', "\\\\");
+                text.replace_range(absolute_start..=absolute_end, &escaped);
+                i = absolute_start + escaped.len();
+            } else {
+                i = absolute_end + 1;
+            }
+        } else {
+            break;
         }
-        if character == '#' && quote.is_none() {
-            return &line[..index];
-        }
     }
-    line
-}
-
-fn parse_scalar(value: &str) -> Result<String> {
-    if value.starts_with('"') {
-        return serde_json::from_str(value).context("invalid double-quoted string");
-    }
-    if value.starts_with('\'') {
-        if !value.ends_with('\'') || value.len() < 2 {
-            bail!("unterminated single-quoted string");
-        }
-        return Ok(value[1..value.len() - 1].replace("''", "'"));
-    }
-    Ok(value.trim().to_owned())
-}
-
-fn parse_bool(value: &str, key: &str) -> Result<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Ok(true),
-        "false" | "no" | "off" | "0" => Ok(false),
-        _ => bail!("{key} must be true or false"),
-    }
-}
-
-fn parse_positive_u64(value: &str, key: &str) -> Result<u64> {
-    let number = value
-        .parse::<u64>()
-        .with_context(|| format!("{key} must be a positive integer"))?;
-    if number == 0 {
-        bail!("{key} must be positive");
-    }
-    Ok(number)
+    text
 }
 
 #[cfg(test)]
@@ -243,19 +185,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_flat_yaml_without_a_yaml_dependency() {
+    fn parses_json_with_comments() {
         let config = Config::parse(
             r#"
-                # comment
-                auto_rotate: true
-                keep_icc: false
-                page_size: "Letter"
-                ocr_prompt: "Keep # signs and: colons"
-                jpeg_quality: 91
-                font_path: 'C:\Windows\Fonts\arial.ttf'
-                ocr_jobs: 3
-                ocr_cache: false
-                ocr_cache_dir: 'D:\cache\bpdf'
+                {
+                    // comment
+                    "auto_rotate": true,
+                    "keep_icc": false,
+                    "page_size": "Letter",
+                    "ocr_prompt": "Keep # signs and: colons",
+                    "jpeg_quality": 91,
+                    "font_path": "C:\\Windows\\Fonts\\arial.ttf",
+                    "ocr_jobs": 3,
+                    "ocr_cache": false,
+                    "ocr_cache_dir": "D:\\cache\\bpdf"
+                }
             "#,
         )
         .unwrap();
@@ -272,10 +216,5 @@ mod tests {
             config.font_path,
             Some(PathBuf::from(r"C:\Windows\Fonts\arial.ttf"))
         );
-    }
-
-    #[test]
-    fn rejects_bad_boolean() {
-        assert!(Config::parse("optimize: perhaps").is_err());
     }
 }

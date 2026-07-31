@@ -108,6 +108,7 @@ pub fn run(config: &Config) -> Result<()> {
             keep_icc: config.keep_icc,
             ffmpeg: config.ffmpeg.clone(),
             jpeg_quality: config.jpeg_quality,
+            image_dpi: config.image_dpi,
         },
         jobs: 1,
         cache_dir: None,

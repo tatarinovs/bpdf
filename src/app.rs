@@ -98,6 +98,7 @@ fn merge(args: MergeArgs, config: &Config) -> Result<()> {
         keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
         ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
         jpeg_quality: config.jpeg_quality,
+        image_dpi: config.image_dpi,
     };
     let options = LoadOptions {
         image,
@@ -190,6 +191,7 @@ fn ocr(args: OcrArgs, config: &Config) -> Result<()> {
         keep_icc: config.keep_icc,
         ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
         jpeg_quality: config.jpeg_quality,
+        image_dpi: config.image_dpi,
     };
     let jobs = args.jobs.unwrap_or(config.ocr_jobs);
     if !(1..=64).contains(&jobs) {
@@ -271,6 +273,7 @@ fn strip(args: StripArgs, config: &Config) -> Result<()> {
         keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
         ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
         jpeg_quality: config.jpeg_quality,
+        image_dpi: config.image_dpi,
     };
     let mut failures = 0usize;
     for spec in &specs {
@@ -478,6 +481,7 @@ fn extract_images(
             keep_icc: config.keep_icc,
             ffmpeg: ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
             jpeg_quality: config.jpeg_quality,
+            image_dpi: config.image_dpi,
         },
     )?;
     let directory = output_dir.map(Path::to_path_buf).unwrap_or_else(|| {

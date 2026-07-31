@@ -22,7 +22,7 @@ pub struct LoadOptions {
 pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
     if imageconv::is_supported_image(&spec.path) {
         reject_pages(spec)?;
-        let jpeg = imageconv::to_jpeg(&spec.path, &options.image)?;
+        let jpeg = imageconv::to_jpeg(&spec.path, &options.image, Some(&options.text.page_size))?;
         return pdf::jpeg_document(jpeg, &options.text.page_size);
     }
 

@@ -18,6 +18,7 @@ pub struct ImageOptions {
     pub keep_icc: bool,
     pub ffmpeg: PathBuf,
     pub jpeg_quality: u8,
+    pub image_dpi: u32,
 }
 
 pub fn is_jpeg(path: &Path) -> bool {
@@ -39,21 +40,48 @@ pub fn is_supported_image(path: &Path) -> bool {
     )
 }
 
-pub fn to_jpeg(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
+pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
     if is_heic(path) {
         return heic_to_jpeg(path, options);
     }
 
     let input = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if is_jpeg(path) {
+    
+    // Check if we need to resize before deciding to fast-path the JPEG
+    let mut target_dimensions = None;
+    if options.image_dpi > 0 {
+        if let Some(size) = page_size {
+            if let Ok((pw, ph)) = crate::pdf::paper_size(size) {
+                let dpi = f64::from(options.image_dpi);
+                let mut max_w = (pw / 72.0 * dpi).round() as u32;
+                let mut max_h = (ph / 72.0 * dpi).round() as u32;
+                let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+                
+                if (w > h) != (max_w > max_h) {
+                    std::mem::swap(&mut max_w, &mut max_h);
+                }
+                
+                if w > max_w || h > max_h {
+                    target_dimensions = Some((max_w, max_h));
+                }
+            }
+        }
+    }
+
+    if is_jpeg(path) && target_dimensions.is_none() {
         return metadata::strip_jpeg(&input, options.keep_icc);
     }
 
-    let image = ImageReader::new(Cursor::new(input))
+    let mut image = ImageReader::new(Cursor::new(input))
         .with_guessed_format()
         .context("failed to determine image format")?
         .decode()
         .with_context(|| format!("failed to decode {}", path.display()))?;
+        
+    if let Some((max_w, max_h)) = target_dimensions {
+        image = image.resize(max_w, max_h, FilterType::Lanczos3);
+    }
+        
     encode_jpeg_on_white(&image, options.jpeg_quality)
 }
 
@@ -66,7 +94,7 @@ pub fn for_ocr(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
     ) {
         return Ok(bytes);
     }
-    to_jpeg(path, options)
+    to_jpeg(path, options, None)
 }
 
 pub fn optimize_for_ocr(bytes: &[u8]) -> Result<Vec<u8>> {

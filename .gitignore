@@ -3,8 +3,11 @@
 /prototype-output/
 /config.yaml
 /dist/
+/tools/
 *.xls*
 *.doc*
 *.pdf
-*.yaml
+*.jsonc
+*.json
+!config.example.jsonc
 *.txt
