@@ -21,8 +21,9 @@
 - прозрачные PNG-штампы: `over`, `under`, `auto`;
 - очистка метаданных JPEG/PNG без перекодирования и очистка PDF;
 - разбиение, извлечение, поворот и изменение размера страниц;
-- офлайн-извлечение текста и структурная диагностика PDF;
-- `doctor`, самостоятельные `stamp`, `optimize`, `metadata` и `images`;
+- извлечение текста и структурная диагностика PDF;
+- конвертация изображений и извлечение картинок из PDF в JPEG;
+- `doctor`, самостоятельные `stamp`, `optimize`, `metadata`, `images` и `convert`;
 - тихий режим и поток NDJSON для автоматизации;
 - glob, каталоги, списки файлов через `@list.txt`, естественная сортировка и атомарная запись.
 
@@ -85,6 +86,7 @@ bpdf optimize document.pdf
 bpdf metadata show document.pdf
 bpdf metadata set document.pdf --author "Author" --title "Title"
 bpdf images document.pdf extracted
+bpdf convert photo.heic photo.png document.pdf -o converted_jpegs
 bpdf ocr scan1.jpg scan2.jpg --jobs 2
 bpdf --json doctor
 bpdf --quiet merge *.jpg -o scans.pdf

@@ -1,5 +1,5 @@
 [Buttonbar]
-Buttoncount=10
+Buttoncount=11
 button1=%COMMANDER_PATH%\ico\merge.ico
 cmd1=%COMMANDER_PATH%\tools\bpdf\bpdf.exe merge --optimize --auto-rotate -s A4
 param1=@"%UL"
@@ -50,3 +50,7 @@ cmd10=%COMMANDER_PATH%\tools\bpdf\bpdf.exe stamp
 param10=?"%P%N" "%Pseal.png"
 iconic10=0
 menu10=Поставить штамп на PDF
+button11=%COMMANDER_PATH%\ico\convert.ico
+cmd11=%COMMANDER_PATH%\tools\bpdf\bpdf.exe convert
+param11=?"%P%N"
+menu11=Конвертировать в JPEG

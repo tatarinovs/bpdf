@@ -97,6 +97,8 @@ pub enum Command {
         #[arg(long)]
         ffmpeg: Option<PathBuf>,
     },
+    /// Convert images or PDF embedded images to JPEG.
+    Convert(ConvertArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -225,3 +227,17 @@ pub struct StripArgs {
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
 }
+
+#[derive(Debug, Args)]
+pub struct ConvertArgs {
+    /// Input files, directories, globs, or @list.txt manifests.
+    #[arg(required = true)]
+    pub inputs: Vec<String>,
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub keep_icc: Option<bool>,
+    #[arg(long)]
+    pub ffmpeg: Option<PathBuf>,
+}
+

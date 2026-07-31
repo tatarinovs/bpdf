@@ -7,7 +7,7 @@ use lopdf::Document;
 use serde_json::json;
 
 use crate::atomic::write_atomic;
-use crate::cli::{Command, MergeArgs, MetadataCommand, OcrArgs, StampArgs, StripArgs};
+use crate::cli::{Command, ConvertArgs, MergeArgs, MetadataCommand, OcrArgs, StampArgs, StripArgs};
 use crate::config::Config;
 use crate::fileset::{ExpandOptions, InputSpec, expand};
 use crate::imageconv::{self, ImageOptions};
@@ -72,6 +72,7 @@ pub fn run(command: Command, config: Config) -> Result<()> {
             output_dir,
             ffmpeg,
         } => extract_images(&input, output_dir.as_deref(), ffmpeg, &config),
+        Command::Convert(args) => run_convert(args, &config),
     }
 }
 
@@ -596,4 +597,81 @@ mod tests {
             PathBuf::from("scan_merged.pdf")
         );
     }
+}
+
+fn run_convert(args: ConvertArgs, config: &Config) -> Result<()> {
+    let specs = expand(
+        &args.inputs,
+        ExpandOptions {
+            directory_extensions: crate::fileset::MERGE_EXTENSIONS,
+        },
+    )?;
+    
+    let image_options = ImageOptions {
+        keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
+        ffmpeg: args.ffmpeg.clone().unwrap_or_else(|| config.ffmpeg.clone()),
+        jpeg_quality: config.jpeg_quality,
+        image_dpi: config.image_dpi,
+    };
+
+    let output_dir = args.out.as_deref();
+    if let Some(dir) = output_dir {
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+        } else if !dir.is_dir() {
+            bail!("--out {} is not a directory", dir.display());
+        }
+    }
+
+    let mut converted = 0usize;
+    for spec in specs {
+        let input_path = &spec.path;
+        
+        if crate::imageconv::is_supported_image(input_path) {
+            let output_path = if let Some(dir) = output_dir {
+                dir.join(input_path.file_name().unwrap()).with_extension("jpg")
+            } else {
+                input_path.with_extension("jpg")
+            };
+            
+            output::info(format!("Converting {}", input_path.display()));
+            let jpeg_bytes = crate::imageconv::to_jpeg(input_path, &image_options, None)?;
+            write_atomic(&output_path, &jpeg_bytes)?;
+            output::written(&output_path);
+            converted += 1;
+        } else if input_path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("pdf")) {
+            output::info(format!("Extracting images from PDF {}", input_path.display()));
+            
+            let data = fs::read(input_path)
+                .with_context(|| format!("failed to read {}", input_path.display()))?;
+            let document = lopdf::Document::load_mem(&data)
+                .with_context(|| format!("failed to parse {}", input_path.display()))?;
+            
+            let images = crate::ocr::extract_pdf_images(&document, &image_options)
+                .with_context(|| format!("failed to extract images from {}", input_path.display()))?;
+                
+            for image in images {
+                let suffix = format!("{}.jpg", image.label);
+                let output_path = if let Some(dir) = output_dir {
+                    dir.join(input_path.file_stem().unwrap()).with_extension(suffix)
+                } else {
+                    input_path.with_extension(suffix)
+                };
+                
+                output::info(format!("Saving extracted image to {}", output_path.display()));
+                write_atomic(&output_path, &image.bytes)?;
+                output::written(&output_path);
+                converted += 1;
+            }
+        } else {
+            crate::output::warn(format!("Skipping {}, unsupported for convert", input_path.display()));
+        }
+    }
+    
+    output::result(
+        "converted",
+        format!("Converted {converted} image(s) to JPEG"),
+        serde_json::json!({"converted_count": converted}),
+    );
+    Ok(())
 }
