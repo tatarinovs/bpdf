@@ -115,7 +115,7 @@ impl Drop for RequestPermit<'_> {
 impl OcrEngine {
     pub fn new(options: OcrOptions) -> Result<Self> {
         if options.api_key.trim().is_empty() {
-            bail!("Groq API key is empty; set groq_api_key or pass --groq-key");
+            bail!("Groq API key is empty; set groq_api_key in config");
         }
         if options.jobs == 0 {
             bail!("OCR jobs must be at least 1");

@@ -2,7 +2,7 @@
 Buttoncount=10
 button1=%COMMANDER_PATH%\ico\merge.ico
 cmd1=%COMMANDER_PATH%\tools\bpdf\bpdf.exe merge --optimize --auto-rotate -s A4
-param1=""%UL""
+param1=@"%UL"
 iconic1=0
 menu1=Объединить в PDF
 button2=%COMMANDER_PATH%\ico\ocr.ico
@@ -12,7 +12,7 @@ iconic2=0
 menu2=Распознать текст (OCR)
 button3=%COMMANDER_PATH%\ico\strip.ico
 cmd3=%COMMANDER_PATH%\tools\bpdf\bpdf.exe strip
-param3=""%UL""
+param3=@"%UL"
 iconic3=0
 menu3=Очистить метаданные (Strip)
 button4=%COMMANDER_PATH%\ico\split.ico

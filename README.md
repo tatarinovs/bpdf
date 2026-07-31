@@ -24,7 +24,7 @@
 - офлайн-извлечение текста и структурная диагностика PDF;
 - `doctor`, самостоятельные `stamp`, `optimize`, `metadata` и `images`;
 - тихий режим и поток NDJSON для автоматизации;
-- glob, каталоги, манифесты, естественная сортировка и атомарная запись.
+- glob, каталоги, списки файлов через `@list.txt`, естественная сортировка и атомарная запись.
 
 Если все входы `.txt`/`.md`, `merge` склеивает их как текст. В смешанном наборе
 текст рендерится в страницы PDF.
@@ -68,6 +68,7 @@ $env:RC_EXE = "D:\Windows Kits\10\bin\x64\rc.exe"
 
 ```powershell
 bpdf merge scan.jpg invoice.pdf:1-3 notes.txt -o result.pdf
+bpdf merge @list.txt -o result.pdf
 bpdf merge *.jpg -s A4 --auto-rotate --optimize -o scans.pdf
 bpdf merge invoice.pdf --stamp seal.png --stamp-pos br --stamp-op 0.6
 bpdf strip photo.jpg

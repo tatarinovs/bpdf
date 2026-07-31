@@ -203,7 +203,7 @@ fn ocr(args: OcrArgs, config: &Config) -> Result<()> {
             .unwrap_or_else(|| config.ocr_cache_dir.clone())
     });
     let engine = OcrEngine::new(OcrOptions {
-        api_key: args.groq_key.unwrap_or_else(|| config.groq_api_key.clone()),
+        api_key: config.groq_api_key.clone(),
         proxy: args.proxy.unwrap_or_else(|| config.proxy.clone()),
         model: args.model.unwrap_or_else(|| config.ocr_model.clone()),
         prompt: args.prompt.unwrap_or_else(|| config.ocr_prompt.clone()),

@@ -11,3 +11,7 @@
 *.json
 !config.example.jsonc
 *.txt
+*.br2
+*.xip
+*.zip
+*.7z

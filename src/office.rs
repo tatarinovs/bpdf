@@ -148,6 +148,7 @@ try {
     $word = New-Object -ComObject Word.Application
     $word.Visible = $false
     $word.DisplayAlerts = 0
+    $word.AutomationSecurity = 3
     $document = $word.Documents.Open($env:BPDF_OFFICE_INPUT)
     if ($null -eq $document) {
         # Some Word/PowerShell combinations perform Open successfully but do
@@ -185,6 +186,7 @@ try {
     $excel = New-Object -ComObject Excel.Application
     $excel.Visible = $false
     $excel.DisplayAlerts = $false
+    $excel.AutomationSecurity = 3
     $workbook = $excel.Workbooks.Open($env:BPDF_OFFICE_INPUT)
     if ($null -eq $workbook) {
         throw 'Excel returned no workbook object'

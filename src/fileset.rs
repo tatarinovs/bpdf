@@ -26,18 +26,22 @@ pub fn expand(arguments: &[String], options: ExpandOptions) -> Result<Vec<InputS
     let mut files = Vec::new();
 
     for argument in arguments {
-        let (base, pages) = split_pdf_range(argument);
-        let path = Path::new(&base);
-
-        if is_manifest(path) {
-            for entry in read_manifest(path)? {
+        if let Some(manifest_arg) = argument.strip_prefix('@') {
+            let (manifest_path, pages) = split_pdf_range(manifest_arg);
+            for entry in read_manifest(Path::new(&manifest_path))? {
                 let (entry_path, entry_pages) = split_pdf_range(&entry);
                 files.push(InputSpec {
                     path: PathBuf::from(entry_path),
                     pages: entry_pages.or_else(|| pages.clone()),
                 });
             }
-        } else if path.is_dir() {
+            continue;
+        }
+
+        let (base, pages) = split_pdf_range(argument);
+        let path = Path::new(&base);
+
+        if path.is_dir() {
             let mut entries = fs::read_dir(path)
                 .with_context(|| format!("failed to read directory {}", path.display()))?
                 .filter_map(|entry| entry.ok())
@@ -148,38 +152,7 @@ fn natural_compare(left: &str, right: &str) -> Ordering {
     left.len().cmp(&right.len())
 }
 
-fn is_manifest(path: &Path) -> bool {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "lst" | "tmp" => true,
-        "txt" => first_manifest_entry_exists(path),
-        _ => false,
-    }
-}
 
-fn first_manifest_entry_exists(path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return true;
-    };
-    contents
-        .trim_start_matches('\u{feff}')
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .is_some_and(|line| {
-            let (entry, _) = split_pdf_range(line);
-            Path::new(&entry).exists()
-                || (entry.contains(['*', '?'])
-                    && glob(&entry)
-                        .ok()
-                        .is_some_and(|mut matches| matches.next().is_some()))
-        })
-}
 
 fn read_manifest(path: &Path) -> Result<Vec<String>> {
     let contents = fs::read_to_string(path)

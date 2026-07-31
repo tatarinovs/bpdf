@@ -9,7 +9,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     propagate_version = true
 )]
 pub struct Cli {
-    /// Configuration file (defaults to config.yaml in cwd or beside bpdf).
+    /// Configuration file (defaults to config.jsonc in cwd or beside bpdf).
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
@@ -141,6 +141,7 @@ pub struct StampArgs {
 
 #[derive(Debug, Args)]
 pub struct MergeArgs {
+    /// Input files, directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
@@ -184,12 +185,11 @@ pub struct MergeArgs {
 
 #[derive(Debug, Args)]
 pub struct OcrArgs {
+    /// Input files, directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
     #[arg(short, long)]
     pub out: Option<PathBuf>,
-    #[arg(long)]
-    pub groq_key: Option<String>,
     #[arg(long)]
     pub proxy: Option<String>,
     #[arg(long)]
@@ -215,6 +215,7 @@ pub struct OcrArgs {
 
 #[derive(Debug, Args)]
 pub struct StripArgs {
+    /// Input files, directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
     #[arg(short, long)]
