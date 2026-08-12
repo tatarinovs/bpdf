@@ -232,5 +232,8 @@ pub struct ConvertArgs {
     pub keep_icc: Option<bool>,
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
+    /// Allow output to overwrite an input file (e.g. jpg -> jpg in place).
+    #[arg(long)]
+    pub force: bool,
 }
 

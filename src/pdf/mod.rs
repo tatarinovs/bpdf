@@ -182,12 +182,15 @@ pub fn metadata_report(path: &Path) -> Result<Value> {
 }
 
 pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
-    let document =
-        Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let data = std::fs::read(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let document = Document::load_mem(&data)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
     let page_count = document.get_pages().len();
     if page_count == 0 {
         bail!("PDF contains no pages");
     }
+    drop(document);
 
     let stem = path
         .file_stem()
@@ -197,10 +200,10 @@ pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut outputs = Vec::with_capacity(page_count);
 
     for page in 1..=page_count {
-        // Reloading is deliberately simple and reliable for the prototype:
+        // Re-parsing from the cached byte buffer is simple and reliable:
         // delete_pages mutates the shared page tree, so clones would need a
         // deep audit before being trusted for arbitrary PDFs.
-        let mut one_page = Document::load(path)?;
+        let mut one_page = Document::load_mem(&data)?;
         select_pages(&mut one_page, &page.to_string())?;
         let bytes = save_to_bytes(&mut one_page)?;
         let output = output_dir.join(format!("{stem}_{page:0width$}.pdf"));

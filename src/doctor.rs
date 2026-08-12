@@ -7,7 +7,6 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use crate::config::Config;
-use crate::imageconv::ImageOptions;
 use crate::ocr::{OcrEngine, OcrOptions};
 use crate::office::{self, OfficeOptions};
 use crate::{output, process, textpdf};
@@ -104,13 +103,9 @@ pub fn run(config: &Config) -> Result<()> {
         endpoint: config.ocr_endpoint.clone(),
         timeout: Duration::from_secs(config.ocr_timeout_seconds),
         force_image_ocr: false,
-        image: ImageOptions {
-            keep_icc: config.keep_icc,
-            ffmpeg: config.ffmpeg.clone(),
-            jpeg_quality: config.jpeg_quality,
-            image_dpi: config.image_dpi,
-        },
+        image: config.image_options(None, None),
         jobs: 1,
+        max_tokens: config.ocr_max_tokens,
         cache_dir: None,
     })
     .and_then(|engine| engine.check_connection());

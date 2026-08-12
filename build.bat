@@ -49,14 +49,14 @@ if errorlevel 1 goto :error
 
 echo [3/4] Building optimized Windows executable...
 set "BPDF_WINDOWS_RES=%RESOURCE_FILE%"
-cargo build --release --locked
+cargo build --release
 if errorlevel 1 goto :error
 
 echo [4/4] Preparing dist directory...
 if not exist "%CD%\dist" mkdir "%CD%\dist"
 if errorlevel 1 goto :error
 copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
-copy /y "%CD%\config.example.yaml" "%CD%\dist\config.example.yaml" >nul || goto :error
+copy /y "%CD%\config.example.jsonc" "%CD%\dist\config.example.jsonc" >nul || goto :error
 copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
 
 echo.

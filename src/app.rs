@@ -90,12 +90,7 @@ fn merge(args: MergeArgs, config: &Config) -> Result<()> {
         page_size.to_ascii_lowercase().as_str(),
         "none" | "original" | "keep"
     );
-    let image = ImageOptions {
-        keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
-        ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
-        jpeg_quality: config.jpeg_quality,
-        image_dpi: config.image_dpi,
-    };
+    let image = config.image_options(args.keep_icc, args.ffmpeg);
     let options = LoadOptions {
         image,
         office: OfficeOptions {
@@ -103,11 +98,7 @@ fn merge(args: MergeArgs, config: &Config) -> Result<()> {
             timeout: Duration::from_secs(config.office_timeout_seconds),
         },
         text: TextOptions {
-            page_size: if keep_original_size {
-                "A4".to_owned()
-            } else {
-                page_size.clone()
-            },
+            page_size: page_size.clone(),
             font_path: config.font_path.clone(),
             ..TextOptions::default()
         },
@@ -192,12 +183,7 @@ fn ocr(args: OcrArgs, config: &Config) -> Result<()> {
         bail!("page ranges are not supported by ocr; extract the pages first");
     }
 
-    let image = ImageOptions {
-        keep_icc: config.keep_icc,
-        ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
-        jpeg_quality: config.jpeg_quality,
-        image_dpi: config.image_dpi,
-    };
+    let image = config.image_options(None, args.ffmpeg);
     let jobs = args.jobs.unwrap_or(config.ocr_jobs);
     if !(1..=64).contains(&jobs) {
         bail!("--jobs must be between 1 and 64");
@@ -217,6 +203,7 @@ fn ocr(args: OcrArgs, config: &Config) -> Result<()> {
         force_image_ocr: args.force_ocr,
         image,
         jobs,
+        max_tokens: config.ocr_max_tokens,
         cache_dir,
     })?;
 
@@ -274,12 +261,7 @@ fn strip(args: StripArgs, config: &Config) -> Result<()> {
     if args.out.is_some() && specs.len() != 1 {
         bail!("--out is only valid with one input file");
     }
-    let options = ImageOptions {
-        keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
-        ffmpeg: args.ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
-        jpeg_quality: config.jpeg_quality,
-        image_dpi: config.image_dpi,
-    };
+    let options = config.image_options(args.keep_icc, args.ffmpeg);
     let mut failures = 0usize;
     for spec in &specs {
         if let Err(error) = strip_one(spec, args.out.as_deref(), &options) {
@@ -313,6 +295,9 @@ fn strip_one(spec: &InputSpec, explicit_out: Option<&Path>, options: &ImageOptio
             input.clone()
         }
     });
+    if same_path(input, &output) {
+        output::info(format!("Stripping metadata in-place: {}", input.display()));
+    }
     let bytes = if imageconv::is_heic(input) {
         imageconv::heic_to_jpeg(input, options)?
     } else if imageconv::is_jpeg(input) {
@@ -360,11 +345,12 @@ where
     F: FnOnce(&mut Document) -> Result<()>,
 {
     let output = output.unwrap_or_else(|| suffixed_output(input, suffix, "pdf"));
-    if same_path(input, &output) {
-        bail!("refusing to overwrite the input PDF");
-    }
+    // Read into memory so we can safely write back to the same path.
+    let data =
+        fs::read(input).with_context(|| format!("failed to read {}", input.display()))?;
     let mut document =
-        Document::load(input).with_context(|| format!("failed to load {}", input.display()))?;
+        Document::load_mem(&data).with_context(|| format!("failed to parse {}", input.display()))?;
+    drop(data);
     edit(&mut document)?;
     write_atomic(&output, &pdf::save_to_bytes(&mut document)?)?;
     output::written(&output);
@@ -565,6 +551,53 @@ mod tests {
             PathBuf::from("scan_merged.pdf")
         );
     }
+
+    #[test]
+    fn convert_refuses_to_overwrite_input_without_force() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("photo.jpg");
+        sample_jpeg_file(&input);
+
+        let error = run_convert(
+            ConvertArgs {
+                inputs: vec![input.to_string_lossy().into_owned()],
+                out: None,
+                keep_icc: None,
+                ffmpeg: None,
+                force: false,
+            },
+            &Config::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--force"));
+    }
+
+    #[test]
+    fn convert_overwrites_input_with_force() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("photo.jpg");
+        sample_jpeg_file(&input);
+
+        run_convert(
+            ConvertArgs {
+                inputs: vec![input.to_string_lossy().into_owned()],
+                out: None,
+                keep_icc: None,
+                ffmpeg: None,
+                force: true,
+            },
+            &Config::default(),
+        )
+        .unwrap();
+        assert!(input.is_file());
+    }
+
+    fn sample_jpeg_file(path: &Path) {
+        use image::{ImageFormat, Rgb, RgbImage};
+        image::DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 4, Rgb([10, 20, 30])))
+            .save_with_format(path, ImageFormat::Jpeg)
+            .unwrap();
+    }
 }
 
 fn run_convert(args: ConvertArgs, config: &Config) -> Result<()> {
@@ -575,12 +608,7 @@ fn run_convert(args: ConvertArgs, config: &Config) -> Result<()> {
         },
     )?;
     
-    let image_options = ImageOptions {
-        keep_icc: args.keep_icc.unwrap_or(config.keep_icc),
-        ffmpeg: args.ffmpeg.clone().unwrap_or_else(|| config.ffmpeg.clone()),
-        jpeg_quality: config.jpeg_quality,
-        image_dpi: config.image_dpi,
-    };
+    let image_options = config.image_options(args.keep_icc, args.ffmpeg.clone());
 
     let output_dir = args.out.as_deref();
     if let Some(dir) = output_dir {
@@ -594,14 +622,23 @@ fn run_convert(args: ConvertArgs, config: &Config) -> Result<()> {
     let mut converted = 0usize;
     for spec in specs {
         let input_path = &spec.path;
-        
+
         if crate::imageconv::is_supported_image(input_path) {
+            let file_name = input_path
+                .file_name()
+                .with_context(|| format!("{} has no file name", input_path.display()))?;
             let output_path = if let Some(dir) = output_dir {
-                dir.join(input_path.file_name().unwrap()).with_extension("jpg")
+                dir.join(file_name).with_extension("jpg")
             } else {
                 input_path.with_extension("jpg")
             };
-            
+            if !args.force && same_path(input_path, &output_path) {
+                bail!(
+                    "{} would overwrite the input; pass --force to convert in place",
+                    output_path.display()
+                );
+            }
+
             output::info(format!("Converting {}", input_path.display()));
             let jpeg_bytes = crate::imageconv::to_jpeg(input_path, &image_options, None)?;
             write_atomic(&output_path, &jpeg_bytes)?;
@@ -609,23 +646,26 @@ fn run_convert(args: ConvertArgs, config: &Config) -> Result<()> {
             converted += 1;
         } else if input_path.extension().and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("pdf")) {
             output::info(format!("Extracting images from PDF {}", input_path.display()));
-            
+
             let data = fs::read(input_path)
                 .with_context(|| format!("failed to read {}", input_path.display()))?;
             let document = lopdf::Document::load_mem(&data)
                 .with_context(|| format!("failed to parse {}", input_path.display()))?;
-            
+
             let images = crate::ocr::extract_pdf_images(&document, &image_options)
                 .with_context(|| format!("failed to extract images from {}", input_path.display()))?;
-                
+
+            let file_stem = input_path
+                .file_stem()
+                .with_context(|| format!("{} has no file stem", input_path.display()))?;
             for image in images {
                 let suffix = format!("{}.jpg", image.label);
                 let output_path = if let Some(dir) = output_dir {
-                    dir.join(input_path.file_stem().unwrap()).with_extension(suffix)
+                    dir.join(file_stem).with_extension(suffix)
                 } else {
                     input_path.with_extension(suffix)
                 };
-                
+
                 output::info(format!("Saving extracted image to {}", output_path.display()));
                 write_atomic(&output_path, &image.bytes)?;
                 output::written(&output_path);

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::imageconv::ImageOptions;
+
 pub const DEFAULT_OCR_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.6-27b";
 pub const DEFAULT_OCR_PROMPT: &str = "You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.";
@@ -32,6 +34,7 @@ pub struct Config {
     pub office_timeout_seconds: u64,
     pub ocr_timeout_seconds: u64,
     pub ocr_jobs: usize,
+    pub ocr_max_tokens: u32,
     pub ocr_cache: bool,
     pub ocr_cache_dir: PathBuf,
     pub image_dpi: u32,
@@ -60,6 +63,7 @@ impl Default for Config {
             office_timeout_seconds: 120,
             ocr_timeout_seconds: 120,
             ocr_jobs: 2,
+            ocr_max_tokens: 4096,
             ocr_cache: true,
             ocr_cache_dir: default_cache_dir(),
             image_dpi: 150,
@@ -68,6 +72,20 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Build `ImageOptions` from config with optional CLI overrides.
+    pub fn image_options(
+        &self,
+        keep_icc: Option<bool>,
+        ffmpeg: Option<PathBuf>,
+    ) -> ImageOptions {
+        ImageOptions {
+            keep_icc: keep_icc.unwrap_or(self.keep_icc),
+            ffmpeg: ffmpeg.unwrap_or_else(|| self.ffmpeg.clone()),
+            jpeg_quality: self.jpeg_quality,
+            image_dpi: self.image_dpi,
+        }
+    }
+
     pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
         if let Some(path) = explicit_path {
             let text = fs::read_to_string(path)
@@ -97,11 +115,7 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let mut clean_json = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut clean_json = strip_jsonc_comments(text);
 
         clean_json = expand_env_vars(clean_json);
 
@@ -119,6 +133,9 @@ impl Config {
         }
         if config.ocr_jobs == 0 {
             bail!("ocr_jobs must be positive");
+        }
+        if config.ocr_max_tokens == 0 {
+            bail!("ocr_max_tokens must be positive");
         }
 
         Ok(config)
@@ -152,6 +169,45 @@ fn config_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// Strip `//` comments from JSONC text, respecting string literals.
+fn strip_jsonc_comments(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        // Full-line comment.
+        if trimmed.starts_with("//") {
+            output.push('\n');
+            continue;
+        }
+        // Scan for inline `//` outside of string literals.
+        let mut in_string = false;
+        let mut escape = false;
+        let bytes = line.as_bytes();
+        let mut cut = line.len();
+        for (index, &byte) in bytes.iter().enumerate() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if byte == b'\\' && in_string {
+                escape = true;
+                continue;
+            }
+            if byte == b'"' {
+                in_string = !in_string;
+                continue;
+            }
+            if !in_string && byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                cut = index;
+                break;
+            }
+        }
+        output.push_str(&line[..cut]);
+        output.push('\n');
+    }
+    output
+}
+
 fn expand_env_vars(mut text: String) -> String {
     let mut i = 0;
     while let Some(start) = text[i..].find('%') {
@@ -167,7 +223,7 @@ fn expand_env_vars(mut text: String) -> String {
             }
             
             if let Ok(val) = std::env::var(var_name) {
-                let escaped = val.replace('\\', "\\\\");
+                let escaped = val.replace('\\', "\\\\").replace('"', "\\\"" );
                 text.replace_range(absolute_start..=absolute_end, &escaped);
                 i = absolute_start + escaped.len();
             } else {
@@ -216,5 +272,61 @@ mod tests {
             config.font_path,
             Some(PathBuf::from(r"C:\Windows\Fonts\arial.ttf"))
         );
+    }
+
+    #[test]
+    fn inline_comment_is_stripped() {
+        let config = Config::parse(
+            r#"{
+                "jpeg_quality": 80 // high quality
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.jpeg_quality, 80);
+    }
+
+    #[test]
+    fn url_inside_string_is_preserved() {
+        let config = Config::parse(
+            r#"{
+                "ocr_endpoint": "https://api.groq.com/openai/v1/chat/completions"
+            }"#,
+        )
+        .unwrap();
+        assert!(config.ocr_endpoint.starts_with("https://"));
+    }
+
+    #[test]
+    fn expand_env_vars_replaces_known_variable() {
+        unsafe { std::env::set_var("BPDF_TEST_VAR", "hello") };
+        let result = expand_env_vars("%BPDF_TEST_VAR% world".to_owned());
+        assert_eq!(result, "hello world");
+        unsafe { std::env::remove_var("BPDF_TEST_VAR") };
+    }
+
+    #[test]
+    fn expand_env_vars_ignores_unknown_variable() {
+        let result = expand_env_vars("%BPDF_DEFINITELY_NOT_SET% world".to_owned());
+        assert_eq!(result, "%BPDF_DEFINITELY_NOT_SET% world");
+    }
+
+    #[test]
+    fn expand_env_vars_rejects_whitespace_names() {
+        let result = expand_env_vars("% not a var % rest".to_owned());
+        assert_eq!(result, "% not a var % rest");
+    }
+
+    #[test]
+    fn expand_env_vars_escapes_backslashes_and_quotes() {
+        unsafe { std::env::set_var("BPDF_PATH_VAR", r#"C:\dir\"file"#) };
+        let result = expand_env_vars(r#"{"key": "%BPDF_PATH_VAR%"}"#.to_owned());
+        assert!(result.contains(r#"C:\\dir\\\"file"#));
+        unsafe { std::env::remove_var("BPDF_PATH_VAR") };
+    }
+
+    #[test]
+    fn max_tokens_default_is_4096() {
+        let config = Config::default();
+        assert_eq!(config.ocr_max_tokens, 4096);
     }
 }

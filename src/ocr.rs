@@ -34,6 +34,7 @@ pub struct OcrOptions {
     pub force_image_ocr: bool,
     pub image: ImageOptions,
     pub jobs: usize,
+    pub max_tokens: u32,
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -316,7 +317,7 @@ impl OcrEngine {
                 ]
             }],
             "temperature": 0.0,
-            "max_tokens": 4096
+            "max_tokens": self.options.max_tokens
         });
         let authorization = format!("Bearer {}", self.options.api_key);
 

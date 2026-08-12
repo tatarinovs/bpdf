@@ -212,14 +212,18 @@ fn wrap_text(text: &str, face: &Face<'_>, font_size: f64, max_width: f64) -> Vec
         }
 
         let mut line = String::new();
+        let mut line_width = 0.0;
         for word in paragraph.split_inclusive(char::is_whitespace) {
-            let candidate = format!("{line}{word}");
-            if line.is_empty() || text_width(&candidate, face, font_size) <= max_width {
-                line = candidate;
+            let word_width = text_width(word, face, font_size);
+            if line.is_empty() || line_width + word_width <= max_width {
+                line.push_str(word);
+                line_width += word_width;
                 continue;
             }
             output.extend(break_long_line(line.trim_end(), face, font_size, max_width));
-            line = word.trim_start().to_owned();
+            let trimmed = word.trim_start();
+            line = trimmed.to_owned();
+            line_width = text_width(trimmed, face, font_size);
         }
         output.extend(break_long_line(line.trim_end(), face, font_size, max_width));
     }
@@ -234,13 +238,20 @@ fn break_long_line(line: &str, face: &Face<'_>, font_size: f64, max_width: f64) 
 
     let mut result = Vec::new();
     let mut chunk = String::new();
+    let mut chunk_width = 0.0;
+    let units = f64::from(face.units_per_em());
     for character in line.chars() {
-        let mut candidate = chunk.clone();
-        candidate.push(character);
-        if !chunk.is_empty() && text_width(&candidate, face, font_size) > max_width {
+        let glyph = face
+            .glyph_index(character)
+            .or_else(|| face.glyph_index('?'))
+            .unwrap_or(GlyphId(0));
+        let char_width = f64::from(face.glyph_hor_advance(glyph).unwrap_or(0)) * font_size / units;
+        if !chunk.is_empty() && chunk_width + char_width > max_width {
             result.push(std::mem::take(&mut chunk));
+            chunk_width = 0.0;
         }
         chunk.push(character);
+        chunk_width += char_width;
     }
     if !chunk.is_empty() {
         result.push(chunk);

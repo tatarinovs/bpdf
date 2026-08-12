@@ -1,4 +1,6 @@
 /// Dependency-free SHA-256 for stable OCR cache keys.
+/// Processes input parts in streaming 64-byte blocks to avoid copying
+/// large images into a single contiguous buffer.
 pub fn sha256_hex(parts: &[&[u8]]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -17,20 +19,7 @@ pub fn sha256_hex(parts: &[&[u8]]) -> String {
         0xc67178f2,
     ];
 
-    let byte_len = parts.iter().map(|part| part.len()).sum::<usize>();
-    let mut message = Vec::with_capacity((byte_len + 72).next_multiple_of(64));
-    for part in parts {
-        message.extend_from_slice(part);
-    }
-    let bit_len = (message.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut state = INITIAL;
-    for block in message.chunks_exact(64) {
+    fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
         let mut words = [0u32; 64];
         for (index, bytes) in block.chunks_exact(4).enumerate() {
             words[index] = u32::from_be_bytes(bytes.try_into().expect("four-byte chunk"));
@@ -48,7 +37,7 @@ pub fn sha256_hex(parts: &[&[u8]]) -> String {
                 .wrapping_add(s1);
         }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
         for index in 0..64 {
             let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let choice = (e & f) ^ ((!e) & g);
@@ -79,6 +68,41 @@ pub fn sha256_hex(parts: &[&[u8]]) -> String {
         state[7] = state[7].wrapping_add(h);
     }
 
+    let byte_len: usize = parts.iter().map(|part| part.len()).sum();
+    let bit_len = (byte_len as u64).wrapping_mul(8);
+    let mut state = INITIAL;
+    let mut buffer = [0u8; 64];
+    let mut buffered = 0usize;
+
+    // Stream full blocks directly from input parts.
+    for part in parts {
+        let mut remaining = *part;
+        while !remaining.is_empty() {
+            let space = 64 - buffered;
+            let take = remaining.len().min(space);
+            buffer[buffered..buffered + take].copy_from_slice(&remaining[..take]);
+            buffered += take;
+            remaining = &remaining[take..];
+            if buffered == 64 {
+                compress_block(&mut state, &buffer);
+                buffered = 0;
+            }
+        }
+    }
+
+    // Pad the final block(s).
+    buffer[buffered] = 0x80;
+    buffered += 1;
+    if buffered > 56 {
+        buffer[buffered..64].fill(0);
+        compress_block(&mut state, &buffer);
+        buffer = [0u8; 64];
+        buffered = 0;
+    }
+    buffer[buffered..56].fill(0);
+    buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+    compress_block(&mut state, &buffer);
+
     state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
@@ -96,5 +120,15 @@ mod tests {
             sha256_hex(&[b"a", b"bc"]),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn streaming_matches_large_input() {
+        // Verify that a multi-block message produces the correct hash.
+        let block = vec![0x61u8; 200]; // "aaa..." 200 bytes, spans multiple 64-byte blocks
+        let expected = sha256_hex(&[&block]);
+        // Same data split across multiple parts.
+        let split = sha256_hex(&[&block[..50], &block[50..130], &block[130..]]);
+        assert_eq!(expected, split);
     }
 }
