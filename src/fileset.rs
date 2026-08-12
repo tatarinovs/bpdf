@@ -53,6 +53,7 @@ pub fn expand(arguments: &[String], options: ExpandOptions) -> Result<Vec<InputS
                 })
                 .map(|entry| entry.path())
                 .filter(|entry| extension_allowed(entry, options.directory_extensions))
+                .filter(|entry| !is_office_lock_file(entry))
                 .collect::<Vec<_>>();
             natural_sort(&mut entries);
             files.extend(entries.into_iter().map(|path| InputSpec {
@@ -63,6 +64,7 @@ pub fn expand(arguments: &[String], options: ExpandOptions) -> Result<Vec<InputS
             let mut matches = glob(&base)
                 .with_context(|| format!("invalid glob pattern {base}"))?
                 .filter_map(|entry| entry.ok())
+                .filter(|entry| !is_office_lock_file(entry))
                 .collect::<Vec<_>>();
             natural_sort(&mut matches);
             if matches.is_empty() {
@@ -105,6 +107,13 @@ fn extension_allowed(path: &Path, extensions: &[&str]) -> bool {
                 .iter()
                 .any(|allowed| extension.eq_ignore_ascii_case(allowed))
         })
+}
+
+fn is_office_lock_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with("~$"))
+        .unwrap_or(false)
 }
 
 fn natural_sort(paths: &mut [PathBuf]) {

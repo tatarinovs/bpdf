@@ -23,7 +23,7 @@
 - разбиение, извлечение, поворот и изменение размера страниц;
 - извлечение текста и структурная диагностика PDF;
 - конвертация изображений и извлечение картинок из PDF в JPEG;
-- `doctor`, самостоятельные `stamp`, `optimize`, `metadata`, `images` и `convert`;
+- `doctor`, самостоятельные `stamp`, `optimize`, `metadata` и `convert`;
 - тихий режим и поток NDJSON для автоматизации;
 - glob, каталоги, списки файлов через `@list.txt`, естественная сортировка и атомарная запись.
 
@@ -85,7 +85,6 @@ bpdf stamp document.pdf seal.png --opacity 0.5
 bpdf optimize document.pdf
 bpdf metadata show document.pdf
 bpdf metadata set document.pdf --author "Author" --title "Title"
-bpdf images document.pdf extracted
 bpdf convert photo.heic photo.png document.pdf -o converted_jpegs
 bpdf ocr scan1.jpg scan2.jpg --jobs 2
 bpdf --json doctor

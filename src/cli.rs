@@ -90,13 +90,6 @@ pub enum Command {
         #[command(subcommand)]
         command: MetadataCommand,
     },
-    /// Extract embedded images from a PDF.
-    Images {
-        input: PathBuf,
-        output_dir: Option<PathBuf>,
-        #[arg(long)]
-        ffmpeg: Option<PathBuf>,
-    },
     /// Convert images or PDF embedded images to JPEG.
     Convert(ConvertArgs),
 }

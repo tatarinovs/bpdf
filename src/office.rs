@@ -127,6 +127,18 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
                 path.display()
             )
         })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stderr.contains("80080005") || stdout.contains("80080005") {
+            bail!("Microsoft Office COM server is stuck (error 80080005). Please close invisible WINWORD.EXE/EXCEL.EXE processes via Task Manager or dismiss open Office dialogs.");
+        }
+        if stderr.contains("8001010A") || stdout.contains("8001010A") {
+            bail!("Microsoft Office is busy (error 8001010A). Please close open Office dialogs and try again.");
+        }
+    }
+
     process::require_success(output, "Office conversion")?;
 
     let pdf = fs::read(&output_path)
@@ -142,6 +154,10 @@ const WORD_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+    Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
+}
 $word = $null
 $document = $null
 try {
@@ -149,7 +165,7 @@ try {
     $word.Visible = $false
     $word.DisplayAlerts = 0
     $word.AutomationSecurity = 3
-    $document = $word.Documents.Open($env:BPDF_OFFICE_INPUT)
+    $document = $word.Documents.Open($env:BPDF_OFFICE_INPUT, $false, $true)
     if ($null -eq $document) {
         # Some Word/PowerShell combinations perform Open successfully but do
         # not marshal its return value. ActiveDocument is then authoritative.
@@ -180,6 +196,10 @@ const EXCEL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+    Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
+}
 $excel = $null
 $workbook = $null
 try {
@@ -187,7 +207,7 @@ try {
     $excel.Visible = $false
     $excel.DisplayAlerts = $false
     $excel.AutomationSecurity = 3
-    $workbook = $excel.Workbooks.Open($env:BPDF_OFFICE_INPUT)
+    $workbook = $excel.Workbooks.Open($env:BPDF_OFFICE_INPUT, 0, $true)
     if ($null -eq $workbook) {
         throw 'Excel returned no workbook object'
     }

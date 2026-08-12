@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::fileset::{ExpandOptions, InputSpec, expand};
 use crate::imageconv::{self, ImageOptions};
 use crate::input::{self, LoadOptions};
-use crate::ocr::{self, OcrEngine, OcrOptions};
+use crate::ocr::{OcrEngine, OcrOptions};
 use crate::office::OfficeOptions;
 use crate::pdf;
 use crate::pdf::transform::{self, StampMode, StampOptions};
@@ -67,11 +67,6 @@ pub fn run(command: Command, config: Config) -> Result<()> {
             Ok(())
         }),
         Command::Metadata { command } => metadata(command),
-        Command::Images {
-            input,
-            output_dir,
-            ffmpeg,
-        } => extract_images(&input, output_dir.as_deref(), ffmpeg, &config),
         Command::Convert(args) => run_convert(args, &config),
     }
 }
@@ -127,7 +122,16 @@ fn merge(args: MergeArgs, config: &Config) -> Result<()> {
             specs.len(),
             spec.path.display()
         ));
-        documents.push(input::load(spec, &options)?);
+        match input::load(spec, &options) {
+            Ok(document) => documents.push(document),
+            Err(error) => {
+                output::warn(format!("Skipping {}: {error:#}", spec.path.display()));
+            }
+        }
+    }
+
+    if documents.is_empty() {
+        bail!("no valid input files to merge");
     }
 
     output::info("Merging page trees...");
@@ -389,14 +393,23 @@ fn extract_native_text(input: &Path, output: Option<&Path>) -> Result<()> {
 
 fn merge_text(specs: &[InputSpec], output: &Path) -> Result<()> {
     let mut result = String::new();
-    for (index, spec) in specs.iter().enumerate() {
-        if index != 0 {
-            result.push_str("\n\n---\n\n");
+    let mut count = 0;
+    for spec in specs {
+        match fs::read_to_string(&spec.path) {
+            Ok(content) => {
+                if count != 0 {
+                    result.push_str("\n\n---\n\n");
+                }
+                result.push_str(&content);
+                count += 1;
+            }
+            Err(error) => {
+                output::warn(format!("Skipping {}: {error:#}", spec.path.display()));
+            }
         }
-        result.push_str(
-            &fs::read_to_string(&spec.path)
-                .with_context(|| format!("failed to read {}", spec.path.display()))?,
-        );
+    }
+    if count == 0 {
+        bail!("no valid text files to merge");
     }
     write_atomic(output, result.as_bytes())?;
     output::written(output);
@@ -466,51 +479,6 @@ fn metadata(command: MetadataCommand) -> Result<()> {
             })
         }
     }
-}
-
-fn extract_images(
-    input: &Path,
-    output_dir: Option<&Path>,
-    ffmpeg: Option<PathBuf>,
-    config: &Config,
-) -> Result<()> {
-    let document =
-        Document::load(input).with_context(|| format!("failed to load {}", input.display()))?;
-    let images = ocr::extract_pdf_images(
-        &document,
-        &ImageOptions {
-            keep_icc: config.keep_icc,
-            ffmpeg: ffmpeg.unwrap_or_else(|| config.ffmpeg.clone()),
-            jpeg_quality: config.jpeg_quality,
-            image_dpi: config.image_dpi,
-        },
-    )?;
-    let directory = output_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        let stem = input
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("document");
-        input
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{stem}_images"))
-    });
-    fs::create_dir_all(&directory)?;
-    for image in &images {
-        let path = directory.join(format!("{}.jpg", image.label));
-        write_atomic(&path, &image.bytes)?;
-        output::written(&path);
-    }
-    output::result(
-        "images_extracted",
-        format!("Extracted {} image(s)", images.len()),
-        json!({
-            "input": input.to_string_lossy(),
-            "output_dir": directory.to_string_lossy(),
-            "count": images.len(),
-        }),
-    );
-    Ok(())
 }
 
 fn default_merge_output(specs: &[InputSpec]) -> PathBuf {
