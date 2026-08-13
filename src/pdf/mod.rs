@@ -182,10 +182,9 @@ pub fn metadata_report(path: &Path) -> Result<Value> {
 }
 
 pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
-    let data = std::fs::read(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let document = Document::load_mem(&data)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let document =
+        Document::load_mem(&data).with_context(|| format!("failed to parse {}", path.display()))?;
     let page_count = document.get_pages().len();
     if page_count == 0 {
         bail!("PDF contains no pages");

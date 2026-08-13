@@ -84,15 +84,6 @@ pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
 
 #[cfg(windows)]
 fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
-    let absolute_input = fs::canonicalize(path)
-        .map(normalize_com_path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
-    let temporary = Builder::new().suffix(".pdf").tempfile()?;
-    let output_path = temporary.into_temp_path();
-    // Word and Excel should create the output themselves. An existing empty
-    // file can trigger an overwrite prompt despite DisplayAlerts=false.
-    fs::remove_file(&output_path)?;
-
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -103,6 +94,25 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
         "xls" | "xlsx" => EXCEL_SCRIPT,
         _ => bail!("unsupported Office format: .{extension}"),
     };
+
+    // Work on a temporary copy: Office automation may need to remove the
+    // downloaded-file marker, but bpdf must never change the security state of
+    // the user's source document.
+    let input_copy = Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile()?
+        .into_temp_path();
+    fs::copy(path, &input_copy)
+        .with_context(|| format!("failed to copy {} for Office conversion", path.display()))?;
+    let absolute_input = fs::canonicalize(&input_copy)
+        .map(normalize_com_path)
+        .with_context(|| format!("failed to resolve temporary copy of {}", path.display()))?;
+
+    let temporary = Builder::new().suffix(".pdf").tempfile()?;
+    let output_path = temporary.into_temp_path();
+    // Word and Excel should create the output themselves. An existing empty
+    // file can trigger an overwrite prompt despite DisplayAlerts=false.
+    fs::remove_file(&output_path)?;
 
     let mut command = Command::new(&options.powershell);
     command
@@ -132,10 +142,14 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         if stderr.contains("80080005") || stdout.contains("80080005") {
-            bail!("Microsoft Office COM server is stuck (error 80080005). Please close invisible WINWORD.EXE/EXCEL.EXE processes via Task Manager or dismiss open Office dialogs.");
+            bail!(
+                "Microsoft Office COM server is stuck (error 80080005). Please close invisible WINWORD.EXE/EXCEL.EXE processes via Task Manager or dismiss open Office dialogs."
+            );
         }
         if stderr.contains("8001010A") || stdout.contains("8001010A") {
-            bail!("Microsoft Office is busy (error 8001010A). Please close open Office dialogs and try again.");
+            bail!(
+                "Microsoft Office is busy (error 8001010A). Please close open Office dialogs and try again."
+            );
         }
     }
 

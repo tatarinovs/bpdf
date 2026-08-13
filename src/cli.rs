@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Stop a batch command after its first input error.
+    #[arg(long, global = true)]
+    pub fail_fast: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -236,4 +240,3 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub force: bool,
 }
-

@@ -5,6 +5,21 @@
 #define VFT_APP 0x00000001L
 
 1 ICON "bpdf.ico"
+2 ICON "merge.ico"
+3 ICON "ocr.ico"
+4 ICON "strip.ico"
+5 ICON "split.ico"
+6 ICON "extract.ico"
+7 ICON "inspect.ico"
+8 ICON "rotate.ico"
+9 ICON "resize.ico"
+10 ICON "text.ico"
+11 ICON "doctor.ico"
+12 ICON "stamp.ico"
+13 ICON "optimize.ico"
+14 ICON "metadata.ico"
+15 ICON "convert.ico"
+
 1 RT_MANIFEST "bpdf.manifest"
 
 1 VERSIONINFO

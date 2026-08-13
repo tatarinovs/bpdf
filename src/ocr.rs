@@ -115,9 +115,6 @@ impl Drop for RequestPermit<'_> {
 
 impl OcrEngine {
     pub fn new(options: OcrOptions) -> Result<Self> {
-        if options.api_key.trim().is_empty() {
-            bail!("Groq API key is empty; set groq_api_key in config");
-        }
         if options.jobs == 0 {
             bail!("OCR jobs must be at least 1");
         }
@@ -168,6 +165,7 @@ impl OcrEngine {
     }
 
     pub fn check_connection(&self) -> Result<()> {
+        self.ensure_api_key()?;
         let endpoint = models_endpoint(&self.options.endpoint)?;
         let authorization = format!("Bearer {}", self.options.api_key);
         let _permit = self.gate.enter();
@@ -296,6 +294,7 @@ impl OcrEngine {
     }
 
     fn run_vision_uncached(&self, image: &[u8]) -> Result<String> {
+        self.ensure_api_key()?;
         let mime = match image::guess_format(image).ok() {
             Some(image::ImageFormat::Png) => "image/png",
             Some(image::ImageFormat::WebP) => "image/webp",
@@ -378,6 +377,13 @@ impl OcrEngine {
         }
 
         bail!("OCR exceeded {MAX_ATTEMPTS} attempts")
+    }
+
+    fn ensure_api_key(&self) -> Result<()> {
+        if self.options.api_key.trim().is_empty() {
+            bail!("Groq API key is empty; set groq_api_key in config");
+        }
+        Ok(())
     }
 }
 
@@ -596,6 +602,24 @@ fn file_label(path: &Path) -> &str {
 mod tests {
     use super::*;
 
+    fn options_without_api_key() -> OcrOptions {
+        let config = crate::config::Config::default();
+        let image = config.image_options(None, None);
+        OcrOptions {
+            api_key: String::new(),
+            proxy: String::new(),
+            model: config.ocr_model,
+            prompt: config.ocr_prompt,
+            endpoint: config.ocr_endpoint,
+            timeout: Duration::from_secs(1),
+            force_image_ocr: false,
+            image,
+            jobs: 1,
+            max_tokens: config.ocr_max_tokens,
+            cache_dir: None,
+        }
+    }
+
     #[test]
     fn text_layer_threshold_is_per_page() {
         assert!(has_text_layer(&"a".repeat(200), 2));
@@ -635,5 +659,26 @@ mod tests {
             models_endpoint("https://api.groq.com/openai/v1/chat/completions").unwrap(),
             "https://api.groq.com/openai/v1/models"
         );
+    }
+
+    #[test]
+    fn native_pdf_text_does_not_require_api_key() {
+        let temporary = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        let text = "Текстовый слой документа. ".repeat(20);
+        let mut document =
+            crate::textpdf::render(&text, &crate::textpdf::TextOptions::default()).unwrap();
+        document.save(temporary.path()).unwrap();
+        let engine = OcrEngine::new(options_without_api_key()).unwrap();
+
+        let extracted = engine.extract_text(temporary.path()).unwrap();
+
+        assert!(!extracted.trim().is_empty());
+    }
+
+    #[test]
+    fn image_ocr_still_requires_api_key() {
+        let engine = OcrEngine::new(options_without_api_key()).unwrap();
+        let error = engine.run_vision_uncached(b"not-an-image").unwrap_err();
+        assert!(error.to_string().contains("API key"));
     }
 }

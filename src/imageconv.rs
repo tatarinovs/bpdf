@@ -46,25 +46,24 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
     }
 
     let input = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    
+
     // Check if we need to resize before deciding to fast-path the JPEG
     let mut target_dimensions = None;
-    if options.image_dpi > 0 {
-        if let Some(size) = page_size {
-            if let Ok((pw, ph)) = crate::pdf::paper_size(size) {
-                let dpi = f64::from(options.image_dpi);
-                let mut max_w = (pw / 72.0 * dpi).round() as u32;
-                let mut max_h = (ph / 72.0 * dpi).round() as u32;
-                let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-                
-                if (w > h) != (max_w > max_h) {
-                    std::mem::swap(&mut max_w, &mut max_h);
-                }
-                
-                if w > max_w || h > max_h {
-                    target_dimensions = Some((max_w, max_h));
-                }
-            }
+    if options.image_dpi > 0
+        && let Some(size) = page_size
+        && let Ok((pw, ph)) = crate::pdf::paper_size(size)
+    {
+        let dpi = f64::from(options.image_dpi);
+        let mut max_w = (pw / 72.0 * dpi).round() as u32;
+        let mut max_h = (ph / 72.0 * dpi).round() as u32;
+        let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
+
+        if (w > h) != (max_w > max_h) {
+            std::mem::swap(&mut max_w, &mut max_h);
+        }
+
+        if w > max_w || h > max_h {
+            target_dimensions = Some((max_w, max_h));
         }
     }
 
@@ -77,11 +76,11 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
         .context("failed to determine image format")?
         .decode()
         .with_context(|| format!("failed to decode {}", path.display()))?;
-        
+
     if let Some((max_w, max_h)) = target_dimensions {
         image = image.resize(max_w, max_h, FilterType::Lanczos3);
     }
-        
+
     encode_jpeg_on_white(&image, options.jpeg_quality)
 }
 

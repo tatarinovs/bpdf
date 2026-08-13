@@ -4,6 +4,7 @@
 /config.yaml
 /dist/
 /tools/
+/artifacts/
 *.xls*
 *.doc*
 *.pdf

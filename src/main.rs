@@ -51,5 +51,5 @@ fn run() -> Result<()> {
     };
     output::init(cli.quiet, cli.json);
     let config = Config::load(cli.config.as_deref())?;
-    app::run(cli.command, config)
+    app::run(cli.command, config, cli.fail_fast)
 }

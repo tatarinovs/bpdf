@@ -43,13 +43,13 @@ if not defined RC_EXE (
 )
 
 echo [2/4] Compiling Windows resources...
-"%RC_EXE%" /nologo /c65001 /i "%RESOURCE_DIR%" ^
+"%RC_EXE%" /nologo /c65001 /i "%RESOURCE_DIR%" /i "%CD%\resources" /i "%CD%\ico" ^
   /fo "%RESOURCE_FILE%" "%CD%\resources\bpdf.rc"
 if errorlevel 1 goto :error
 
 echo [3/4] Building optimized Windows executable...
 set "BPDF_WINDOWS_RES=%RESOURCE_FILE%"
-cargo build --release
+cargo build --release --locked
 if errorlevel 1 goto :error
 
 echo [4/4] Preparing dist directory...
@@ -58,6 +58,7 @@ if errorlevel 1 goto :error
 copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
 copy /y "%CD%\config.example.jsonc" "%CD%\dist\config.example.jsonc" >nul || goto :error
 copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
+copy /y "%CD%\bpdf.bar" "%CD%\dist\bpdf.bar" >nul || goto :error
 
 echo.
 echo Build complete:

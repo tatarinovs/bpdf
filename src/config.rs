@@ -73,11 +73,7 @@ impl Default for Config {
 
 impl Config {
     /// Build `ImageOptions` from config with optional CLI overrides.
-    pub fn image_options(
-        &self,
-        keep_icc: Option<bool>,
-        ffmpeg: Option<PathBuf>,
-    ) -> ImageOptions {
+    pub fn image_options(&self, keep_icc: Option<bool>, ffmpeg: Option<PathBuf>) -> ImageOptions {
         ImageOptions {
             keep_icc: keep_icc.unwrap_or(self.keep_icc),
             ffmpeg: ffmpeg.unwrap_or_else(|| self.ffmpeg.clone()),
@@ -119,8 +115,8 @@ impl Config {
 
         clean_json = expand_env_vars(clean_json);
 
-        let config: Self = serde_json::from_str(&clean_json)
-            .context("syntax error or invalid field type")?;
+        let config: Self =
+            serde_json::from_str(&clean_json).context("syntax error or invalid field type")?;
 
         if !(1..=100).contains(&config.jpeg_quality) {
             bail!("jpeg_quality must be between 1 and 100");
@@ -215,15 +211,15 @@ fn expand_env_vars(mut text: String) -> String {
         if let Some(end) = text[absolute_start + 1..].find('%') {
             let absolute_end = absolute_start + 1 + end;
             let var_name = &text[absolute_start + 1..absolute_end];
-            
+
             // Reject variable names with whitespace (avoids treating '% 10 % 20' as an env var)
             if var_name.contains(|c: char| c.is_whitespace()) || var_name.is_empty() {
                 i = absolute_start + 1;
                 continue;
             }
-            
+
             if let Ok(val) = std::env::var(var_name) {
-                let escaped = val.replace('\\', "\\\\").replace('"', "\\\"" );
+                let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
                 text.replace_range(absolute_start..=absolute_end, &escaped);
                 i = absolute_start + escaped.len();
             } else {

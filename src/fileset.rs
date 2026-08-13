@@ -10,6 +10,9 @@ pub const MERGE_EXTENSIONS: &[&str] = &[
     "docx", "xls", "xlsx", "md", "txt",
 ];
 pub const STRIP_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "pdf"];
+pub const CONVERT_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "bmp", "gif", "tiff", "tif", "webp", "heic", "heif", "pdf",
+];
 
 #[derive(Clone, Copy)]
 pub struct ExpandOptions {
@@ -160,8 +163,6 @@ fn natural_compare(left: &str, right: &str) -> Ordering {
     }
     left.len().cmp(&right.len())
 }
-
-
 
 fn read_manifest(path: &Path) -> Result<Vec<String>> {
     let contents = fs::read_to_string(path)
