@@ -4,6 +4,8 @@
 /config.yaml
 /dist/
 /tools/
+!/tools/benchmark-v1.ps1
+!/tools/compare-v1.ps1
 /artifacts/
 *.xls*
 *.doc*

@@ -9,15 +9,15 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     propagate_version = true
 )]
 pub struct Cli {
-    /// Configuration file (defaults to config.jsonc in cwd or beside bpdf).
+    /// Configuration file (otherwise searches config.jsonc/config.json in cwd and beside bpdf).
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Suppress progress and success messages.
+    /// Suppress progress and success messages; command results are still printed.
     #[arg(long, global = true, conflicts_with = "json")]
     pub quiet: bool,
 
-    /// Emit newline-delimited JSON events.
+    /// Emit progress, result and error events as newline-delimited JSON.
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -37,18 +37,25 @@ pub enum Command {
     Ocr(OcrArgs),
     /// Split a PDF into one file per page.
     Split {
+        /// Source PDF file.
         input: PathBuf,
+        /// Destination directory (defaults to the source file's directory).
         output_dir: Option<PathBuf>,
     },
     /// Extract selected pages into one PDF.
     Extract {
+        /// Source PDF file.
         input: PathBuf,
+        /// Page selection, for example 1-5,8,last, even or odd.
         pages: String,
+        /// Destination PDF (must differ from the source file).
         output: Option<PathBuf>,
     },
     /// Inspect page, font, image and text information in a PDF.
     Inspect {
+        /// PDF file to inspect.
         input: PathBuf,
+        /// Also extract and print the existing text layer.
         #[arg(long)]
         text: bool,
     },
@@ -56,26 +63,36 @@ pub enum Command {
     Strip(StripArgs),
     /// Rotate selected PDF pages by a multiple of 90 degrees.
     Rotate {
+        /// Source PDF file.
         input: PathBuf,
+        /// Clockwise angle in degrees; must be a multiple of 90.
         degrees: i64,
+        /// Pages to rotate, for example all, 1-5, even or odd.
         #[arg(short, long, default_value = "all")]
         pages: String,
+        /// Destination PDF; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
     /// Resize and center selected PDF pages on A4 or Letter.
     Resize {
+        /// Source PDF file.
         input: PathBuf,
+        /// Target paper size: A4 or Letter.
         #[arg(short, long, default_value = "A4")]
         size: String,
+        /// Pages to resize, for example all, 1-5, even or odd.
         #[arg(short, long, default_value = "all")]
         pages: String,
+        /// Destination PDF; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
     /// Extract an existing PDF text layer without using a network service.
     Text {
+        /// Source PDF file with an existing text layer.
         input: PathBuf,
+        /// Destination text file (prints to stdout when omitted).
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -83,9 +100,11 @@ pub enum Command {
     Doctor,
     /// Apply a PNG stamp to an existing PDF.
     Stamp(StampArgs),
-    /// Structurally optimize an existing PDF.
+    /// Optimize PDF structure and downsample oversized images.
     Optimize {
+        /// Source PDF file.
         input: PathBuf,
+        /// Destination PDF; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -100,21 +119,31 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum MetadataCommand {
+    /// Show PDF Info metadata.
     Show {
+        /// Source PDF file.
         input: PathBuf,
     },
+    /// Set selected PDF Info fields, leaving unspecified fields unchanged.
     Set {
+        /// Source PDF file.
         input: PathBuf,
+        /// Destination PDF; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Document title.
         #[arg(long)]
         title: Option<String>,
+        /// Document author.
         #[arg(long)]
         author: Option<String>,
+        /// Document subject.
         #[arg(long)]
         subject: Option<String>,
+        /// Document keywords.
         #[arg(long)]
         keywords: Option<String>,
+        /// Application that created the document.
         #[arg(long)]
         creator: Option<String>,
     },
@@ -122,86 +151,119 @@ pub enum MetadataCommand {
 
 #[derive(Debug, Args)]
 pub struct StampArgs {
+    /// Source PDF file.
     pub input: PathBuf,
+    /// PNG image used as the stamp.
     pub stamp: PathBuf,
+    /// Destination PDF; may equal the input for an in-place update.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// Anchor (br, bl, tr, tl, c, tc, bc, l, r) or X,Y mm offset from bottom-right.
     #[arg(long, default_value = "br")]
     pub position: String,
+    /// Stamp scale; 0 selects an automatic size up to 25% of the page.
     #[arg(long, default_value_t = 0.0)]
     pub scale: f64,
+    /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub opacity: f64,
+    /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(long, default_value = "all")]
     pub pages: String,
+    /// Layer mode: auto, over or under.
     #[arg(long, default_value = "auto")]
     pub mode: String,
 }
 
 #[derive(Debug, Args)]
 pub struct MergeArgs {
-    /// Input files, directories, globs, or @list.txt manifests.
+    /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
+    /// Destination PDF or text file (generated automatically when omitted).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// Target page size, or none/original/keep to preserve source sizes.
+    /// Target PDF page size: A4, Letter, or none/original/keep for source PDF sizes.
     #[arg(short, long)]
     pub size: Option<String>,
 
+    /// Rotate pages to the document's majority orientation; ties follow the first page.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub auto_rotate: Option<bool>,
 
+    /// Preserve each page's orientation, overriding auto_rotate from configuration.
+    #[arg(long, conflicts_with = "auto_rotate")]
+    pub no_rotate: bool,
+
+    /// PNG image to apply as a stamp.
     #[arg(long)]
     pub stamp: Option<PathBuf>,
+    /// Stamp anchor or X,Y mm offset from the bottom-right.
     #[arg(long, default_value = "br")]
     pub stamp_pos: String,
+    /// Stamp scale; 0 selects an automatic size up to 25% of the page.
     #[arg(long, default_value_t = 0.0)]
     pub stamp_scale: f64,
+    /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub stamp_op: f64,
+    /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(long, default_value = "all")]
     pub stamp_pages: String,
+    /// Stamp layer mode: auto, over or under.
     #[arg(long, default_value = "auto")]
     pub stamp_mode: String,
 
+    /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub keep_icc: Option<bool>,
+    /// Optimize PDF structure and downsample images using configured image_dpi/jpeg_quality.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub optimize: Option<bool>,
+    /// Remove metadata from the resulting document.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub strip_meta: Option<bool>,
 
+    /// PDF Author metadata value.
     #[arg(long)]
     pub author: Option<String>,
+    /// PDF Creator metadata value.
     #[arg(long)]
     pub creator: Option<String>,
+    /// Path to FFmpeg, used for HEIC/HEIF input.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct OcrArgs {
-    /// Input files, directories, globs, or @list.txt manifests.
+    /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
+    /// Combined Markdown output; when omitted, writes one .md file per input.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// HTTP or SOCKS5 proxy URL.
     #[arg(long)]
     pub proxy: Option<String>,
+    /// Groq Vision model name.
     #[arg(long)]
     pub model: Option<String>,
+    /// OCR instruction sent to the model.
     #[arg(long)]
     pub prompt: Option<String>,
+    /// Groq-compatible chat completions endpoint.
     #[arg(long)]
     pub endpoint: Option<String>,
+    /// Run Vision OCR even when a PDF already has a text layer.
     #[arg(long)]
     pub force_ocr: bool,
+    /// Path to FFmpeg, used for HEIC/HEIF input.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
-    /// Maximum simultaneous OCR requests.
+    /// Maximum simultaneous OCR requests (1-64).
     #[arg(long)]
     pub jobs: Option<usize>,
     /// Disable the content-addressed OCR cache.
@@ -214,29 +276,82 @@ pub struct OcrArgs {
 
 #[derive(Debug, Args)]
 pub struct StripArgs {
-    /// Input files, directories, globs, or @list.txt manifests.
+    /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
+    /// Destination file (allowed only for a single input); defaults to in-place.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub keep_icc: Option<bool>,
+    /// Path to FFmpeg, used for HEIC/HEIF input.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct ConvertArgs {
-    /// Input files, directories, globs, or @list.txt manifests.
+    /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
+    /// Destination directory for generated JPEG files.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub keep_icc: Option<bool>,
+    /// Path to FFmpeg, used for HEIC/HEIF input.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
     /// Allow output to overwrite an input file (e.g. jpg -> jpg in place).
     #[arg(long)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::*;
+
+    #[test]
+    fn merge_no_rotate_is_available_and_conflicts_with_auto_rotate() {
+        let cli = Cli::try_parse_from(["bpdf", "merge", "scan.pdf", "--no-rotate"]).unwrap();
+        let Command::Merge(args) = cli.command else {
+            panic!("expected merge command");
+        };
+        assert!(args.no_rotate);
+
+        assert!(
+            Cli::try_parse_from(["bpdf", "merge", "scan.pdf", "--no-rotate", "--auto-rotate",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn every_command_and_argument_has_help_text() {
+        fn check(command: &clap::Command) {
+            assert!(
+                command.get_about().is_some(),
+                "command '{}' has no description",
+                command.get_name()
+            );
+
+            for argument in command.get_arguments() {
+                assert!(
+                    argument.get_help().is_some(),
+                    "argument '{}' in command '{}' has no description",
+                    argument.get_id(),
+                    command.get_name()
+                );
+            }
+
+            for subcommand in command.get_subcommands() {
+                check(subcommand);
+            }
+        }
+
+        check(&Cli::command());
+    }
 }

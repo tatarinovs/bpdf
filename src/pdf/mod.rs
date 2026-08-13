@@ -6,7 +6,30 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 use serde_json::{Value, json};
 
 use crate::atomic::write_atomic;
+pub(crate) mod image;
 pub mod transform;
+
+pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
+
+pub fn load(path: &Path) -> Result<Document> {
+    Document::load(path).with_context(|| format!("failed to load PDF {}", path.display()))
+}
+
+pub fn transform_file<F>(path: &Path, transform: F) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut Document) -> Result<()>,
+{
+    let mut document = load(path)?;
+    transform(&mut document)?;
+    save_to_bytes(&mut document)
+}
+
+pub fn extract_text(document: &Document) -> Result<String> {
+    let pages = document.get_pages().keys().copied().collect::<Vec<_>>();
+    document
+        .extract_text_with_limit(&pages, MAX_DECOMPRESSED_BYTES)
+        .context("failed to extract PDF text")
+}
 
 /// Merge without flattening leaf pages. Each source Pages root becomes a child
 /// of a new Pages root, preserving inherited resources, boxes and rotation.
@@ -87,16 +110,8 @@ pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
     Ok(result)
 }
 
-pub fn extract_file(path: &Path, pages: &str) -> Result<Vec<u8>> {
-    let mut document =
-        Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
-    select_pages(&mut document, pages)?;
-    save_to_bytes(&mut document)
-}
-
 pub fn inspect_file(path: &Path, include_text: bool) -> Result<String> {
-    let document =
-        Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let document = load(path)?;
     let pages = document.get_pages();
     let mut report = format!(
         "PDF version: {}\nPages: {}\n",
@@ -117,10 +132,7 @@ pub fn inspect_file(path: &Path, include_text: bool) -> Result<String> {
     }
 
     if include_text {
-        let page_numbers = pages.keys().copied().collect::<Vec<_>>();
-        let text = document
-            .extract_text_with_limit(&page_numbers, 256 * 1024 * 1024)
-            .context("failed to extract PDF text")?;
+        let text = extract_text(&document)?;
         report.push_str("\n--- text ---\n");
         report.push_str(&text);
         if !text.ends_with('\n') {
@@ -132,8 +144,7 @@ pub fn inspect_file(path: &Path, include_text: bool) -> Result<String> {
 }
 
 pub fn metadata_report(path: &Path) -> Result<Value> {
-    let document =
-        Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let document = load(path)?;
     let mut fields = serde_json::Map::new();
     if let Ok(info_object) = document.trailer.get(b"Info") {
         let info = match info_object {
@@ -182,15 +193,11 @@ pub fn metadata_report(path: &Path) -> Result<Value> {
 }
 
 pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
-    let data = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let document =
-        Document::load_mem(&data).with_context(|| format!("failed to parse {}", path.display()))?;
+    let document = load(path)?;
     let page_count = document.get_pages().len();
     if page_count == 0 {
         bail!("PDF contains no pages");
     }
-    drop(document);
-
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -199,10 +206,9 @@ pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut outputs = Vec::with_capacity(page_count);
 
     for page in 1..=page_count {
-        // Re-parsing from the cached byte buffer is simple and reliable:
-        // delete_pages mutates the shared page tree, so clones would need a
-        // deep audit before being trusted for arbitrary PDFs.
-        let mut one_page = Document::load_mem(&data)?;
+        // lopdf::Document owns its complete object graph, so Clone gives each
+        // output an isolated page tree without parsing the source N times.
+        let mut one_page = document.clone();
         select_pages(&mut one_page, &page.to_string())?;
         let bytes = save_to_bytes(&mut one_page)?;
         let output = output_dir.join(format!("{stem}_{page:0width$}.pdf"));
@@ -211,13 +217,6 @@ pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     }
 
     Ok(outputs)
-}
-
-pub fn strip_pdf_metadata(path: &Path) -> Result<Vec<u8>> {
-    let mut document =
-        Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
-    strip_document_metadata(&mut document);
-    save_to_bytes(&mut document)
 }
 
 pub fn strip_document_metadata(document: &mut Document) {
@@ -547,7 +546,7 @@ fn pdf_text(object: &Object) -> String {
 mod tests {
     use std::io::Cursor;
 
-    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use ::image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 
     use super::*;
 
@@ -611,6 +610,26 @@ mod tests {
     }
 
     #[test]
+    fn split_clones_keep_pages_isolated() {
+        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let mut merged = merge_documents(vec![first, second]).unwrap();
+        let source = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        merged.save(source.path()).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        let files = split_file(source.path(), output.path()).unwrap();
+
+        assert_eq!(files.len(), 2);
+        for file in files {
+            let split = load(&file).unwrap();
+            assert_eq!(split.get_pages().len(), 1);
+            let page_id = *split.get_pages().get(&1).unwrap();
+            assert_eq!(split.get_page_images(page_id).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn pdf_strip_removes_info_catalog_and_page_metadata() {
         let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
         let metadata_id = document.add_object(Stream::new(
@@ -633,7 +652,11 @@ mod tests {
 
         let temporary = tempfile::NamedTempFile::new().unwrap();
         document.save(temporary.path()).unwrap();
-        let stripped = strip_pdf_metadata(temporary.path()).unwrap();
+        let stripped = transform_file(temporary.path(), |document| {
+            strip_document_metadata(document);
+            Ok(())
+        })
+        .unwrap();
         let clean = Document::load_mem(&stripped).unwrap();
 
         assert!(clean.catalog().unwrap().get(b"Metadata").is_err());

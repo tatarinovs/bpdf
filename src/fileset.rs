@@ -5,19 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use glob::glob;
 
-pub const MERGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "bmp", "gif", "tiff", "tif", "webp", "heic", "heif", "pdf", "doc",
-    "docx", "xls", "xlsx", "md", "txt",
-];
-pub const STRIP_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "pdf"];
-pub const CONVERT_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "bmp", "gif", "tiff", "tif", "webp", "heic", "heif", "pdf",
-];
-
-#[derive(Clone, Copy)]
-pub struct ExpandOptions {
-    pub directory_extensions: &'static [&'static str],
-}
+use crate::formats::InputFormatSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputSpec {
@@ -25,7 +13,7 @@ pub struct InputSpec {
     pub pages: Option<String>,
 }
 
-pub fn expand(arguments: &[String], options: ExpandOptions) -> Result<Vec<InputSpec>> {
+pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<InputSpec>> {
     let mut files = Vec::new();
 
     for argument in arguments {
@@ -55,7 +43,7 @@ pub fn expand(arguments: &[String], options: ExpandOptions) -> Result<Vec<InputS
                         .unwrap_or(false)
                 })
                 .map(|entry| entry.path())
-                .filter(|entry| extension_allowed(entry, options.directory_extensions))
+                .filter(|entry| formats.supports(entry))
                 .filter(|entry| !is_office_lock_file(entry))
                 .collect::<Vec<_>>();
             natural_sort(&mut entries);
@@ -100,16 +88,6 @@ fn split_pdf_range(argument: &str) -> (String, Option<String>) {
         );
     }
     (argument.to_owned(), None)
-}
-
-fn extension_allowed(path: &Path, extensions: &[&str]) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|extension| {
-            extensions
-                .iter()
-                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
-        })
 }
 
 fn is_office_lock_file(path: &Path) -> bool {

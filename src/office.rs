@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use tempfile::Builder;
 
 use crate::encoding::powershell_encoded_command;
+use crate::formats::{self, Format};
 use crate::process;
 
 #[derive(Clone, Debug)]
@@ -19,16 +20,6 @@ pub struct OfficeOptions {
 pub struct OfficeAvailability {
     pub word: bool,
     pub excel: bool,
-}
-
-pub fn is_office(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("doc" | "docx" | "xls" | "xlsx")
-    )
 }
 
 pub fn convert_to_pdf(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
@@ -84,16 +75,15 @@ pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
 
 #[cfg(windows)]
 fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
+    let script = match formats::detect(path) {
+        Some(Format::Word) => WORD_SCRIPT,
+        Some(Format::Excel) => EXCEL_SCRIPT,
+        _ => bail!("unsupported Office format: {}", path.display()),
+    };
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let script = match extension.as_str() {
-        "doc" | "docx" => WORD_SCRIPT,
-        "xls" | "xlsx" => EXCEL_SCRIPT,
-        _ => bail!("unsupported Office format: .{extension}"),
-    };
+        .unwrap_or("docx");
 
     // Work on a temporary copy: Office automation may need to remove the
     // downloaded-file marker, but bpdf must never change the security state of

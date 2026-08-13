@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
-use super::{object_number, paper_size, parse_page_selection};
+use super::{image as pdf_image, object_number, paper_size, parse_page_selection};
+use crate::imageconv;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StampMode {
@@ -42,6 +44,20 @@ pub struct PageGeometry {
     pub rotation: i64,
 }
 
+#[derive(Debug, Default)]
+pub struct OptimizeReport {
+    pub resized_images: usize,
+    pub skipped_images: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImageResize {
+    id: ObjectId,
+    target_width: u32,
+    target_height: u32,
+}
+
 impl PageGeometry {
     pub fn raw_width(self) -> f64 {
         (self.right - self.left).abs()
@@ -70,17 +86,16 @@ impl PageGeometry {
 
 pub fn auto_rotate(document: &mut Document) -> Result<Vec<u32>> {
     let pages = document.get_pages();
-    let Some((&_, &first_id)) = pages.first_key_value() else {
+    let geometries = page_geometries(document, &pages)?;
+    if geometries.is_empty() {
         return Ok(Vec::new());
-    };
-    let first = page_geometry(document, first_id)?;
-    let first_landscape = first.display_width() > first.display_height();
+    }
+    let target_landscape = dominant_landscape(geometries.iter().map(|(_, _, geometry)| *geometry));
 
     let mut rotated = Vec::new();
-    for (number, page_id) in pages {
-        let geometry = page_geometry(document, page_id)?;
+    for (number, page_id, geometry) in geometries {
         let landscape = geometry.display_width() > geometry.display_height();
-        if landscape != first_landscape {
+        if landscape != target_landscape {
             set_page_rotation(document, page_id, geometry.rotation - 90)?;
             rotated.push(number);
         }
@@ -104,26 +119,47 @@ pub fn rotate_pages(document: &mut Document, pages: &str, degrees: i64) -> Resul
 }
 
 pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<()> {
+    resize_pages_with_orientation(document, size, pages, false)
+}
+
+pub fn resize_pages_preserving_orientation(
+    document: &mut Document,
+    size: &str,
+    pages: &str,
+) -> Result<()> {
+    resize_pages_with_orientation(document, size, pages, true)
+}
+
+fn resize_pages_with_orientation(
+    document: &mut Document,
+    size: &str,
+    pages: &str,
+    preserve_orientation: bool,
+) -> Result<()> {
     let (target_portrait_width, target_portrait_height) = paper_size(size)?;
     let page_map = document.get_pages();
     let selected = parse_page_selection(pages, page_map.len())?;
-    let first_orientation = page_map
-        .first_key_value()
-        .map(|(_, page_id)| page_geometry(document, *page_id))
-        .transpose()?
-        .map(|geometry| geometry.display_width() > geometry.display_height())
-        .unwrap_or(false);
-    let (target_display_width, target_display_height) = if first_orientation {
-        (target_portrait_height, target_portrait_width)
-    } else {
-        (target_portrait_width, target_portrait_height)
-    };
+    let geometries = page_geometries(document, &page_map)?;
+    let common_orientation = (!preserve_orientation).then(|| {
+        dominant_landscape(
+            geometries
+                .iter()
+                .filter(|(number, _, _)| selected.contains(&(*number as usize)))
+                .map(|(_, _, geometry)| *geometry),
+        )
+    });
 
-    for (number, page_id) in page_map {
+    for (number, page_id, geometry) in geometries {
         if !selected.contains(&(number as usize)) {
             continue;
         }
-        let geometry = page_geometry(document, page_id)?;
+        let landscape = common_orientation
+            .unwrap_or_else(|| geometry.display_width() > geometry.display_height());
+        let (target_display_width, target_display_height) = if landscape {
+            (target_portrait_height, target_portrait_width)
+        } else {
+            (target_portrait_width, target_portrait_height)
+        };
         let quarter_turn = geometry.rotation.rem_euclid(180) == 90;
         let (target_raw_width, target_raw_height) = if quarter_turn {
             (target_display_height, target_display_width)
@@ -165,6 +201,35 @@ pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<
         }
     }
     Ok(())
+}
+
+fn page_geometries(
+    document: &Document,
+    pages: &BTreeMap<u32, ObjectId>,
+) -> Result<Vec<(u32, ObjectId, PageGeometry)>> {
+    pages
+        .iter()
+        .map(|(&number, &page_id)| Ok((number, page_id, page_geometry(document, page_id)?)))
+        .collect()
+}
+
+fn dominant_landscape(geometries: impl IntoIterator<Item = PageGeometry>) -> bool {
+    let mut first = None;
+    let (mut landscapes, mut portraits) = (0, 0);
+    for geometry in geometries {
+        let landscape = geometry.display_width() > geometry.display_height();
+        first.get_or_insert(landscape);
+        if landscape {
+            landscapes += 1;
+        } else {
+            portraits += 1;
+        }
+    }
+    if landscapes == portraits {
+        first.unwrap_or(false)
+    } else {
+        landscapes > portraits
+    }
 }
 
 pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()> {
@@ -254,11 +319,156 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     Ok(())
 }
 
-pub fn optimize(document: &mut Document) {
+pub fn optimize(document: &mut Document, image_dpi: u32, jpeg_quality: u8) -> OptimizeReport {
+    let mut report = downsample_images(document, image_dpi, jpeg_quality);
     document.delete_zero_length_streams();
     document.prune_objects();
     document.renumber_objects();
     document.compress();
+    report.warnings.shrink_to_fit();
+    report
+}
+
+fn downsample_images(document: &mut Document, image_dpi: u32, jpeg_quality: u8) -> OptimizeReport {
+    let mut report = OptimizeReport::default();
+    if image_dpi == 0 {
+        return report;
+    }
+
+    let candidates = collect_image_resizes(document, image_dpi, &mut report.warnings);
+
+    for candidate in candidates {
+        match downsample_image(document, candidate, jpeg_quality) {
+            Ok(()) => report.resized_images += 1,
+            Err(error) => {
+                report.skipped_images += 1;
+                report.warnings.push(format!(
+                    "image object {} {}: {error:#}",
+                    candidate.id.0, candidate.id.1
+                ));
+            }
+        }
+    }
+    report
+}
+
+fn collect_image_resizes(
+    document: &Document,
+    image_dpi: u32,
+    warnings: &mut Vec<String>,
+) -> Vec<ImageResize> {
+    let mut targets = BTreeMap::<ObjectId, (u32, u32)>::new();
+    for (page_number, page_id) in document.get_pages() {
+        let geometry = match page_geometry(document, page_id) {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                warnings.push(format!(
+                    "page {page_number}: cannot read page size: {error:#}"
+                ));
+                continue;
+            }
+        };
+        let user_unit = inherited_value(document, page_id, b"UserUnit")
+            .and_then(|value| object_number(&value).ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0);
+        let page_width = geometry.display_width() * user_unit;
+        let page_height = geometry.display_height() * user_unit;
+        let images = match document.get_page_images(page_id) {
+            Ok(images) => images,
+            Err(error) => {
+                warnings.push(format!(
+                    "page {page_number}: cannot inspect images: {error:#}"
+                ));
+                continue;
+            }
+        };
+        for image in images {
+            let Ok(width) = u32::try_from(image.width) else {
+                continue;
+            };
+            let Ok(height) = u32::try_from(image.height) else {
+                continue;
+            };
+            let Some(target) = imageconv::fit_dimensions_for_dpi(
+                width,
+                height,
+                page_width,
+                page_height,
+                image_dpi,
+            ) else {
+                continue;
+            };
+            targets
+                .entry(image.id)
+                .and_modify(|current| {
+                    if target.0 > current.0 {
+                        *current = target;
+                    }
+                })
+                .or_insert(target);
+        }
+    }
+    targets
+        .into_iter()
+        .map(|(id, (target_width, target_height))| ImageResize {
+            id,
+            target_width,
+            target_height,
+        })
+        .collect()
+}
+
+fn downsample_image(document: &mut Document, resize: ImageResize, jpeg_quality: u8) -> Result<()> {
+    let decoded = {
+        let original = document.get_object(resize.id)?.as_stream()?;
+        reject_unsafe_image_features(original)?;
+        pdf_image::decode(original)?
+    };
+    let jpeg = imageconv::resize_to_jpeg(
+        &decoded,
+        Some((resize.target_width, resize.target_height)),
+        jpeg_quality,
+    )?;
+
+    let stream = document.get_object_mut(resize.id)?.as_stream_mut()?;
+    stream.dict.set("Width", i64::from(resize.target_width));
+    stream.dict.set("Height", i64::from(resize.target_height));
+    stream.dict.set("ColorSpace", "DeviceRGB");
+    stream.dict.set("BitsPerComponent", 8);
+    stream.dict.set("Filter", "DCTDecode");
+    stream.dict.remove(b"DecodeParms");
+    stream.dict.remove(b"Decode");
+    stream.set_content(jpeg);
+    Ok(())
+}
+
+fn reject_unsafe_image_features(stream: &Stream) -> Result<()> {
+    if stream.dict.get(b"SMask").is_ok() || stream.dict.get(b"Mask").is_ok() {
+        bail!("image masks are preserved without resampling");
+    }
+    if stream
+        .dict
+        .get(b"ImageMask")
+        .ok()
+        .and_then(|value| value.as_bool().ok())
+        .unwrap_or(false)
+    {
+        bail!("stencil images are preserved without resampling");
+    }
+    if stream.dict.get(b"Decode").is_ok() {
+        bail!("images with a custom Decode array are preserved");
+    }
+    let bits = stream
+        .dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .and_then(|value| value.as_i64().ok())
+        .unwrap_or(8);
+    if bits != 8 {
+        bail!("only 8-bit images can be resampled safely");
+    }
+    Ok(())
 }
 
 pub fn set_info_properties(document: &mut Document, author: &str, creator: &str) -> Result<()> {
@@ -563,17 +773,74 @@ fn stamp_position(value: &str, page: PageGeometry, width: f64, height: f64) -> R
 mod tests {
     use std::io::Cursor;
 
-    use image::{DynamicImage, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
+    use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
     use super::*;
 
     fn one_page() -> Document {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([20, 40, 60])));
+        image_page(image, None)
+    }
+
+    fn placed_image(width: u32, height: u32, display_width: f64, display_height: f64) -> Document {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
+            Rgb([
+                (x % 251) as u8,
+                (y % 241) as u8,
+                ((x.wrapping_add(y)) % 239) as u8,
+            ])
+        }));
+        image_page(image, Some((display_width, display_height)))
+    }
+
+    fn image_page(image: DynamicImage, placement: Option<(f64, f64)>) -> Document {
         let mut jpeg = Vec::new();
         image
             .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
             .unwrap();
-        super::super::jpeg_document(jpeg, "A4").unwrap()
+        let mut document = super::super::jpeg_document(jpeg, "A4").unwrap();
+        if let Some((width, height)) = placement {
+            let page_id = *document.get_pages().get(&1).unwrap();
+            let content_id = document
+                .get_dictionary(page_id)
+                .unwrap()
+                .get(b"Contents")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            document
+                .get_object_mut(content_id)
+                .unwrap()
+                .as_stream_mut()
+                .unwrap()
+                .set_content(
+                    format!("q\n{width} 0 0 {height} 10 20 cm\n/Im0 Do\nQ\n").into_bytes(),
+                );
+        }
+        document
+    }
+
+    fn first_image_dimensions(document: &Document) -> (u32, u32) {
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let image = document.get_page_images(page_id).unwrap().remove(0);
+        (image.width as u32, image.height as u32)
+    }
+
+    fn duplicate_first_page(document: &mut Document) {
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let page = document.get_dictionary(page_id).unwrap().clone();
+        let parent_id = page.get(b"Parent").unwrap().as_reference().unwrap();
+        let second_page_id = document.add_object(page);
+        let pages = document
+            .get_object_mut(parent_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap();
+        let mut kids = pages.get(b"Kids").unwrap().as_array().unwrap().clone();
+        kids.push(second_page_id.into());
+        let count = kids.len() as i64;
+        pages.set("Kids", kids);
+        pages.set("Count", count);
     }
 
     #[test]
@@ -595,6 +862,123 @@ mod tests {
         let geometry = page_geometry(&document, page_id).unwrap();
         assert!((geometry.display_width() - 841.89).abs() < 0.1);
         assert!((geometry.display_height() - 595.28).abs() < 0.1);
+    }
+
+    #[test]
+    fn auto_rotate_uses_majority_instead_of_first_page() {
+        let mut document = one_page();
+        duplicate_first_page(&mut document);
+        duplicate_first_page(&mut document);
+        rotate_pages(&mut document, "2-3", 90).unwrap();
+
+        assert_eq!(auto_rotate(&mut document).unwrap(), vec![1]);
+        assert!(document.get_pages().into_values().all(|page_id| {
+            let geometry = page_geometry(&document, page_id).unwrap();
+            geometry.display_width() < geometry.display_height()
+        }));
+    }
+
+    #[test]
+    fn resize_uses_majority_instead_of_first_page() {
+        let mut document = one_page();
+        duplicate_first_page(&mut document);
+        duplicate_first_page(&mut document);
+        rotate_pages(&mut document, "2-3", 90).unwrap();
+
+        resize_pages(&mut document, "A4", "all").unwrap();
+        assert!(document.get_pages().into_values().all(|page_id| {
+            let geometry = page_geometry(&document, page_id).unwrap();
+            geometry.display_width() < geometry.display_height()
+        }));
+    }
+
+    #[test]
+    fn resize_can_preserve_each_page_orientation() {
+        let mut document = one_page();
+        duplicate_first_page(&mut document);
+        duplicate_first_page(&mut document);
+        rotate_pages(&mut document, "2-3", 90).unwrap();
+
+        resize_pages_preserving_orientation(&mut document, "A4", "all").unwrap();
+        let orientations = document
+            .get_pages()
+            .into_values()
+            .map(|page_id| {
+                let geometry = page_geometry(&document, page_id).unwrap();
+                geometry.display_width() > geometry.display_height()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(orientations, vec![true, false, false]);
+    }
+
+    #[test]
+    fn optimize_downsamples_image_to_page_dpi() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        let report = optimize(&mut document, 36, 82);
+
+        assert_eq!(report.resized_images, 1);
+        assert_eq!(report.skipped_images, 0);
+        assert!(report.warnings.is_empty());
+        assert_eq!(first_image_dimensions(&document), (421, 211));
+
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let embedded = document.get_page_images(page_id).unwrap().remove(0);
+        let decoded = image::load_from_memory(embedded.content).unwrap();
+        assert_eq!(decoded.dimensions(), (421, 211));
+
+        let bytes = super::super::save_to_bytes(&mut document).unwrap();
+        let parsed = Document::load_mem(&bytes).unwrap();
+        assert_eq!(parsed.get_pages().len(), 1);
+        assert_eq!(first_image_dimensions(&parsed), (421, 211));
+    }
+
+    #[test]
+    fn optimize_dpi_zero_keeps_image_dimensions() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        let report = optimize(&mut document, 0, 82);
+
+        assert_eq!(report.resized_images, 0);
+        assert_eq!(report.skipped_images, 0);
+        assert_eq!(first_image_dimensions(&document), (1200, 600));
+    }
+
+    #[test]
+    fn optimize_resizes_a_shared_image_only_once() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        duplicate_first_page(&mut document);
+
+        let report = optimize(&mut document, 36, 82);
+
+        assert_eq!(report.resized_images, 1);
+        assert_eq!(document.get_pages().len(), 2);
+        for page_id in document.get_pages().into_values() {
+            let image = document.get_page_images(page_id).unwrap().remove(0);
+            assert_eq!((image.width, image.height), (421, 211));
+        }
+    }
+
+    #[test]
+    fn optimize_preserves_masked_images() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let image_id = document.get_page_images(page_id).unwrap().remove(0).id;
+        document
+            .get_object_mut(image_id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .dict
+            .set(
+                "Mask",
+                vec![0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
+            );
+
+        let report = optimize(&mut document, 100, 82);
+
+        assert_eq!(report.resized_images, 0);
+        assert_eq!(report.skipped_images, 1);
+        assert_eq!(first_image_dimensions(&document), (1200, 600));
+        assert!(report.warnings[0].contains("image masks are preserved"));
     }
 
     #[test]

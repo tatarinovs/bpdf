@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use lopdf::Document;
 
 use crate::fileset::InputSpec;
+use crate::formats::{self, Format};
 use crate::imageconv::{self, ImageOptions};
 use crate::office::{self, OfficeOptions};
 use crate::pdf;
@@ -20,53 +21,34 @@ pub struct LoadOptions {
 }
 
 pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
-    if imageconv::is_supported_image(&spec.path) {
-        reject_pages(spec)?;
-        let jpeg = imageconv::to_jpeg(&spec.path, &options.image, Some(&options.text.page_size))?;
-        return pdf::jpeg_document(jpeg, &options.text.page_size);
-    }
-
-    if is_pdf(spec) {
-        let mut document = Document::load(&spec.path)
-            .with_context(|| format!("failed to load PDF {}", spec.path.display()))?;
-        if let Some(pages) = &spec.pages {
-            pdf::select_pages(&mut document, pages)?;
+    match formats::detect(&spec.path) {
+        Some(format) if format.is_image() => {
+            reject_pages(spec)?;
+            let jpeg =
+                imageconv::to_jpeg(&spec.path, &options.image, Some(&options.text.page_size))?;
+            pdf::jpeg_document(jpeg, &options.text.page_size)
         }
-        return Ok(document);
+        Some(Format::Pdf) => {
+            let mut document = pdf::load(&spec.path)?;
+            if let Some(pages) = &spec.pages {
+                pdf::select_pages(&mut document, pages)?;
+            }
+            Ok(document)
+        }
+        Some(Format::Word | Format::Excel) => {
+            reject_pages(spec)?;
+            let bytes = office::convert_to_pdf(&spec.path, &options.office)?;
+            Document::load_mem(&bytes)
+                .with_context(|| format!("Office output for {} is invalid", spec.path.display()))
+        }
+        Some(Format::Text) => {
+            reject_pages(spec)?;
+            let text = fs::read_to_string(&spec.path)
+                .with_context(|| format!("failed to read text file {}", spec.path.display()))?;
+            textpdf::render(&text, &options.text)
+        }
+        _ => bail!("unsupported merge format: {}", spec.path.display()),
     }
-
-    if office::is_office(&spec.path) {
-        reject_pages(spec)?;
-        let bytes = office::convert_to_pdf(&spec.path, &options.office)?;
-        return Document::load_mem(&bytes)
-            .with_context(|| format!("Office output for {} is invalid", spec.path.display()));
-    }
-
-    if is_text(&spec.path) {
-        reject_pages(spec)?;
-        let text = fs::read_to_string(&spec.path)
-            .with_context(|| format!("failed to read text file {}", spec.path.display()))?;
-        return textpdf::render(&text, &options.text);
-    }
-
-    bail!("unsupported merge format: {}", spec.path.display())
-}
-
-pub fn is_text(path: &std::path::Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("md" | "txt")
-    )
-}
-
-fn is_pdf(spec: &InputSpec) -> bool {
-    spec.path
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
 }
 
 fn reject_pages(spec: &InputSpec) -> Result<()> {

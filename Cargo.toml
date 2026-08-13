@@ -1,9 +1,9 @@
 [package]
 name = "bpdf"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
-description = "Rust prototype for loss-conscious PDF and image processing"
+description = "Second-generation loss-conscious PDF and image processing toolkit"
 license = "MIT"
 repository = "https://github.com/tatarinovs/bpdf"
 keywords = ["pdf", "merge", "ocr", "image", "cli"]
@@ -35,5 +35,5 @@ ureq = { version = "3.3.0", default-features = false, features = [
 [profile.release]
 strip = true
 lto = "fat"
-opt-level = "s"
+opt-level = "z"
 codegen-units = 1

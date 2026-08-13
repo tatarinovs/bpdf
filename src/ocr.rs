@@ -8,16 +8,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use image::{DynamicImage, GrayImage, RgbImage};
-use lopdf::{Document, Object};
+use lopdf::Document;
 use serde_json::{Value, json};
 use tempfile::Builder;
 use ureq::{Agent, Proxy};
 
 use crate::encoding::base64;
+use crate::formats::{self, Format};
 use crate::hash::sha256_hex;
 use crate::imageconv::{self, ImageOptions};
-use crate::{atomic, output};
+use crate::{atomic, output, pdf};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
@@ -145,13 +145,13 @@ impl OcrEngine {
     }
 
     fn extract_text_with_mode(&self, path: &Path, parallel_pdf_images: bool) -> Result<String> {
-        if is_pdf(path) {
-            self.process_pdf(path, parallel_pdf_images)
-        } else if imageconv::is_supported_image(path) {
-            let image = imageconv::for_ocr(path, &self.options.image)?;
-            self.run_vision(&image, file_label(path))
-        } else {
-            bail!("unsupported OCR input: {}", path.display())
+        match formats::detect(path) {
+            Some(Format::Pdf) => self.process_pdf(path, parallel_pdf_images),
+            Some(format) if format.is_image() => {
+                let image = imageconv::for_ocr(path, &self.options.image)?;
+                self.run_vision(&image, file_label(path))
+            }
+            _ => bail!("unsupported OCR input: {}", path.display()),
         }
     }
 
@@ -183,13 +183,9 @@ impl OcrEngine {
     }
 
     fn process_pdf(&self, path: &Path, parallel_images: bool) -> Result<String> {
-        let document =
-            Document::load(path).with_context(|| format!("failed to load {}", path.display()))?;
+        let document = pdf::load(path)?;
         let pages = document.get_pages();
-        let page_numbers = pages.keys().copied().collect::<Vec<_>>();
-        let native_text = document
-            .extract_text_with_limit(&page_numbers, 256 * 1024 * 1024)
-            .unwrap_or_default();
+        let native_text = pdf::extract_text(&document).unwrap_or_default();
         let mut parts = Vec::new();
         if !native_text.trim().is_empty() {
             parts.push(native_text.trim().to_owned());
@@ -463,8 +459,9 @@ pub fn extract_pdf_images(
             } else if filters.iter().any(|filter| filter == "JPXDecode") {
                 convert_encoded_image(&stream.content, ".jp2", options)?
             } else {
-                raw_pdf_image_to_jpeg(stream, options.jpeg_quality)
-                    .with_context(|| format!("{label}: unsupported PDF image encoding"))?
+                let image = pdf::image::decode(stream)
+                    .with_context(|| format!("{label}: unsupported PDF image encoding"))?;
+                imageconv::encode_jpeg_on_white(&image, options.jpeg_quality)?
             };
             output.push(ExtractedImage { label, bytes });
         }
@@ -477,69 +474,6 @@ fn convert_encoded_image(bytes: &[u8], suffix: &str, options: &ImageOptions) -> 
     temporary.write_all(bytes)?;
     temporary.as_file_mut().sync_all()?;
     imageconv::ffmpeg_to_jpeg(temporary.path(), options)
-}
-
-fn raw_pdf_image_to_jpeg(stream: &lopdf::Stream, quality: u8) -> Result<Vec<u8>> {
-    let width = stream.dict.get(b"Width")?.as_i64()? as u32;
-    let height = stream.dict.get(b"Height")?.as_i64()? as u32;
-    let bits = stream
-        .dict
-        .get(b"BitsPerComponent")
-        .ok()
-        .and_then(|value| value.as_i64().ok())
-        .unwrap_or(8);
-    if bits != 8 {
-        bail!("only 8-bit raw PDF images are supported");
-    }
-    let color_space = stream
-        .dict
-        .get(b"ColorSpace")
-        .ok()
-        .and_then(color_space_name)
-        .unwrap_or("DeviceRGB");
-    let raw = stream
-        .decompressed_content_with_limit(256 * 1024 * 1024)
-        .context("failed to decompress PDF image")?;
-
-    let image = match color_space {
-        "DeviceGray" => DynamicImage::ImageLuma8(
-            GrayImage::from_raw(width, height, raw).context("bad grayscale image length")?,
-        ),
-        "DeviceRGB" => DynamicImage::ImageRgb8(
-            RgbImage::from_raw(width, height, raw).context("bad RGB image length")?,
-        ),
-        "DeviceCMYK" => {
-            if raw.len() != width as usize * height as usize * 4 {
-                bail!("bad CMYK image length");
-            }
-            let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for pixel in raw.chunks_exact(4) {
-                let c = f64::from(pixel[0]) / 255.0;
-                let m = f64::from(pixel[1]) / 255.0;
-                let y = f64::from(pixel[2]) / 255.0;
-                let k = f64::from(pixel[3]) / 255.0;
-                rgb.push((255.0 * (1.0 - c) * (1.0 - k)).round() as u8);
-                rgb.push((255.0 * (1.0 - m) * (1.0 - k)).round() as u8);
-                rgb.push((255.0 * (1.0 - y) * (1.0 - k)).round() as u8);
-            }
-            DynamicImage::ImageRgb8(
-                RgbImage::from_raw(width, height, rgb).context("bad converted image length")?,
-            )
-        }
-        other => bail!("unsupported color space {other}"),
-    };
-    imageconv::encode_jpeg_on_white(&image, quality)
-}
-
-fn color_space_name(object: &Object) -> Option<&str> {
-    match object {
-        Object::Name(name) => std::str::from_utf8(name).ok(),
-        Object::Array(items) => items
-            .first()
-            .and_then(|item| item.as_name().ok())
-            .and_then(|name| std::str::from_utf8(name).ok()),
-        _ => None,
-    }
 }
 
 fn has_text_layer(text: &str, pages: usize) -> bool {
@@ -584,12 +518,6 @@ fn strip_think_blocks(content: &str) -> String {
         content.replace_range(start..end, "");
         content = content.trim().to_owned();
     }
-}
-
-fn is_pdf(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("pdf"))
 }
 
 fn file_label(path: &Path) -> &str {
