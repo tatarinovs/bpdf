@@ -1023,4 +1023,111 @@ mod tests {
             .unwrap();
         assert!(value.starts_with(&[0xfe, 0xff]));
     }
+
+    #[test]
+    fn create_bookmarks_builds_outlines_tree() {
+        let mut document = one_page();
+        duplicate_first_page(&mut document);
+        let entries = vec![
+            ("First Section".to_owned(), 1),
+            ("Вторая секция".to_owned(), 2),
+        ];
+        create_bookmarks(&mut document, &entries).unwrap();
+
+        let root_id = document.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = document.get_dictionary(root_id).unwrap();
+        let outlines_id = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
+        let outlines = document.get_dictionary(outlines_id).unwrap();
+
+        assert_eq!(outlines.get(b"Count").unwrap().as_i64().unwrap(), 2);
+        let first_id = outlines.get(b"First").unwrap().as_reference().unwrap();
+        let last_id = outlines.get(b"Last").unwrap().as_reference().unwrap();
+
+        let first_item = document.get_dictionary(first_id).unwrap();
+        assert_eq!(first_item.get(b"Title").unwrap().as_str().unwrap(), b"First Section");
+        assert_eq!(
+            first_item.get(b"Next").unwrap().as_reference().unwrap(),
+            last_id
+        );
+
+        let last_item = document.get_dictionary(last_id).unwrap();
+        assert_eq!(
+            last_item.get(b"Prev").unwrap().as_reference().unwrap(),
+            first_id
+        );
+        let title_bytes = last_item.get(b"Title").unwrap().as_str().unwrap();
+        assert!(title_bytes.starts_with(&[0xfe, 0xff]));
+    }
+}
+
+pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let pages = document.get_pages();
+    if pages.is_empty() {
+        return Ok(());
+    }
+
+    let valid_entries: Vec<(&str, ObjectId)> = entries
+        .iter()
+        .filter_map(|(title, page_num)| {
+            pages.get(page_num).map(|&page_id| (title.as_str(), page_id))
+        })
+        .collect();
+
+    if valid_entries.is_empty() {
+        return Ok(());
+    }
+
+    let outline_root_id = document.new_object_id();
+    let item_ids: Vec<ObjectId> = (0..valid_entries.len())
+        .map(|_| document.new_object_id())
+        .collect();
+
+    for (i, (&(title, page_id), &item_id)) in valid_entries.iter().zip(&item_ids).enumerate() {
+        let mut dict = dictionary! {
+            "Title" => info_string(title),
+            "Parent" => outline_root_id,
+            "Dest" => vec![
+                Object::Reference(page_id),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        };
+        if i > 0 {
+            dict.set("Prev", item_ids[i - 1]);
+        }
+        if i + 1 < item_ids.len() {
+            dict.set("Next", item_ids[i + 1]);
+        }
+        document.objects.insert(item_id, Object::Dictionary(dict));
+    }
+
+    let root_dict = dictionary! {
+        "Type" => "Outlines",
+        "First" => item_ids[0],
+        "Last" => item_ids[item_ids.len() - 1],
+        "Count" => item_ids.len() as i64,
+    };
+    document.objects.insert(outline_root_id, Object::Dictionary(root_dict));
+
+    let catalog_id = if let Ok(root) = document.trailer.get(b"Root") {
+        root.as_reference()?
+    } else {
+        let id = document.new_object_id();
+        document
+            .objects
+            .insert(id, Object::Dictionary(dictionary! { "Type" => "Catalog" }));
+        document.trailer.set("Root", id);
+        id
+    };
+
+    let catalog = document
+        .get_object_mut(catalog_id)
+        .context("catalog object not found")?
+        .as_dict_mut()
+        .context("catalog is not a dictionary")?;
+    catalog.set("Outlines", outline_root_id);
+
+    Ok(())
 }

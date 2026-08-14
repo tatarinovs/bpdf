@@ -10,8 +10,8 @@ PDF при `split` и сокращено копирование данных п�
 
 ## Возможности
 
-- **Объединение (Merge):** Склеивание PDF, обычных изображений, JPEG 2000/JPEG-LS/JPEG XR, HEIC/AVIF/PSD, RAW-снимков камер, документов Word/Excel/PowerPoint/OpenDocument и текстовых файлов в единый PDF или текстовый файл.
-- **Многостраничные изображения:** Все страницы TIFF и все кадры GIF/APNG/анимированного WebP становятся отдельными страницами PDF при `merge`.
+- **Объединение (Merge):** Склеивание PDF, обычных изображений, комиксов (CBZ), JPEG 2000/JPEG-LS/JPEG XR, HEIC/AVIF/PSD, RAW-снимков камер, электронных книг (EPUB, FB2, FB2.ZIP, HTMLZ), документов Word/Excel/PowerPoint/OpenDocument и текстовых файлов в единый PDF или текстовый файл.
+- **Многостраничные изображения и комиксы:** Все страницы TIFF, архивы CBZ (с естественной сортировкой страниц) и все кадры GIF/APNG/анимированного WebP становятся отдельными страницами PDF при `merge`.
 - **Диапазоны страниц во входе:** Гибкий выбор страниц прямо при указании файлов (`document.pdf:1-5,8,last`).
 - **Оптический распознаватель текста (Groq Vision OCR):** Извлечение текста со сканов, обычных изображений, HEIC/AVIF/PSD, RAW-снимков и PDF в Markdown через Groq Vision с автоматическим подхватом готового текстового слоя PDF без расхода API-квот.
 - **Умное кеширование OCR:** Content-addressed кеш на диске (SHA-256 хэш изображения + модель + промпт). Повторные вызовы и параллельные потоки выполняются мгновенно без обращения к сети.
@@ -34,7 +34,7 @@ PDF при `split` и сокращено копирование данных п�
 - **Внешние форматы изображений:** Для HEIC/HEIF, AVIF, PSD, JPEG 2000/JPEG-LS, DDS, EXR, HDR, QOI, TGA, PCX, PNM, SGI, XBM, DPX, FITS и других редких растров требуется установленный `ffmpeg` в системном `PATH` либо параметр `--ffmpeg C:\path\to\ffmpeg.exe`. Фактический набор декодеров зависит от сборки FFmpeg.
 - **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
 - **RAW-снимки камер:** В Windows CR2/CR3, NEF/NRW, ARW, DNG, RAF, ORF, RW2 и другие RAW декодируются системным Windows Imaging Component. Нужен компактный Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`.
-- **Конвертация Office/OpenDocument:** В Windows для DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP требуется установленный и активированный Microsoft Office с соответствующим приложением.
+- **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
 - **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.jsonc`, в том числе через `%GROQ_API_KEY%`.
 
 ---
@@ -104,6 +104,7 @@ bpdf merge <INPUTS>... [OPTIONS]
 - `--keep-icc[=true|false]` — Сохранять цветовые профили ICC у изображений (по умолчанию `false` для уменьшения размера).
 - `--optimize[=true|false]` — Оптимизировать структуру PDF и уменьшать слишком большие встроенные изображения до `image_dpi` из конфигурации; JPEG кодируется с `jpeg_quality`.
 - `--strip-meta[=true|false]` — Удалять метаданные из итогового документа.
+- `--bookmarks[=true|false]` — Создавать оглавление/закладки (PDF Outlines) для каждого объединяемого файла.
 - `--author <STRING>` — Указать имя автора в свойствах PDF.
 - `--creator <STRING>` — Указать программу-создателя в свойствах PDF.
 - `--ffmpeg <PATH>` — Путь к FFmpeg для внешних форматов изображений и резервного декодирования.
@@ -116,7 +117,7 @@ bpdf ocr <INPUTS>... [OPTIONS]
 ```
 
 **Параметры:**
-- `<INPUTS>...` — Входные файлы (JPG, PNG, HEIC, AVIF, PSD, RAW, PDF и др.), папки или маски. *(Обязательный)*.
+- `<INPUTS>...` — Входные файлы (JPG, PNG, PDF, RAW и др., включая диапазоны страниц для PDF: `doc.pdf:1-5`), папки или маски. *(Обязательный)*.
 - `-o, --out <PATH>` — Путь к итоговому файлу Markdown (`.md`). Если не указан, создаются индивидуальные файлы `.md` рядом с каждым исходным файлом.
 - `--proxy <URL>` — Прокси-сервер (`http://...` или `socks5://...`).
 - `--model <NAME>` — Модель Groq Vision (по умолчанию `qwen/qwen3.6-27b`).
@@ -267,7 +268,7 @@ bpdf convert <INPUTS>... [OPTIONS]
 ```
 
 **Параметры:**
-- `<INPUTS>...` — Исходные изображения или PDF-файлы.
+- `<INPUTS>...` — Исходные изображения или PDF-файлы (включая диапазоны страниц для PDF: `doc.pdf:1-5`).
 - `-o, --out <PATH>` — Директория назначения для сохранённых JPEG-файлов.
 - `--keep-icc[=true|false]` — Сохранять цветовые профили ICC.
 - `--ffmpeg <PATH>` — Путь к FFmpeg для внешних форматов изображений и резервного декодирования.
@@ -296,12 +297,13 @@ bpdf doctor
 - При `merge` все логические страницы TIFF и все кадры GIF/APNG/анимированного WebP добавляются в PDF по порядку. Ограничение безопасности — не более 10 000 кадров из одного файла. `convert`, `ocr` и `strip` работают с одним основным кадром.
 - JPEG XL не заявлен как поддерживаемый: декодер JXL отсутствует во многих сборках FFmpeg.
 
-### Форматы Office и текста
+### Электронные книги и текстовые форматы
 
+- **Электронные книги:** `.epub`, `.fb2`, `.fb2.zip` (распаковка архивов, автоизвлечение структуры глав, заголовков и метаданных Title/Author при конвертации в PDF).
 - Word: `.doc`, `.docx`, `.rtf`, `.odt`.
 - Excel: `.xls`, `.xlsx`, `.ods`.
 - PowerPoint: `.ppt`, `.pptx`, `.pps`, `.ppsx`, `.odp`.
-- Текст: `.md`, `.txt`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.log`, `.ini`, `.cfg`, `.csv`, `.tsv`.
+- Текст: `.md`, `.txt`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.log`, `.ini`, `.cfg`, `.csv`, `.tsv`, а также **любые другие текстовые файлы и файлы исходного кода** (`.rs`, `.py`, `.c`, `.cpp`, `.js`, `.sql`, `LICENSE`, `.env` и т.д.), автоопределяемые по содержимому (эвристика валидации UTF-8 / ASCII).
 - Если все входы текстовые, по умолчанию они объединяются как текст. Явный выход `-o result.pdf` включает рендеринг текста в PDF.
 
 ### Синтаксис диапазонов страниц
@@ -439,6 +441,10 @@ bpdf merge multipage.tiff animation.apng animation.webp -o pages.pdf
 
 # PowerPoint и OpenDocument в PDF
 bpdf merge slides.pptx report.odt table.ods -o office.pdf
+
+# Конвертация электронных книг (EPUB, FB2, FB2.ZIP) в PDF
+bpdf merge book.epub -o book.pdf
+bpdf merge story.fb2.zip -o story.pdf
 
 # JSON/XML/YAML как текстовый PDF
 bpdf merge data.json settings.xml config.yaml -o data.pdf

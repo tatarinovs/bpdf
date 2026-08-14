@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -6,15 +5,20 @@ use anyhow::{Context, Result, bail};
 use super::common::{DOCUMENT_SEPARATOR, finish_batch, write_output};
 use crate::cli::OcrArgs;
 use crate::config::Config;
-use crate::fileset::expand;
-use crate::formats::InputFormatSet;
+use crate::fileset::{InputSpec, expand};
+use crate::formats::{self, Format, InputFormatSet};
 use crate::ocr::{OcrEngine, OcrOptions};
 use crate::output;
 
 pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Ocr)?;
-    if specs.iter().any(|spec| spec.pages.is_some()) {
-        bail!("page ranges are not supported by ocr; extract the pages first");
+    for spec in &specs {
+        if spec.pages.is_some() && formats::detect(&spec.path) != Some(Format::Pdf) {
+            bail!(
+                "page ranges are only valid for PDF inputs: {}",
+                spec.path.display()
+            );
+        }
     }
 
     let jobs = args.jobs.unwrap_or(config.ocr_jobs);
@@ -41,13 +45,13 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     })?;
 
     for spec in &specs {
-        output::info(format!("Queued OCR: {}", spec.path.display()));
+        if let Some(pages) = &spec.pages {
+            output::info(format!("Queued OCR: {}:{}", spec.path.display(), pages));
+        } else {
+            output::info(format!("Queued OCR: {}", spec.path.display()));
+        }
     }
-    let paths = specs
-        .iter()
-        .map(|spec| spec.path.clone())
-        .collect::<Vec<_>>();
-    let results = extract(&engine, &paths, fail_fast);
+    let results = extract(&engine, &specs, fail_fast);
     let combined = args.out.is_some();
     let mut parts = Vec::new();
     let mut failures = 0usize;
@@ -92,13 +96,13 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     finish_batch("ocr", specs.len(), failures, outputs)
 }
 
-fn extract(engine: &OcrEngine, paths: &[PathBuf], fail_fast: bool) -> Vec<Result<String>> {
+fn extract(engine: &OcrEngine, specs: &[InputSpec], fail_fast: bool) -> Vec<Result<String>> {
     if !fail_fast {
-        return engine.extract_many(paths);
+        return engine.extract_many_specs(specs);
     }
     let mut results = Vec::new();
-    for path in paths {
-        let result = engine.extract_text(path);
+    for spec in specs {
+        let result = engine.extract_spec(spec);
         let failed = result.is_err();
         results.push(result);
         if failed {

@@ -46,16 +46,37 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             }
             Ok(document)
         }
+        Some(Format::Cbz) => {
+            reject_pages(spec)?;
+            crate::archive::load_cbz(&spec.path, &options.image, Some(&options.text.page_size))
+        }
         Some(format) if format.is_office() => {
             reject_pages(spec)?;
-            let bytes = office::convert_to_pdf(&spec.path, &options.office)?;
-            Document::load_mem(&bytes)
-                .with_context(|| format!("Office output for {} is invalid", spec.path.display()))
+            match office::convert_to_pdf(&spec.path, &options.office) {
+                Ok(bytes) => Document::load_mem(&bytes)
+                    .with_context(|| format!("Office output for {} is invalid", spec.path.display())),
+                Err(com_err) => {
+                    if let Ok(text) = crate::office_fallback::extract_text(&spec.path) {
+                        crate::output::warn(format!(
+                            "COM automation unavailable for {}, using Pure-Rust text fallback: {com_err}",
+                            spec.path.display()
+                        ));
+                        textpdf::render(&text, &options.text)
+                    } else {
+                        Err(com_err)
+                    }
+                }
+            }
         }
         Some(Format::Text) => {
             reject_pages(spec)?;
             let text = fs::read_to_string(&spec.path)
                 .with_context(|| format!("failed to read text file {}", spec.path.display()))?;
+            textpdf::render(&text, &options.text)
+        }
+        Some(format) if format.is_ebook() => {
+            reject_pages(spec)?;
+            let text = crate::ebook::load(&spec.path)?;
             textpdf::render(&text, &options.text)
         }
         _ => bail!("unsupported merge format: {}", spec.path.display()),

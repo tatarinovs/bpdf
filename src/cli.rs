@@ -226,6 +226,10 @@ pub struct MergeArgs {
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub strip_meta: Option<bool>,
 
+    /// Add PDF outline bookmarks for each merged input file.
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub bookmarks: Option<bool>,
+
     /// PDF Author metadata value.
     #[arg(long)]
     pub author: Option<String>,

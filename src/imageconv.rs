@@ -72,6 +72,35 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
     resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
 }
 
+/// Convert raw image bytes into JPEG for PDF page creation.
+pub fn bytes_to_jpeg(
+    bytes: &[u8],
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<u8>> {
+    if let Ok(ImageFormat::Jpeg) = image::guess_format(bytes) {
+        let jpeg_target = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+            .and_then(|(w, h)| dpi_target_for_dimensions(w, h, page_size, options.image_dpi));
+        if jpeg_target.is_none() {
+            if let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
+                return Ok(stripped);
+            }
+        }
+    }
+
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("failed to determine image format")?
+        .decode()
+        .context("failed to decode image bytes")?;
+
+    let target_dimensions = dpi_target(&image, page_size, options.image_dpi);
+    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+}
+
 /// Decode every logical page/frame for PDF construction. Single-image callers
 /// keep using `to_jpeg`, so convert/OCR naming and behavior remain stable.
 pub fn to_jpegs_for_pdf(

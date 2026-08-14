@@ -14,7 +14,7 @@ use crate::{ocr, output, pdf};
 #[derive(Debug)]
 enum Plan {
     Image(PathBuf),
-    Pdf,
+    Pdf(Option<String>),
 }
 
 pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
@@ -66,16 +66,16 @@ fn build_plans(
         .map(|spec| {
             let input = spec.path.clone();
             let plan = (|| {
-                if spec.pages.is_some() {
-                    bail!("page ranges are not valid for convert");
-                }
                 match formats::detect(&input) {
                     Some(format) if format.is_image() => {
+                        if spec.pages.is_some() {
+                            bail!("page ranges are only valid for PDF inputs");
+                        }
                         let output = image_output_path(&input, output_dir)?;
                         registry.reserve(&input, &output, force)?;
                         Ok(Plan::Image(output))
                     }
-                    Some(Format::Pdf) => Ok(Plan::Pdf),
+                    Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
                     _ => bail!("unsupported convert input: {}", input.display()),
                 }
             })();
@@ -99,9 +99,12 @@ fn execute(
             write_output(&output, &jpeg)?;
             Ok(1)
         }
-        Plan::Pdf => {
+        Plan::Pdf(pages) => {
             output::info(format!("Extracting images from PDF {}", input.display()));
-            let document = pdf::load(input)?;
+            let mut document = pdf::load(input)?;
+            if let Some(pages) = pages {
+                pdf::select_pages(&mut document, &pages)?;
+            }
             let images = ocr::extract_pdf_images(&document, image_options)
                 .with_context(|| format!("failed to extract images from {}", input.display()))?;
             if images.is_empty() {
@@ -250,5 +253,23 @@ mod tests {
         let plans = build_plans(&specs, Some(&output), false, &mut registry);
         assert!(plans[0].1.is_ok());
         assert!(format!("{:#}", plans[1].1.as_ref().unwrap_err()).contains("multiple inputs"));
+    }
+
+    #[test]
+    fn page_ranges_on_images_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("photo.png");
+        sample_png(&image);
+        let specs = [InputSpec {
+            path: image,
+            pages: Some("1".to_owned()),
+        }];
+        let mut registry = OutputRegistry::default();
+        let plans = build_plans(&specs, None, false, &mut registry);
+        assert!(plans[0].1.is_err());
+        assert!(
+            format!("{:#}", plans[0].1.as_ref().unwrap_err())
+                .contains("page ranges are only valid for PDF inputs")
+        );
     }
 }

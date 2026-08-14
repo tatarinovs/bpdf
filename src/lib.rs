@@ -1,9 +1,11 @@
 pub mod cli;
 pub mod config;
 
+mod archive;
 mod atomic;
 mod commands;
 mod doctor;
+mod ebook;
 mod encoding;
 mod fileset;
 mod formats;
@@ -13,11 +15,13 @@ mod input;
 mod metadata;
 mod ocr;
 mod office;
+mod office_fallback;
 mod output;
 mod pdf;
 mod process;
 mod textpdf;
 mod wic;
+mod xml;
 
 use std::ffi::OsString;
 

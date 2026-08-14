@@ -55,10 +55,26 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
             specs.len(),
             spec.path.display()
         ));
-        (&spec.path, input::load(spec, &options))
+        (&spec.path, input::load(spec, &options).map(|doc| (spec.path.clone(), doc)))
     });
     let mut documents = Vec::with_capacity(specs.len());
-    let failures = handle_results(loads, fail_fast, "failed to load", "Skipping", |document| {
+    let mut bookmarks = Vec::new();
+    let mut current_page = 1u32;
+    let generate_bookmarks = args.bookmarks.unwrap_or(config.bookmarks);
+
+    let failures = handle_results(loads, fail_fast, "failed to load", "Skipping", |(path, document)| {
+        if generate_bookmarks {
+            let title = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("document")
+                .to_owned();
+            let page_count = document.get_pages().len() as u32;
+            if page_count > 0 {
+                bookmarks.push((title, current_page));
+                current_page += page_count;
+            }
+        }
         documents.push(document);
     })?;
 
@@ -68,6 +84,10 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
 
     output::info("Merging page trees...");
     let mut document = pdf::merge_documents(documents)?;
+    if generate_bookmarks && !bookmarks.is_empty() {
+        output::info("Adding outline bookmarks...");
+        transform::create_bookmarks(&mut document, &bookmarks)?;
+    }
     if !args.no_rotate && args.auto_rotate.unwrap_or(config.auto_rotate) {
         let pages = transform::auto_rotate(&mut document)?;
         if !pages.is_empty() {

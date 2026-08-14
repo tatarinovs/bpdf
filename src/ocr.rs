@@ -140,14 +140,27 @@ impl OcrEngine {
         })
     }
 
+    #[allow(dead_code)]
     pub fn extract_text(&self, path: &Path) -> Result<String> {
-        self.extract_text_with_mode(path, true)
+        self.extract_text_with_mode(path, None, true)
     }
 
-    fn extract_text_with_mode(&self, path: &Path, parallel_pdf_images: bool) -> Result<String> {
+    pub fn extract_spec(&self, spec: &crate::fileset::InputSpec) -> Result<String> {
+        self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), true)
+    }
+
+    fn extract_text_with_mode(
+        &self,
+        path: &Path,
+        pages_filter: Option<&str>,
+        parallel_pdf_images: bool,
+    ) -> Result<String> {
         match formats::detect(path) {
-            Some(Format::Pdf) => self.process_pdf(path, parallel_pdf_images),
+            Some(Format::Pdf) => self.process_pdf(path, pages_filter, parallel_pdf_images),
             Some(format) if format.is_image() => {
+                if pages_filter.is_some() {
+                    bail!("page ranges are only valid for PDF inputs");
+                }
                 let image = imageconv::for_ocr(path, &self.options.image)?;
                 self.run_vision(&image, file_label(path))
             }
@@ -155,12 +168,22 @@ impl OcrEngine {
         }
     }
 
+    pub fn extract_many_specs(&self, specs: &[crate::fileset::InputSpec]) -> Vec<Result<String>> {
+        if specs.len() <= 1 {
+            return specs.iter().map(|spec| self.extract_spec(spec)).collect();
+        }
+        parallel_map(specs, self.options.jobs, |spec| {
+            self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), false)
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn extract_many(&self, paths: &[PathBuf]) -> Vec<Result<String>> {
         if paths.len() <= 1 {
             return paths.iter().map(|path| self.extract_text(path)).collect();
         }
         parallel_map(paths, self.options.jobs, |path| {
-            self.extract_text_with_mode(path, false)
+            self.extract_text_with_mode(path, None, false)
         })
     }
 
@@ -182,8 +205,16 @@ impl OcrEngine {
         Ok(())
     }
 
-    fn process_pdf(&self, path: &Path, parallel_images: bool) -> Result<String> {
-        let document = pdf::load(path)?;
+    fn process_pdf(
+        &self,
+        path: &Path,
+        pages_filter: Option<&str>,
+        parallel_images: bool,
+    ) -> Result<String> {
+        let mut document = pdf::load(path)?;
+        if let Some(pages) = pages_filter {
+            pdf::select_pages(&mut document, pages)?;
+        }
         let pages = document.get_pages();
         let native_text = pdf::extract_text(&document).unwrap_or_default();
         let mut parts = Vec::new();
@@ -601,6 +632,28 @@ mod tests {
         let extracted = engine.extract_text(temporary.path()).unwrap();
 
         assert!(!extracted.trim().is_empty());
+    }
+
+    #[test]
+    fn native_pdf_text_with_page_filter() {
+        let temporary = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        let doc1 =
+            crate::textpdf::render("Первая страница", &crate::textpdf::TextOptions::default())
+                .unwrap();
+        let doc2 =
+            crate::textpdf::render("Вторая страница", &crate::textpdf::TextOptions::default())
+                .unwrap();
+        let mut merged = crate::pdf::merge_documents(vec![doc1, doc2]).unwrap();
+        merged.save(temporary.path()).unwrap();
+        let engine = OcrEngine::new(options_without_api_key()).unwrap();
+
+        let spec = crate::fileset::InputSpec {
+            path: temporary.path().to_path_buf(),
+            pages: Some("2".to_owned()),
+        };
+        let extracted = engine.extract_spec(&spec).unwrap();
+        assert!(extracted.contains("Вторая"));
+        assert!(!extracted.contains("Первая"));
     }
 
     #[test]

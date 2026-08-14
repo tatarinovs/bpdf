@@ -101,7 +101,7 @@ fn natural_sort(paths: &mut [PathBuf]) {
     paths.sort_by(|left, right| natural_compare(&left.to_string_lossy(), &right.to_string_lossy()));
 }
 
-fn natural_compare(left: &str, right: &str) -> Ordering {
+pub fn natural_compare(left: &str, right: &str) -> Ordering {
     let left_folded = left.to_lowercase();
     let right_folded = right.to_lowercase();
     let left = left_folded.as_bytes();
