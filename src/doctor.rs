@@ -47,6 +47,14 @@ pub fn run(config: &Config) -> Result<()> {
         &mut failures,
     );
 
+    let raw_decoder = crate::wic::availability();
+    check(
+        "raw_decoder",
+        raw_decoder.is_ok(),
+        raw_decoder.unwrap_or_else(|error| format!("{error:#}")),
+        &mut failures,
+    );
+
     let office_options = OfficeOptions {
         powershell: config.powershell.clone(),
         timeout: Duration::from_secs(config.office_timeout_seconds),
@@ -73,10 +81,21 @@ pub fn run(config: &Config) -> Result<()> {
                 },
                 &mut failures,
             );
+            check(
+                "powerpoint",
+                availability.powerpoint,
+                if availability.powerpoint {
+                    "COM registration found"
+                } else {
+                    "COM registration not found"
+                },
+                &mut failures,
+            );
         }
         Err(error) => {
             check("word", false, format!("{error:#}"), &mut failures);
             check("excel", false, "Office probe failed", &mut failures);
+            check("powerpoint", false, "Office probe failed", &mut failures);
         }
     }
 

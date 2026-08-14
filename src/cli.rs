@@ -31,7 +31,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Merge PDF, images, Office and text files.
+    /// Merge PDF, image frames, Office/OpenDocument and text files.
     Merge(MergeArgs),
     /// Extract text from PDF/images, using Groq Vision when needed.
     Ocr(OcrArgs),
@@ -113,7 +113,7 @@ pub enum Command {
         #[command(subcommand)]
         command: MetadataCommand,
     },
-    /// Convert images or PDF embedded images to JPEG.
+    /// Convert supported images or PDF embedded images to JPEG.
     Convert(ConvertArgs),
 }
 
@@ -232,7 +232,7 @@ pub struct MergeArgs {
     /// PDF Creator metadata value.
     #[arg(long)]
     pub creator: Option<String>,
-    /// Path to FFmpeg, used for HEIC/HEIF input.
+    /// Path to FFmpeg for external image formats and decoder fallback.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
 }
@@ -260,7 +260,7 @@ pub struct OcrArgs {
     /// Run Vision OCR even when a PDF already has a text layer.
     #[arg(long)]
     pub force_ocr: bool,
-    /// Path to FFmpeg, used for HEIC/HEIF input.
+    /// Path to FFmpeg for external image formats and decoder fallback.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
     /// Maximum simultaneous OCR requests (1-64).
@@ -285,7 +285,7 @@ pub struct StripArgs {
     /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub keep_icc: Option<bool>,
-    /// Path to FFmpeg, used for HEIC/HEIF input.
+    /// Path to FFmpeg for external image formats and decoder fallback.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
 }
@@ -301,7 +301,7 @@ pub struct ConvertArgs {
     /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub keep_icc: Option<bool>,
-    /// Path to FFmpeg, used for HEIC/HEIF input.
+    /// Path to FFmpeg for external image formats and decoder fallback.
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
     /// Allow output to overwrite an input file (e.g. jpg -> jpg in place).

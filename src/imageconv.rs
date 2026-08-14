@@ -1,11 +1,15 @@
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use image::AnimationDecoder;
+use image::codecs::gif::GifDecoder;
 use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::PngDecoder;
+use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
 use image::{
     DynamicImage, ExtendedColorType, GenericImageView, ImageFormat, ImageReader, Rgb, RgbImage,
@@ -15,6 +19,8 @@ use tempfile::Builder;
 use crate::formats::{self, Format};
 use crate::metadata;
 use crate::process;
+
+const MAX_IMAGE_FRAMES: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct ImageOptions {
@@ -26,36 +32,148 @@ pub struct ImageOptions {
 
 pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
     let format = formats::detect(path);
-    if format == Some(Format::Heic) {
-        return ffmpeg_to_jpeg(path, options);
+    if format.is_some_and(Format::requires_ffmpeg) {
+        return ffmpeg_to_jpeg_for_page(path, options, page_size);
+    }
+    if format.is_some_and(Format::requires_wic) {
+        return decoded_to_jpeg_for_page(crate::wic::decode(path)?, options, page_size);
     }
 
     let input = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
 
-    // Check if we need to resize before deciding to fast-path the JPEG
-    let mut target_dimensions = None;
-    if options.image_dpi > 0
-        && let Some(size) = page_size
-        && let Ok((pw, ph)) = crate::pdf::paper_size(size)
-        && let Ok((w, h)) = image::image_dimensions(path)
-    {
-        target_dimensions = fit_dimensions_for_dpi(w, h, pw, ph, options.image_dpi);
-    }
+    // Preserve the lossless JPEG fast path when its dimensions already fit.
+    let jpeg_target = (format == Some(Format::Jpeg))
+        .then(|| image::image_dimensions(path).ok())
+        .flatten()
+        .and_then(|(width, height)| {
+            dpi_target_for_dimensions(width, height, page_size, options.image_dpi)
+        });
 
-    if format == Some(Format::Jpeg) && target_dimensions.is_none() {
+    if format == Some(Format::Jpeg) && jpeg_target.is_none() {
         return metadata::strip_jpeg(&input, options.keep_icc);
     }
 
-    let image = ImageReader::new(Cursor::new(input))
+    let native = ImageReader::new(Cursor::new(input))
         .with_guessed_format()
         .context("failed to determine image format")?
-        .decode()
-        .with_context(|| format!("failed to decode {}", path.display()))?;
+        .decode();
+    let image = match native {
+        Ok(image) => image,
+        Err(native_error) => decode_with_ffmpeg(path, options).with_context(|| {
+            format!(
+                "native decoder failed for {}: {native_error}",
+                path.display()
+            )
+        })?,
+    };
+    let target_dimensions =
+        jpeg_target.or_else(|| dpi_target(&image, page_size, options.image_dpi));
 
     resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
 }
 
+/// Decode every logical page/frame for PDF construction. Single-image callers
+/// keep using `to_jpeg`, so convert/OCR naming and behavior remain stable.
+pub fn to_jpegs_for_pdf(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "gif" => {
+            let decoder = GifDecoder::new(BufReader::new(File::open(path)?))
+                .with_context(|| format!("failed to decode GIF {}", path.display()))?;
+            encode_animation_frames(decoder.into_frames(), options, page_size, path)
+        }
+        "png" | "apng" => {
+            let decoder = PngDecoder::new(BufReader::new(File::open(path)?))
+                .with_context(|| format!("failed to decode PNG {}", path.display()))?;
+            if decoder.is_apng()? {
+                encode_animation_frames(decoder.apng()?.into_frames(), options, page_size, path)
+            } else {
+                Ok(vec![to_jpeg(path, options, page_size)?])
+            }
+        }
+        "webp" => {
+            let decoder = WebPDecoder::new(BufReader::new(File::open(path)?))
+                .with_context(|| format!("failed to decode WebP {}", path.display()))?;
+            if decoder.has_animation() {
+                encode_animation_frames(decoder.into_frames(), options, page_size, path)
+            } else {
+                Ok(vec![to_jpeg(path, options, page_size)?])
+            }
+        }
+        "tif" | "tiff" => decode_tiff_pages(path, options, page_size),
+        _ => Ok(vec![to_jpeg(path, options, page_size)?]),
+    }
+}
+
+fn encode_animation_frames(
+    frames: impl Iterator<Item = image::ImageResult<image::Frame>>,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+    path: &Path,
+) -> Result<Vec<Vec<u8>>> {
+    let mut output = Vec::new();
+    for (index, frame) in frames.enumerate() {
+        if index == MAX_IMAGE_FRAMES {
+            bail!(
+                "{} contains more than {MAX_IMAGE_FRAMES} frames",
+                path.display()
+            );
+        }
+        let image = DynamicImage::ImageRgba8(frame?.into_buffer());
+        output.push(decoded_to_jpeg_for_page(image, options, page_size)?);
+    }
+    if output.is_empty() {
+        bail!("{} contains no decodable frames", path.display());
+    }
+    Ok(output)
+}
+
+#[cfg(windows)]
+fn decode_tiff_pages(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
+    let decoder = crate::wic::Decoder::open(path)?;
+    let count = usize::try_from(decoder.frame_count()?)?;
+    if count > MAX_IMAGE_FRAMES {
+        bail!(
+            "{} contains {count} pages; maximum is {MAX_IMAGE_FRAMES}",
+            path.display()
+        );
+    }
+    (0..count)
+        .map(|index| {
+            decoded_to_jpeg_for_page(
+                decoder.decode_frame(u32::try_from(index)?)?,
+                options,
+                page_size,
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn decode_tiff_pages(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<Vec<u8>>> {
+    Ok(vec![to_jpeg(path, options, page_size)?])
+}
+
 pub fn for_ocr(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
+    if formats::detect(path).is_some_and(Format::requires_jpeg_conversion) {
+        return to_jpeg(path, options, None);
+    }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let format = image::guess_format(&bytes).ok();
     if matches!(
@@ -79,7 +197,28 @@ pub fn optimize_for_ocr(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn ffmpeg_to_jpeg(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
-    let temporary = Builder::new().suffix(".jpg").tempfile()?;
+    ffmpeg_to_jpeg_for_page(path, options, None)
+}
+
+fn ffmpeg_to_jpeg_for_page(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<u8>> {
+    decoded_to_jpeg_for_page(decode_with_ffmpeg(path, options)?, options, page_size)
+}
+
+fn decoded_to_jpeg_for_page(
+    image: DynamicImage,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<u8>> {
+    let target_dimensions = dpi_target(&image, page_size, options.image_dpi);
+    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+}
+
+fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
+    let temporary = Builder::new().suffix(".png").tempfile()?;
     let output_path = temporary.path().to_path_buf();
 
     let mut command = Command::new(&options.ffmpeg);
@@ -97,8 +236,8 @@ pub fn ffmpeg_to_jpeg(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
         .arg("1")
         .arg("-map_metadata")
         .arg("-1")
-        .arg("-q:v")
-        .arg("2")
+        .arg("-pix_fmt")
+        .arg("rgba")
         .arg(&output_path);
     let output = process::run(command, Duration::from_secs(120), "ffmpeg").with_context(|| {
         format!(
@@ -106,10 +245,33 @@ pub fn ffmpeg_to_jpeg(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
             options.ffmpeg.display()
         )
     })?;
-    process::require_success(output, "ffmpeg")?;
+    process::require_success(output, "ffmpeg").with_context(|| {
+        format!(
+            "the configured FFmpeg build cannot decode {}",
+            path.display()
+        )
+    })?;
 
-    let jpeg = fs::read(&output_path).context("ffmpeg produced no JPEG output")?;
-    metadata::strip_jpeg(&jpeg, options.keep_icc)
+    image::open(&output_path).context("ffmpeg produced no decodable PNG output")
+}
+
+fn dpi_target(image: &DynamicImage, page_size: Option<&str>, image_dpi: u32) -> Option<(u32, u32)> {
+    let (width, height) = image.dimensions();
+    dpi_target_for_dimensions(width, height, page_size, image_dpi)
+}
+
+fn dpi_target_for_dimensions(
+    width: u32,
+    height: u32,
+    page_size: Option<&str>,
+    image_dpi: u32,
+) -> Option<(u32, u32)> {
+    if image_dpi == 0 {
+        return None;
+    }
+    let size = page_size?;
+    let (page_width, page_height) = crate::pdf::paper_size(size).ok()?;
+    fit_dimensions_for_dpi(width, height, page_width, page_height, image_dpi)
 }
 
 pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
@@ -207,6 +369,9 @@ fn resize_to_jpeg_with_filter(
 
 #[cfg(test)]
 mod tests {
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, Rgba, RgbaImage};
+
     use super::*;
 
     #[test]
@@ -239,6 +404,13 @@ mod tests {
     }
 
     #[test]
+    fn decoded_external_image_uses_the_common_page_dpi_target() {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(2400, 1600));
+        assert_eq!(dpi_target(&image, Some("A4"), 150), Some((1754, 1169)));
+        assert_eq!(dpi_target(&image, Some("A4"), 0), None);
+    }
+
+    #[test]
     fn webp_is_decoded_without_ffmpeg() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sample.webp");
@@ -257,5 +429,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(image::guess_format(&jpeg).unwrap(), ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn animated_gif_frames_share_the_pdf_image_pipeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("animation.gif");
+        let file = File::create(&path).unwrap();
+        let mut encoder = GifEncoder::new(file);
+        encoder
+            .encode_frames([
+                Frame::from_parts(
+                    RgbaImage::from_pixel(3, 2, Rgba([255, 0, 0, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(100, 1),
+                ),
+                Frame::from_parts(
+                    RgbaImage::from_pixel(3, 2, Rgba([0, 255, 0, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(100, 1),
+                ),
+            ])
+            .unwrap();
+        drop(encoder);
+
+        let frames = to_jpegs_for_pdf(
+            &path,
+            &ImageOptions {
+                keep_icc: false,
+                ffmpeg: PathBuf::from("missing-ffmpeg"),
+                jpeg_quality: 85,
+                image_dpi: 0,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| image::guess_format(frame).unwrap() == ImageFormat::Jpeg)
+        );
     }
 }

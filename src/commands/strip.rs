@@ -37,7 +37,7 @@ fn strip_one(spec: &InputSpec, explicit_out: Option<&Path>, options: &ImageOptio
     let input = &spec.path;
     let format = formats::detect(input);
     let output_path = explicit_out.map(Path::to_path_buf).unwrap_or_else(|| {
-        if format == Some(Format::Heic) {
+        if format.is_some_and(Format::requires_jpeg_conversion) {
             input.with_extension("jpg")
         } else {
             input.clone()
@@ -47,7 +47,8 @@ fn strip_one(spec: &InputSpec, explicit_out: Option<&Path>, options: &ImageOptio
         output::info(format!("Stripping metadata in-place: {}", input.display()));
     }
     let bytes = match format {
-        Some(Format::Heic) => imageconv::ffmpeg_to_jpeg(input, options)?,
+        Some(Format::FfmpegRaster) => imageconv::ffmpeg_to_jpeg(input, options)?,
+        Some(Format::WicRaster | Format::CameraRaw) => imageconv::to_jpeg(input, options, None)?,
         Some(Format::Jpeg) => metadata::strip_jpeg(&fs::read(input)?, options.keep_icc)?,
         Some(Format::Png) => metadata::strip_png(&fs::read(input)?, options.keep_icc)?,
         Some(Format::Pdf) => pdf::transform_file(input, |document| {

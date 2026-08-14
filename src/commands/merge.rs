@@ -25,10 +25,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let output = args.out.unwrap_or_else(|| default_output(&specs));
     reject_output_collision(&output, &specs)?;
 
-    if specs
-        .iter()
-        .all(|spec| formats::detect(&spec.path) == Some(Format::Text))
-    {
+    if should_merge_as_text(&specs, &output) {
         return merge_text(&specs, &output, fail_fast);
     }
 
@@ -163,6 +160,16 @@ fn default_output(specs: &[InputSpec]) -> PathBuf {
     }
 }
 
+fn should_merge_as_text(specs: &[InputSpec], output: &Path) -> bool {
+    specs
+        .iter()
+        .all(|spec| formats::detect(&spec.path) == Some(Format::Text))
+        && !output
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +190,15 @@ mod tests {
             pages: None,
         }];
         assert_eq!(default_output(&specs), PathBuf::from("scan_merged.pdf"));
+    }
+
+    #[test]
+    fn explicit_pdf_output_renders_text_inputs_as_pdf() {
+        let specs = [InputSpec {
+            path: PathBuf::from("data.json"),
+            pages: None,
+        }];
+        assert!(!should_merge_as_text(&specs, Path::new("data.pdf")));
+        assert!(should_merge_as_text(&specs, Path::new("combined.json")));
     }
 }

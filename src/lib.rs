@@ -17,6 +17,7 @@ mod output;
 mod pdf;
 mod process;
 mod textpdf;
+mod wic;
 
 use std::ffi::OsString;
 

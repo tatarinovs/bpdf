@@ -35,6 +35,17 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   directory expansion, merge, OCR, strip, convert, Office, and image handling.
 - DPI sizing, resampling, alpha composition, and JPEG encoding are implemented
   once in `imageconv.rs`.
+- FFmpeg is an external decoder adapter only; decoded frames return to the same
+  DPI sizing and JPEG encoding path as images handled by the Rust decoder.
+- On Windows, camera RAW files use Windows Imaging Component (WIC) and the
+  Microsoft Raw Image Extension, then return to that same sizing/encoding path.
+- JPEG XR/HD Photo and ICO reuse the same WIC adapter. Multi-page TIFF also
+  iterates WIC frames instead of introducing a separate TIFF implementation.
+- GIF, APNG, and animated WebP frames share one animation-to-JPEG iterator in
+  `imageconv.rs`; `input.rs` turns the resulting frames into the normal PDF
+  documents and reuses the standard page-tree merger.
+- Word, Excel, and PowerPoint share the same isolated temporary-copy and Office
+  process boundary in `office.rs`; only their COM export scripts differ.
 - PDF image decoding is implemented once in `pdf/image.rs` and is shared by
   optimize, OCR, and image extraction.
 - PDF loading and bounded text extraction are implemented once in `pdf/mod.rs`.

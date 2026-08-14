@@ -24,9 +24,20 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
     match formats::detect(&spec.path) {
         Some(format) if format.is_image() => {
             reject_pages(spec)?;
-            let jpeg =
-                imageconv::to_jpeg(&spec.path, &options.image, Some(&options.text.page_size))?;
-            pdf::jpeg_document(jpeg, &options.text.page_size)
+            let jpegs = imageconv::to_jpegs_for_pdf(
+                &spec.path,
+                &options.image,
+                Some(&options.text.page_size),
+            )?;
+            let mut documents = jpegs
+                .into_iter()
+                .map(|jpeg| pdf::jpeg_document(jpeg, &options.text.page_size))
+                .collect::<Result<Vec<_>>>()?;
+            if documents.len() == 1 {
+                Ok(documents.pop().expect("one image document"))
+            } else {
+                pdf::merge_documents(documents)
+            }
         }
         Some(Format::Pdf) => {
             let mut document = pdf::load(&spec.path)?;
@@ -35,7 +46,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             }
             Ok(document)
         }
-        Some(Format::Word | Format::Excel) => {
+        Some(format) if format.is_office() => {
             reject_pages(spec)?;
             let bytes = office::convert_to_pdf(&spec.path, &options.office)?;
             Document::load_mem(&bytes)

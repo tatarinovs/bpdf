@@ -20,6 +20,7 @@ pub struct OfficeOptions {
 pub struct OfficeAvailability {
     pub word: bool,
     pub excel: bool,
+    pub powerpoint: bool,
 }
 
 pub fn convert_to_pdf(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
@@ -42,6 +43,7 @@ pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
         return Ok(OfficeAvailability {
             word: false,
             excel: false,
+            powerpoint: false,
         });
     }
 
@@ -69,6 +71,7 @@ pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
         Ok(OfficeAvailability {
             word: text.lines().any(|line| line.trim() == "word=true"),
             excel: text.lines().any(|line| line.trim() == "excel=true"),
+            powerpoint: text.lines().any(|line| line.trim() == "powerpoint=true"),
         })
     }
 }
@@ -78,6 +81,7 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
     let script = match formats::detect(path) {
         Some(Format::Word) => WORD_SCRIPT,
         Some(Format::Excel) => EXCEL_SCRIPT,
+        Some(Format::PowerPoint) => POWERPOINT_SCRIPT,
         _ => bail!("unsupported Office format: {}", path.display()),
     };
     let extension = path
@@ -231,11 +235,54 @@ try {
 "#;
 
 #[cfg(windows)]
+const POWERPOINT_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
+    Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
+}
+$powerpoint = $null
+$presentation = $null
+try {
+    $powerpoint = New-Object -ComObject PowerPoint.Application
+    $powerpoint.DisplayAlerts = 1
+    $powerpoint.AutomationSecurity = 3
+    $presentation = $powerpoint.Presentations.Open(
+        $env:BPDF_OFFICE_INPUT,
+        $true,
+        $false,
+        $false
+    )
+    if ($null -eq $presentation) {
+        throw 'PowerPoint returned no presentation object'
+    }
+    # ppSaveAsPDF = 32. SaveAs avoids PowerShell's ambiguous late-bound
+    # ExportAsFixedFormat overload with its many optional COM arguments.
+    $presentation.SaveAs($env:BPDF_OFFICE_OUTPUT, 32)
+} finally {
+    if ($null -ne $presentation) {
+        $presentation.Close()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($presentation)
+    }
+    if ($null -ne $powerpoint) {
+        $powerpoint.Quit()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($powerpoint)
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"#;
+
+#[cfg(windows)]
 const OFFICE_PROBE_SCRIPT: &str = r#"
 $word = $null -ne [type]::GetTypeFromProgID('Word.Application')
 $excel = $null -ne [type]::GetTypeFromProgID('Excel.Application')
+$powerpoint = $null -ne [type]::GetTypeFromProgID('PowerPoint.Application')
 Write-Output "word=$($word.ToString().ToLowerInvariant())"
 Write-Output "excel=$($excel.ToString().ToLowerInvariant())"
+Write-Output "powerpoint=$($powerpoint.ToString().ToLowerInvariant())"
 "#;
 
 #[cfg(windows)]
