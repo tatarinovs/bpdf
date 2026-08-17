@@ -8,7 +8,7 @@ use crate::cli::StripArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
-use crate::imageconv::{self, ImageOptions};
+use crate::imageconv::ImageOptions;
 use crate::{metadata, output, pdf};
 
 pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
@@ -17,6 +17,7 @@ pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
         bail!("--out is only valid with one input file");
     }
     let options = config.image_options(args.keep_icc, args.ffmpeg);
+    let mut outputs = 0usize;
     let results = specs
         .iter()
         .map(|spec| (&spec.path, strip_one(spec, args.out.as_deref(), &options)));
@@ -25,37 +26,175 @@ pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
         fail_fast,
         "failed to process",
         "error processing",
-        drop,
+        |stripped| {
+            if stripped {
+                outputs += 1;
+            }
+        },
     )?;
-    finish_batch("strip", specs.len(), failures, specs.len() - failures)
+    finish_batch("strip", specs.len(), failures, outputs)
 }
 
-fn strip_one(spec: &InputSpec, explicit_out: Option<&Path>, options: &ImageOptions) -> Result<()> {
+fn strip_one(
+    spec: &InputSpec,
+    explicit_out: Option<&Path>,
+    options: &ImageOptions,
+) -> Result<bool> {
     if spec.pages.is_some() {
         bail!("page ranges are not valid for strip");
     }
     let input = &spec.path;
     let format = formats::detect(input);
-    let output_path = explicit_out.map(Path::to_path_buf).unwrap_or_else(|| {
-        if format.is_some_and(Format::requires_jpeg_conversion) {
-            input.with_extension("jpg")
-        } else {
-            input.clone()
-        }
-    });
-    if same_path(input, &output_path) {
-        output::info(format!("Stripping metadata in-place: {}", input.display()));
-    }
+    let output_path = explicit_out
+        .map(|p| {
+            if p.is_dir() {
+                p.join(input.file_name().unwrap_or_default())
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .unwrap_or_else(|| input.clone());
+
     let bytes = match format {
-        Some(Format::FfmpegRaster) => imageconv::ffmpeg_to_jpeg(input, options)?,
-        Some(Format::WicRaster | Format::CameraRaw) => imageconv::to_jpeg(input, options, None)?,
         Some(Format::Jpeg) => metadata::strip_jpeg(&fs::read(input)?, options.keep_icc)?,
         Some(Format::Png) => metadata::strip_png(&fs::read(input)?, options.keep_icc)?,
         Some(Format::Pdf) => pdf::transform_file(input, |document| {
             pdf::strip_document_metadata(document);
             Ok(())
         })?,
-        _ => bail!("unsupported strip format: {}", input.display()),
+        _ => {
+            output::info(format!("Skipping unsupported file: {}", input.display()));
+            return Ok(false);
+        }
     };
-    write_output(&output_path, &bytes)
+
+    if same_path(input, &output_path) {
+        output::info(format!("Stripping metadata in-place: {}", input.display()));
+    }
+
+    write_output(&output_path, &bytes)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+
+    fn sample_png(path: &Path) {
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
+            .save_with_format(path, ImageFormat::Png)
+            .unwrap();
+    }
+
+    fn sample_jpeg(path: &Path) {
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
+            .save_with_format(path, ImageFormat::Jpeg)
+            .unwrap();
+    }
+
+    fn sample_pdf(path: &Path) {
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        document.save(path).unwrap();
+    }
+
+    fn args(inputs: &[&Path], out: Option<std::path::PathBuf>) -> StripArgs {
+        StripArgs {
+            inputs: inputs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            out,
+            keep_icc: None,
+            ffmpeg: None,
+        }
+    }
+
+    #[test]
+    fn refuses_multiple_inputs_with_explicit_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.png");
+        sample_png(&first);
+        sample_png(&second);
+        let out = dir.path().join("out.png");
+
+        let error = run(
+            args(&[&first, &second], Some(out)),
+            &Config::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--out is only valid with one input file"));
+    }
+
+    #[test]
+    fn strips_jpeg_and_png_and_pdf() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("sample.jpg");
+        let png = dir.path().join("sample.png");
+        let pdf = dir.path().join("sample.pdf");
+        sample_jpeg(&jpg);
+        sample_png(&png);
+        sample_pdf(&pdf);
+
+        run(args(&[&jpg, &png, &pdf], None), &Config::default(), true).unwrap();
+        assert!(jpg.is_file());
+        assert!(png.is_file());
+        assert!(pdf.is_file());
+    }
+
+    #[test]
+    fn skips_unsupported_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let txt = dir.path().join("notes.txt");
+        let docx = dir.path().join("document.docx");
+        fs::write(&txt, "hello world").unwrap();
+        fs::write(&docx, "not actually a docx").unwrap();
+
+        run(args(&[&txt, &docx], None), &Config::default(), true).unwrap();
+
+        // Files were untouched
+        assert_eq!(fs::read_to_string(&txt).unwrap(), "hello world");
+        assert_eq!(fs::read_to_string(&docx).unwrap(), "not actually a docx");
+    }
+
+    #[test]
+    fn skips_unsupported_format_mixed_with_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("sample.jpg");
+        let txt = dir.path().join("notes.txt");
+        sample_jpeg(&jpg);
+        fs::write(&txt, "hello world").unwrap();
+
+        run(args(&[&jpg, &txt], None), &Config::default(), true).unwrap();
+
+        assert!(jpg.is_file());
+        assert_eq!(fs::read_to_string(&txt).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn refuses_page_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("sample.pdf");
+        sample_pdf(&pdf);
+
+        let error = run(
+            StripArgs {
+                inputs: vec![format!("{}:1-2", pdf.to_string_lossy())],
+                out: None,
+                keep_icc: None,
+                ffmpeg: None,
+            },
+            &Config::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("page ranges are not valid for strip"));
+    }
 }

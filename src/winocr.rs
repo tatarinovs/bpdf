@@ -74,7 +74,7 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
             OcrEngine::TryCreateFromUserProfileLanguages()?
         };
 
-        let max_dim = OcrEngine::MaxImageDimension()? as u32;
+        let max_dim = OcrEngine::MaxImageDimension()?;
 
         let decode_result = (|| -> Result<(SoftwareBitmap, u32, u32, f64)> {
             let stream = InMemoryRandomAccessStream::new()
@@ -91,7 +91,7 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
                 .context("failed to create BitmapDecoder for image")?;
             let pixel_width = decoder.PixelWidth()?;
             let pixel_height = decoder.PixelHeight()?;
-            
+
             if pixel_width > max_dim || pixel_height > max_dim {
                 bail!("image too large for Windows OCR, fallback to scaling");
             }
@@ -110,19 +110,23 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
                     .context("failed to decode image bytes via fallback image decoder")?;
                 let mut width = dynamic_image.width();
                 let mut height = dynamic_image.height();
-                
+
                 let scale_factor = if width > max_dim || height > max_dim {
                     let sf = (max_dim as f64) / (width.max(height) as f64);
                     let new_w = (width as f64 * sf).round() as u32;
                     let new_h = (height as f64 * sf).round() as u32;
-                    dynamic_image = dynamic_image.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+                    dynamic_image = dynamic_image.resize_exact(
+                        new_w,
+                        new_h,
+                        image::imageops::FilterType::Lanczos3,
+                    );
                     width = new_w;
                     height = new_h;
                     sf
                 } else {
                     1.0
                 };
-                
+
                 let rgba = dynamic_image.to_rgba8();
 
                 let writer = DataWriter::new().context("failed to create DataWriter")?;
@@ -150,21 +154,29 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
         let full_text = result.Text()?.to_string();
         let mut words = Vec::new();
 
-        let inv_scale = if scale_factor < 1.0 { 1.0 / scale_factor } else { 1.0 };
+        let inv_scale = if scale_factor < 1.0 {
+            1.0 / scale_factor
+        } else {
+            1.0
+        };
 
         for line in result.Lines()? {
             let mut words_in_line = Vec::new();
             let mut min_y = f64::MAX;
             let mut max_bottom = f64::MIN;
-            
+
             for word in line.Words()? {
                 let text = word.Text()?.to_string();
                 let rect = word.BoundingRect()?;
                 let y = (rect.Y as f64) * inv_scale;
                 let height = (rect.Height as f64) * inv_scale;
-                if y < min_y { min_y = y; }
-                if y + height > max_bottom { max_bottom = y + height; }
-                
+                if y < min_y {
+                    min_y = y;
+                }
+                if y + height > max_bottom {
+                    max_bottom = y + height;
+                }
+
                 words_in_line.push((
                     text,
                     (rect.X as f64) * inv_scale,
@@ -173,10 +185,10 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
                     height,
                 ));
             }
-            
+
             let line_y = min_y;
             let line_height = max_bottom - min_y;
-            
+
             for (text, x, y, width, height) in words_in_line {
                 words.push(OcrWordBox {
                     text,
@@ -212,10 +224,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_extract_words() {
-        use crate::pdf;
         use crate::imageconv;
-        let mut doc = lopdf::Document::load("d:\\PROJECT\\bpdf\\Акты подписанные.PDF").unwrap();
+        use crate::pdf;
+        let doc = lopdf::Document::load("d:\\PROJECT\\bpdf\\Акты подписанные.PDF").unwrap();
         let page_id = doc.get_pages().values().next().cloned().unwrap();
         let images = doc.get_page_images(page_id).unwrap();
         for (index, image_info) in images.iter().enumerate() {
@@ -224,8 +237,12 @@ mod tests {
             let bytes = imageconv::encode_jpeg_on_white(&image, 90).unwrap();
             let area = image.width().saturating_mul(image.height());
             println!("Image {} area: {}, bytes: {}", index, area, bytes.len());
-            std::fs::write(format!("d:\\PROJECT\\bpdf\\scratch_image_{}.jpg", index), &bytes).unwrap();
-            
+            std::fs::write(
+                format!("d:\\PROJECT\\bpdf\\scratch_image_{}.jpg", index),
+                &bytes,
+            )
+            .unwrap();
+
             let result = super::recognize_image_bytes(&bytes, Some("ru")).unwrap();
             println!("Image {} WORDS: {}", index, result.words.len());
         }

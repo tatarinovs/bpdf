@@ -8,7 +8,9 @@ fn main() {
         println!("Page {} has {} streams", i, streams.len());
         for id in streams {
             let s = doc.get_object(id).unwrap().as_stream().unwrap();
-            let c = s.decompressed_content().unwrap_or_else(|_| s.content.clone());
+            let c = s
+                .decompressed_content()
+                .unwrap_or_else(|_| s.content.clone());
             let txt = String::from_utf8_lossy(&c);
             println!("Stream {}: {} bytes", id.0, txt.len());
             if txt.contains("F0") {

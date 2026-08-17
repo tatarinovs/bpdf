@@ -47,7 +47,9 @@ pub fn load_htmlz(path: &Path) -> Result<String> {
 
     let mut index_file = None;
     for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else { continue; };
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
         let name = entry.name().to_ascii_lowercase();
         if name == "index.html" || name == "index.htm" {
             index_file = Some(entry.name().to_owned());
@@ -58,7 +60,8 @@ pub fn load_htmlz(path: &Path) -> Result<String> {
         }
     }
 
-    let target_name = index_file.with_context(|| format!("no HTML file found in HTMLZ archive {}", path.display()))?;
+    let target_name = index_file
+        .with_context(|| format!("no HTML file found in HTMLZ archive {}", path.display()))?;
     let html_content = xml::read_zip_entry(&mut archive, &target_name)?;
     Ok(convert_html_to_text(&html_content))
 }
@@ -112,13 +115,12 @@ fn parse_fb2_xml(xml: &str) -> Result<String> {
         }
     }
 
-    if let Some(authors) = extract_fb2_authors(xml) {
-        if !authors.is_empty() {
+    if let Some(authors) = extract_fb2_authors(xml)
+        && !authors.is_empty() {
             output.push_str("Author: ");
             output.push_str(&authors);
             output.push_str("\n\n");
         }
-    }
 
     // Extract annotation if present
     if let Some(annotation_xml) = extract_tag_value(xml, "annotation") {
@@ -220,14 +222,14 @@ fn parse_fb2_text_block(fb2_body: &str) -> String {
 
 /// Load an EPUB document from a ZIP container.
 fn load_epub(path: &Path) -> Result<String> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open EPUB file {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("failed to open EPUB file {}", path.display()))?;
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to read EPUB ZIP structure in {}", path.display()))?;
 
     // 1. Locate rootfile from META-INF/container.xml
-    let opf_path = find_epub_opf_path(&mut archive)
-        .unwrap_or_else(|_| "OEBPS/content.opf".to_string());
+    let opf_path =
+        find_epub_opf_path(&mut archive).unwrap_or_else(|_| "OEBPS/content.opf".to_string());
 
     // 2. Read OPF file content
     let opf_content = xml::read_zip_entry(&mut archive, &opf_path)
@@ -331,8 +333,6 @@ fn find_epub_opf_path(archive: &mut ZipArchive<File>) -> Result<String> {
     bail!("full-path attribute not found in container.xml")
 }
 
-
-
 /// Parses EPUB OPF manifest items (<item id="..." href="..."/>).
 fn parse_epub_manifest(opf: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
@@ -355,11 +355,10 @@ fn parse_epub_spine(opf: &str) -> Vec<String> {
     let mut spine = Vec::new();
 
     for line in opf.split('<') {
-        if line.starts_with("itemref ") {
-            if let Some(idref) = extract_xml_attribute(line, "idref") {
+        if line.starts_with("itemref ")
+            && let Some(idref) = extract_xml_attribute(line, "idref") {
                 spine.push(idref);
             }
-        }
     }
 
     spine
@@ -443,8 +442,8 @@ fn convert_html_to_text(html: &str) -> String {
                 "br" => {
                     buf.push('\n');
                 }
-                "li" => {
-                    if tag_is_closing {
+                "li"
+                    if tag_is_closing => {
                         let text = xml::decode_entities(&buf);
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
@@ -454,7 +453,6 @@ fn convert_html_to_text(html: &str) -> String {
                         }
                         buf.clear();
                     }
-                }
                 _ => {}
             }
         } else if in_tag {
@@ -507,9 +505,8 @@ fn extract_tag_value(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{tag}>");
 
     let start_pos = xml.find(&open).or_else(|| {
-        xml.find(&open_alt).and_then(|idx| {
-            xml[idx..].find('>').map(|end| idx + end + 1)
-        })
+        xml.find(&open_alt)
+            .and_then(|idx| xml[idx..].find('>').map(|end| idx + end + 1))
     })?;
 
     let content_start = if xml[start_pos..].starts_with(&open) {
@@ -521,10 +518,6 @@ fn extract_tag_value(xml: &str, tag: &str) -> Option<String> {
     let end_pos = xml[content_start..].find(&close)?;
     Some(xml[content_start..content_start + end_pos].to_string())
 }
-
-
-
-
 
 #[cfg(test)]
 mod tests {

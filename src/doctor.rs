@@ -133,12 +133,7 @@ pub fn run(config: &Config) -> Result<()> {
             );
         }
         Err(error) => {
-            check(
-                "windows_ocr",
-                false,
-                format!("{error:#}"),
-                &mut failures,
-            );
+            check("windows_ocr", false, format!("{error:#}"), &mut failures);
         }
     }
 

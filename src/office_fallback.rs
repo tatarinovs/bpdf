@@ -27,21 +27,18 @@ pub fn extract_text(path: &Path) -> Result<String> {
         "pptx" | "ppt" | "pps" | "ppsx" => extract_pptx(&mut archive),
         "odp" => extract_opendocument(&mut archive),
         _ => {
-            if let Ok(text) = extract_docx(&mut archive) {
-                if !text.is_empty() {
+            if let Ok(text) = extract_docx(&mut archive)
+                && !text.is_empty() {
                     return Ok(text);
                 }
-            }
-            if let Ok(text) = extract_pptx(&mut archive) {
-                if !text.is_empty() {
+            if let Ok(text) = extract_pptx(&mut archive)
+                && !text.is_empty() {
                     return Ok(text);
                 }
-            }
-            if let Ok(text) = extract_xlsx(&mut archive) {
-                if !text.is_empty() {
+            if let Ok(text) = extract_xlsx(&mut archive)
+                && !text.is_empty() {
                     return Ok(text);
                 }
-            }
             extract_opendocument(&mut archive)
         }
     }
@@ -99,8 +96,8 @@ fn extract_opendocument(archive: &mut ZipArchive<File>) -> Result<String> {
                     continue;
                 }
             }
-        } else if tag.starts_with("<text:p") {
-            if let Some(gt) = tag.find('>') {
+        } else if tag.starts_with("<text:p")
+            && let Some(gt) = tag.find('>') {
                 let content_start = gt + 1;
                 if let Some(end) = tag[content_start..].find("</text:p>") {
                     let p_text = xml::strip_tags(&tag[content_start..content_start + end]);
@@ -113,7 +110,6 @@ fn extract_opendocument(archive: &mut ZipArchive<File>) -> Result<String> {
                     continue;
                 }
             }
-        }
         cursor = &tag[6..];
     }
 
@@ -165,21 +161,18 @@ fn extract_xlsx(archive: &mut ZipArchive<File>) -> Result<String> {
                 let mut row_values = Vec::new();
                 for cell in row.split("<c ") {
                     if cell.contains("t=\"s\"") {
-                        if let Some(v_start) = cell.find("<v>") {
-                            if let Some(v_end) = cell[v_start + 3..].find("</v>") {
-                                if let Ok(idx) = cell[v_start + 3..v_start + 3 + v_end].parse::<usize>() {
-                                    if let Some(val) = shared_strings.get(idx) {
+                        if let Some(v_start) = cell.find("<v>")
+                            && let Some(v_end) = cell[v_start + 3..].find("</v>")
+                                && let Ok(idx) =
+                                    cell[v_start + 3..v_start + 3 + v_end].parse::<usize>()
+                                    && let Some(val) = shared_strings.get(idx) {
                                         row_values.push(val.clone());
                                     }
-                                }
-                            }
-                        }
-                    } else if let Some(v_start) = cell.find("<v>") {
-                        if let Some(v_end) = cell[v_start + 3..].find("</v>") {
+                    } else if let Some(v_start) = cell.find("<v>")
+                        && let Some(v_end) = cell[v_start + 3..].find("</v>") {
                             let val = &cell[v_start + 3..v_start + 3 + v_end];
                             row_values.push(xml::decode_entities(val));
                         }
-                    }
                 }
 
                 if !row_values.is_empty() {
@@ -205,8 +198,8 @@ fn extract_xlsx(archive: &mut ZipArchive<File>) -> Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use zip::write::SimpleFileOptions;
     use tempfile::NamedTempFile;
+    use zip::write::SimpleFileOptions;
 
     #[test]
     fn extracts_docx_xml_text() {
@@ -222,7 +215,8 @@ mod tests {
             </w:body>
         </w:document>"#;
 
-        zip.start_file("word/document.xml", SimpleFileOptions::default()).unwrap();
+        zip.start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
         zip.write_all(docx_xml.as_bytes()).unwrap();
         zip.finish().unwrap();
 
@@ -242,7 +236,8 @@ mod tests {
             <a:t>Slide Title Text</a:t>
         </p:sld>"#;
 
-        zip.start_file("ppt/slides/slide1.xml", SimpleFileOptions::default()).unwrap();
+        zip.start_file("ppt/slides/slide1.xml", SimpleFileOptions::default())
+            .unwrap();
         zip.write_all(slide_xml.as_bytes()).unwrap();
         zip.finish().unwrap();
 

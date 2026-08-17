@@ -85,6 +85,11 @@ impl Config {
             ffmpeg: ffmpeg.unwrap_or_else(|| self.ffmpeg.clone()),
             jpeg_quality: self.jpeg_quality,
             image_dpi: self.image_dpi,
+            long_edge: None,
+            short_edge: None,
+            orient: None,
+            rotation_degrees: None,
+            force_reencode: false,
         }
     }
 

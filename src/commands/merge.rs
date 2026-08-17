@@ -55,28 +55,37 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
             specs.len(),
             spec.path.display()
         ));
-        (&spec.path, input::load(spec, &options).map(|doc| (spec.path.clone(), doc)))
+        (
+            &spec.path,
+            input::load(spec, &options).map(|doc| (spec.path.clone(), doc)),
+        )
     });
     let mut documents = Vec::with_capacity(specs.len());
     let mut bookmarks = Vec::new();
     let mut current_page = 1u32;
     let generate_bookmarks = args.bookmarks.unwrap_or(config.bookmarks);
 
-    let failures = handle_results(loads, fail_fast, "failed to load", "Skipping", |(path, document)| {
-        if generate_bookmarks {
-            let title = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("document")
-                .to_owned();
-            let page_count = document.get_pages().len() as u32;
-            if page_count > 0 {
-                bookmarks.push((title, current_page));
-                current_page += page_count;
+    let failures = handle_results(
+        loads,
+        fail_fast,
+        "failed to load",
+        "Skipping",
+        |(path, document)| {
+            if generate_bookmarks {
+                let title = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("document")
+                    .to_owned();
+                let page_count = document.get_pages().len() as u32;
+                if page_count > 0 {
+                    bookmarks.push((title, current_page));
+                    current_page += page_count;
+                }
             }
-        }
-        documents.push(document);
-    })?;
+            documents.push(document);
+        },
+    )?;
 
     if documents.is_empty() {
         return finish_batch("merge", specs.len(), failures, 0);

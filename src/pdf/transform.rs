@@ -118,6 +118,26 @@ pub fn rotate_pages(document: &mut Document, pages: &str, degrees: i64) -> Resul
     Ok(())
 }
 
+pub fn orient_pages(document: &mut Document, pages: &str, orient: &str) -> Result<()> {
+    let target_landscape = match orient.to_lowercase().as_str() {
+        "landscape" => true,
+        "portrait" => false,
+        _ => bail!("invalid orientation '{orient}': expected 'portrait' or 'landscape'"),
+    };
+    let page_map = document.get_pages();
+    let selected = parse_page_selection(pages, page_map.len())?;
+    for (number, page_id) in page_map {
+        if selected.contains(&(number as usize)) {
+            let geometry = page_geometry(document, page_id)?;
+            let is_landscape = geometry.display_width() > geometry.display_height();
+            if is_landscape != target_landscape {
+                set_page_rotation(document, page_id, geometry.rotation + 90)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<()> {
     resize_pages_with_orientation(document, size, pages, false)
 }
@@ -855,6 +875,29 @@ mod tests {
     }
 
     #[test]
+    fn orient_changes_page_orientation() {
+        let mut document = one_page(); // default is landscape 842 x 595
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let before = page_geometry(&document, page_id).unwrap();
+        assert!(before.display_width() > before.display_height());
+
+        // Target portrait -> should rotate to portrait
+        orient_pages(&mut document, "1", "portrait").unwrap();
+        let after = page_geometry(&document, page_id).unwrap();
+        assert!(after.display_width() < after.display_height());
+
+        // Target portrait again -> should remain portrait without double rotation
+        orient_pages(&mut document, "1", "portrait").unwrap();
+        let after2 = page_geometry(&document, page_id).unwrap();
+        assert_eq!(after.rotation, after2.rotation);
+
+        // Target landscape -> should rotate back to landscape
+        orient_pages(&mut document, "1", "landscape").unwrap();
+        let after3 = page_geometry(&document, page_id).unwrap();
+        assert!(after3.display_width() > after3.display_height());
+    }
+
+    #[test]
     fn resize_sets_a4_box_and_preserves_page() {
         let mut document = one_page();
         resize_pages(&mut document, "A4", "all").unwrap();
@@ -1034,7 +1077,12 @@ mod tests {
         ];
         create_bookmarks(&mut document, &entries).unwrap();
 
-        let root_id = document.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let root_id = document
+            .trailer
+            .get(b"Root")
+            .unwrap()
+            .as_reference()
+            .unwrap();
         let catalog = document.get_dictionary(root_id).unwrap();
         let outlines_id = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
         let outlines = document.get_dictionary(outlines_id).unwrap();
@@ -1044,7 +1092,10 @@ mod tests {
         let last_id = outlines.get(b"Last").unwrap().as_reference().unwrap();
 
         let first_item = document.get_dictionary(first_id).unwrap();
-        assert_eq!(first_item.get(b"Title").unwrap().as_str().unwrap(), b"First Section");
+        assert_eq!(
+            first_item.get(b"Title").unwrap().as_str().unwrap(),
+            b"First Section"
+        );
         assert_eq!(
             first_item.get(b"Next").unwrap().as_reference().unwrap(),
             last_id
@@ -1072,7 +1123,9 @@ pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> R
     let valid_entries: Vec<(&str, ObjectId)> = entries
         .iter()
         .filter_map(|(title, page_num)| {
-            pages.get(page_num).map(|&page_id| (title.as_str(), page_id))
+            pages
+                .get(page_num)
+                .map(|&page_id| (title.as_str(), page_id))
         })
         .collect();
 
@@ -1109,7 +1162,9 @@ pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> R
         "Last" => item_ids[item_ids.len() - 1],
         "Count" => item_ids.len() as i64,
     };
-    document.objects.insert(outline_root_id, Object::Dictionary(root_dict));
+    document
+        .objects
+        .insert(outline_root_id, Object::Dictionary(root_dict));
 
     let catalog_id = if let Ok(root) = document.trailer.get(b"Root") {
         root.as_reference()?

@@ -19,7 +19,14 @@ enum Plan {
 
 pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Convert)?;
-    let image_options = config.image_options(args.keep_icc, args.ffmpeg.clone());
+    let mut image_options = config.image_options(args.keep_icc, args.ffmpeg.clone());
+    image_options.long_edge = args.long_edge;
+    image_options.short_edge = args.short_edge;
+    image_options.orient = args.orient;
+    if let Some(quality) = args.quality {
+        image_options.jpeg_quality = quality;
+        image_options.force_reencode = true;
+    }
     let output_dir = args.out.as_deref();
     if let Some(directory) = output_dir {
         if !directory.exists() {
@@ -65,19 +72,17 @@ fn build_plans(
         .iter()
         .map(|spec| {
             let input = spec.path.clone();
-            let plan = (|| {
-                match formats::detect(&input) {
-                    Some(format) if format.is_image() => {
-                        if spec.pages.is_some() {
-                            bail!("page ranges are only valid for PDF inputs");
-                        }
-                        let output = image_output_path(&input, output_dir)?;
-                        registry.reserve(&input, &output, force)?;
-                        Ok(Plan::Image(output))
+            let plan = (|| match formats::detect(&input) {
+                Some(format) if format.is_image() => {
+                    if spec.pages.is_some() {
+                        bail!("page ranges are only valid for PDF inputs");
                     }
-                    Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
-                    _ => bail!("unsupported convert input: {}", input.display()),
+                    let output = image_output_path(&input, output_dir)?;
+                    registry.reserve(&input, &output, force)?;
+                    Ok(Plan::Image(output))
                 }
+                Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
+                _ => bail!("unsupported convert input: {}", input.display()),
             })();
             (input, plan)
         })
@@ -168,6 +173,10 @@ mod tests {
             keep_icc: None,
             ffmpeg: None,
             force,
+            long_edge: None,
+            short_edge: None,
+            orient: None,
+            quality: None,
         }
     }
 

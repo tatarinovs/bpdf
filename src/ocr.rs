@@ -212,24 +212,26 @@ impl OcrEngine {
                 if let Some(pages) = &spec.pages {
                     pdf::select_pages(&mut document, pages)?;
                 }
-                
+
                 struct PageImageInfo {
                     page_id: lopdf::ObjectId,
                     width: f64,
                     height: f64,
                     images: Vec<ExtractedImage>,
                 }
-                
+
                 let mut page_images = Vec::new();
                 for (page_number, page_id) in document.get_pages() {
                     let images = match document.get_page_images(page_id) {
                         Ok(images) => images,
                         Err(error) => {
-                            output::warn(format!("page {page_number}: cannot inspect images: {error}"));
+                            output::warn(format!(
+                                "page {page_number}: cannot inspect images: {error}"
+                            ));
                             continue;
                         }
                     };
-                    
+
                     let page_rotation = crate::pdf::transform::page_geometry(&document, page_id)
                         .map(|g| g.rotation)
                         .unwrap_or(0);
@@ -242,7 +244,10 @@ impl OcrEngine {
 
                     let mut extracted_images = Vec::new();
                     for (index, image_info) in images.into_iter().enumerate() {
-                        let stream = match document.get_object(image_info.id).and_then(|obj| obj.as_stream()) {
+                        let stream = match document
+                            .get_object(image_info.id)
+                            .and_then(|obj| obj.as_stream())
+                        {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
@@ -257,20 +262,30 @@ impl OcrEngine {
                         } else if page_rotation == 270 {
                             image = image.rotate270();
                         }
-                        
+
                         let area = image.width().saturating_mul(image.height());
-                        if area > 100_000 {
-                            if let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, self.options.image.jpeg_quality) {
-                                extracted_images.push(ExtractedImage { label: format!("page-{page_number}-image-{}", index + 1), bytes });
+                        if area > 100_000
+                            && let Ok(bytes) = imageconv::encode_jpeg_on_white(
+                                &image,
+                                self.options.image.jpeg_quality,
+                            ) {
+                                extracted_images.push(ExtractedImage {
+                                    label: format!("page-{page_number}-image-{}", index + 1),
+                                    bytes,
+                                });
                             }
-                        }
                     }
-                    
+
                     if !extracted_images.is_empty() {
-                        page_images.push(PageImageInfo { page_id, width: page_width, height: page_height, images: extracted_images });
+                        page_images.push(PageImageInfo {
+                            page_id,
+                            width: page_width,
+                            height: page_height,
+                            images: extracted_images,
+                        });
                     }
                 }
-                
+
                 if page_images.is_empty() {
                     bail!("no extractable images found in {}", spec.path.display());
                 }
@@ -278,7 +293,7 @@ impl OcrEngine {
                 let recognize = |info: &PageImageInfo| -> Result<crate::textpdf::PageTextOverlay> {
                     let mut all_scaled_words = Vec::new();
                     let mut all_fallback_text = String::new();
-                    
+
                     for image in &info.images {
                         output::info(format!("OCR {} (searchable layer)...", image.label));
                         let page_res = match self.recognize_image(&image.bytes, &image.label) {
@@ -288,19 +303,20 @@ impl OcrEngine {
                                 continue;
                             }
                         };
-                        
-                        let (img_w, img_h) = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
-                            .with_guessed_format()
-                            .ok()
-                            .and_then(|r| r.into_dimensions().ok())
-                            .unwrap_or((
-                                page_res.image_width.max(1),
-                                page_res.image_height.max(1),
-                            ));
-                            
+
+                        let (img_w, img_h) =
+                            image::ImageReader::new(std::io::Cursor::new(&image.bytes))
+                                .with_guessed_format()
+                                .ok()
+                                .and_then(|r| r.into_dimensions().ok())
+                                .unwrap_or((
+                                    page_res.image_width.max(1),
+                                    page_res.image_height.max(1),
+                                ));
+
                         let scale_x = info.width / f64::from(img_w.max(1));
                         let scale_y = info.height / f64::from(img_h.max(1));
-                        
+
                         for mut word in page_res.words {
                             word.x *= scale_x;
                             word.y *= scale_y;
@@ -310,29 +326,37 @@ impl OcrEngine {
                             word.line_height *= scale_y;
                             all_scaled_words.push(word);
                         }
-                        
+
                         if !all_fallback_text.is_empty() && !page_res.text.is_empty() {
                             all_fallback_text.push_str("\n\n");
                         }
                         all_fallback_text.push_str(&page_res.text);
                     }
-                        
+
                     Ok(crate::textpdf::PageTextOverlay {
                         page_id: info.page_id,
                         page_width: info.width,
                         page_height: info.height,
                         scaled_words: all_scaled_words,
-                        fallback_text: if all_fallback_text.is_empty() { None } else { Some(all_fallback_text) },
+                        fallback_text: if all_fallback_text.is_empty() {
+                            None
+                        } else {
+                            Some(all_fallback_text)
+                        },
                     })
                 };
-                
+
                 let results = parallel_map(&page_images, self.options.jobs, recognize);
                 let mut overlays = Vec::with_capacity(results.len());
                 for r in results {
                     overlays.push(r?);
                 }
-                
-                crate::textpdf::overlay_searchable_text(&mut document, &overlays, config.font_path.as_deref())?;
+
+                crate::textpdf::overlay_searchable_text(
+                    &mut document,
+                    &overlays,
+                    config.font_path.as_deref(),
+                )?;
                 Ok(document)
             }
             Some(format) if format.is_image() => {
@@ -354,7 +378,11 @@ impl OcrEngine {
                     words: page_res.words,
                     fallback_text: Some(page_res.text),
                 };
-                let doc = crate::textpdf::render_searchable_pdf(&[page_input], &config.page_size, config.font_path.as_deref())?;
+                let doc = crate::textpdf::render_searchable_pdf(
+                    &[page_input],
+                    &config.page_size,
+                    config.font_path.as_deref(),
+                )?;
                 Ok(doc)
             }
             _ => bail!(
@@ -461,27 +489,37 @@ impl OcrEngine {
             OcrBackend::Auto => {
                 if !self.options.api_key.trim().is_empty() {
                     match self.run_vision(original, label) {
-                        Ok(text) => return Ok(crate::winocr::OcrPageResult {
-                            text,
-                            words: Vec::new(),
-                            image_width: 0,
-                            image_height: 0,
-                        }),
+                        Ok(text) => {
+                            return Ok(crate::winocr::OcrPageResult {
+                                text,
+                                words: Vec::new(),
+                                image_width: 0,
+                                image_height: 0,
+                            });
+                        }
                         Err(error) => {
-                            output::warn(format!("Groq OCR failed for {label}: {error}, falling back to Windows OCR..."));
+                            output::warn(format!(
+                                "Groq OCR failed for {label}: {error}, falling back to Windows OCR..."
+                            ));
                         }
                     }
                 }
                 if cfg!(windows) && crate::winocr::is_available() {
                     self.recognize_image_winocr(original, label)
                 } else {
-                    bail!("no OCR engine available (Groq failed/missing key, Windows OCR unavailable)");
+                    bail!(
+                        "no OCR engine available (Groq failed/missing key, Windows OCR unavailable)"
+                    );
                 }
             }
         }
     }
 
-    fn recognize_image_winocr(&self, original: &[u8], label: &str) -> Result<crate::winocr::OcrPageResult> {
+    fn recognize_image_winocr(
+        &self,
+        original: &[u8],
+        label: &str,
+    ) -> Result<crate::winocr::OcrPageResult> {
         let lang_str = self.options.lang.as_deref().unwrap_or("default");
         if let Some(cache_dir) = &self.options.cache_dir {
             let key = sha256_hex(&[
@@ -502,8 +540,8 @@ impl OcrEngine {
                     .clone()
             };
             let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
-            if let Ok(data) = fs::read_to_string(&path) {
-                if let Ok(saved) = serde_json::from_str::<Value>(&data) {
+            if let Ok(data) = fs::read_to_string(&path)
+                && let Ok(saved) = serde_json::from_str::<Value>(&data) {
                     output::info(format!("OCR cache hit: {label}"));
                     let text = saved["text"].as_str().unwrap_or_default().to_owned();
                     let words = saved["words"]
@@ -518,7 +556,9 @@ impl OcrEngine {
                                         width: w["width"].as_f64()?,
                                         height: w["height"].as_f64()?,
                                         line_y: w["line_y"].as_f64().unwrap_or(w["y"].as_f64()?),
-                                        line_height: w["line_height"].as_f64().unwrap_or(w["height"].as_f64()?),
+                                        line_height: w["line_height"]
+                                            .as_f64()
+                                            .unwrap_or(w["height"].as_f64()?),
                                     })
                                 })
                                 .collect::<Vec<_>>()
@@ -533,11 +573,7 @@ impl OcrEngine {
                         image_height: h,
                     });
                 }
-            }
-            let res = crate::winocr::recognize_image_bytes(
-                original,
-                self.options.lang.as_deref(),
-            )?;
+            let res = crate::winocr::recognize_image_bytes(original, self.options.lang.as_deref())?;
             let json_val = json!({
                 "text": res.text,
                 "width": res.image_width,
@@ -785,7 +821,10 @@ pub fn extract_pdf_images(
         let mut best_image: Option<(u32, ExtractedImage)> = None;
 
         for (index, image_info) in images.into_iter().enumerate() {
-            let stream = match document.get_object(image_info.id).and_then(|obj| obj.as_stream()) {
+            let stream = match document
+                .get_object(image_info.id)
+                .and_then(|obj| obj.as_stream())
+            {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -801,15 +840,22 @@ pub fn extract_pdf_images(
             } else if page_rotation == 270 {
                 image = image.rotate270();
             }
-            
+
             let area = image.width().saturating_mul(image.height());
-            if best_image.as_ref().map_or(true, |(best_area, _)| area > *best_area) {
-                if let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality) {
-                    best_image = Some((area, ExtractedImage { label: format!("page-{page_number}"), bytes }));
+            if best_image
+                .as_ref()
+                .is_none_or(|(best_area, _)| area > *best_area)
+                && let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality) {
+                    best_image = Some((
+                        area,
+                        ExtractedImage {
+                            label: format!("page-{page_number}"),
+                            bytes,
+                        },
+                    ));
                 }
-            }
         }
-        
+
         if let Some((_, best)) = best_image {
             output.push(best);
         }
@@ -893,10 +939,7 @@ mod tests {
 
     #[test]
     fn ocr_backend_parsing() {
-        assert_eq!(
-            OcrBackend::parse("groq", "").unwrap(),
-            OcrBackend::Groq
-        );
+        assert_eq!(OcrBackend::parse("groq", "").unwrap(), OcrBackend::Groq);
         if cfg!(windows) {
             assert_eq!(
                 OcrBackend::parse("windows", "").unwrap(),
@@ -908,7 +951,7 @@ mod tests {
             );
             assert_eq!(
                 OcrBackend::parse("auto", "key123").unwrap(),
-                OcrBackend::Groq
+                OcrBackend::Auto
             );
         }
     }

@@ -53,8 +53,9 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
         Some(format) if format.is_office() => {
             reject_pages(spec)?;
             match office::convert_to_pdf(&spec.path, &options.office) {
-                Ok(bytes) => Document::load_mem(&bytes)
-                    .with_context(|| format!("Office output for {} is invalid", spec.path.display())),
+                Ok(bytes) => Document::load_mem(&bytes).with_context(|| {
+                    format!("Office output for {} is invalid", spec.path.display())
+                }),
                 Err(com_err) => {
                     if let Ok(text) = crate::office_fallback::extract_text(&spec.path) {
                         crate::output::warn(format!(

@@ -61,21 +61,24 @@ pub enum InputFormatSet {
     Ocr,
     Strip,
     Convert,
+    Rotate,
+    Resize,
 }
 
 impl InputFormatSet {
     pub fn supports(self, path: &Path) -> bool {
         detect(path).is_some_and(|format| match self {
             Self::Merge => true,
-            Self::Ocr | Self::Convert => format.is_image() || format == Format::Pdf || format == Format::Cbz,
+            Self::Ocr | Self::Convert => {
+                format.is_image() || format == Format::Pdf || format == Format::Cbz
+            }
             Self::Strip => matches!(
                 format,
-                Format::Jpeg
-                    | Format::Png
-                    | Format::FfmpegRaster
-                    | Format::WicRaster
-                    | Format::CameraRaw
-                    | Format::Pdf
+                Format::Jpeg | Format::Png | Format::Pdf
+            ),
+            Self::Rotate | Self::Resize => matches!(
+                format,
+                Format::Pdf | Format::Jpeg
             ),
         })
     }
@@ -93,13 +96,15 @@ pub fn detect(path: &Path) -> Option<Format> {
             "png" => return Some(Format::Png),
             "bmp" | "gif" | "tiff" | "tif" | "webp" | "apng" => return Some(Format::Raster),
             "heic" | "heif" | "avif" | "psd" | "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx"
-            | "pnm" | "ppm" | "pgm" | "pbm" | "pam" | "sgi" | "xbm" | "jp2" | "j2k" | "j2c" | "jpc"
-            | "jpf" | "jpx" | "jls" | "dpx" | "fits" | "fit" | "fts" | "pgx" | "ras" | "sun"
-            | "xwd" | "pix" => return Some(Format::FfmpegRaster),
+            | "pnm" | "ppm" | "pgm" | "pbm" | "pam" | "sgi" | "xbm" | "jp2" | "j2k" | "j2c"
+            | "jpc" | "jpf" | "jpx" | "jls" | "dpx" | "fits" | "fit" | "fts" | "pgx" | "ras"
+            | "sun" | "xwd" | "pix" => return Some(Format::FfmpegRaster),
             "jxr" | "wdp" | "hdp" | "ico" => return Some(Format::WicRaster),
-            "3fr" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf" | "fff" | "gpr"
-            | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf" | "pef" | "raf"
-            | "raw" | "rw2" | "rwl" | "sr2" | "srf" | "srw" | "x3f" => return Some(Format::CameraRaw),
+            "3fr" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf" | "fff"
+            | "gpr" | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf"
+            | "pef" | "raf" | "raw" | "rw2" | "rwl" | "sr2" | "srf" | "srw" | "x3f" => {
+                return Some(Format::CameraRaw);
+            }
             "pdf" => return Some(Format::Pdf),
             "doc" | "docx" | "rtf" | "odt" => return Some(Format::Word),
             "xls" | "xlsx" | "ods" => return Some(Format::Excel),
@@ -124,8 +129,12 @@ pub fn detect(path: &Path) -> Option<Format> {
 
 /// Inspects ZIP archive entries to detect EPUB, FB2, HTMLZ, or CBZ format.
 fn detect_zip_content(path: &Path) -> Option<Format> {
-    let Ok(file) = File::open(path) else { return None; };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else { return None; };
+    let Ok(file) = File::open(path) else {
+        return None;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return None;
+    };
 
     let mut has_image = false;
     let mut has_htmlz_index = false;
@@ -133,7 +142,9 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
     let mut has_fb2 = false;
 
     for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else { continue; };
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
         let name = entry.name().to_ascii_lowercase();
         if name.ends_with("container.xml") {
             has_epub_container = true;
@@ -217,8 +228,8 @@ mod tests {
     fn operation_sets_share_the_detected_format() {
         assert!(InputFormatSet::Merge.supports(Path::new("document.docx")));
         assert!(!InputFormatSet::Ocr.supports(Path::new("document.docx")));
-        assert!(InputFormatSet::Strip.supports(Path::new("photo.heic")));
-        assert!(InputFormatSet::Strip.supports(Path::new("photo.avif")));
+        assert!(!InputFormatSet::Strip.supports(Path::new("photo.heic")));
+        assert!(!InputFormatSet::Strip.supports(Path::new("photo.avif")));
         assert!(InputFormatSet::Convert.supports(Path::new("design.psd")));
         assert!(InputFormatSet::Convert.supports(Path::new("scan.jp2")));
         assert!(InputFormatSet::Convert.supports(Path::new("photo.jxr")));
@@ -226,8 +237,20 @@ mod tests {
         assert!(!InputFormatSet::Ocr.supports(Path::new("slides.pptx")));
         assert!(InputFormatSet::Merge.supports(Path::new("photo.nef")));
         assert!(InputFormatSet::Ocr.supports(Path::new("photo.arw")));
-        assert!(InputFormatSet::Strip.supports(Path::new("photo.dng")));
+        assert!(!InputFormatSet::Strip.supports(Path::new("photo.dng")));
         assert!(!InputFormatSet::Strip.supports(Path::new("photo.webp")));
+        assert!(InputFormatSet::Strip.supports(Path::new("photo.png")));
+        assert!(InputFormatSet::Strip.supports(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Rotate.supports(Path::new("document.pdf")));
+        assert!(InputFormatSet::Rotate.supports(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Rotate.supports(Path::new("photo.jpeg")));
+        assert!(!InputFormatSet::Rotate.supports(Path::new("photo.png")));
+        assert!(!InputFormatSet::Rotate.supports(Path::new("photo.webp")));
+        assert!(InputFormatSet::Resize.supports(Path::new("document.pdf")));
+        assert!(InputFormatSet::Resize.supports(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Resize.supports(Path::new("photo.jpeg")));
+        assert!(!InputFormatSet::Resize.supports(Path::new("photo.png")));
+        assert!(!InputFormatSet::Resize.supports(Path::new("photo.webp")));
     }
 
     #[test]

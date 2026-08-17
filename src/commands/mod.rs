@@ -3,6 +3,8 @@ mod convert;
 mod merge;
 mod ocr;
 mod pdf_edit;
+mod resize;
+mod rotate;
 mod strip;
 
 use anyhow::Result;
@@ -34,21 +36,37 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
         }
         Command::Strip(args) => strip::run(args, &config, fail_fast),
         Command::Rotate {
-            input,
+            inputs,
             degrees,
+            orient,
             pages,
             out,
-        } => common::edit_pdf(&input, out, "rotated", |document| {
-            transform::rotate_pages(document, &pages, degrees)
-        }),
+        } => rotate::run(
+            &inputs,
+            degrees,
+            orient.as_deref(),
+            &pages,
+            out.as_deref(),
+            &config,
+            fail_fast,
+        ),
         Command::Resize {
-            input,
+            inputs,
             size,
+            long_edge,
+            short_edge,
             pages,
             out,
-        } => common::edit_pdf(&input, out, "resized", |document| {
-            transform::resize_pages(document, &size, &pages)
-        }),
+        } => resize::run(
+            &inputs,
+            &size,
+            long_edge,
+            short_edge,
+            &pages,
+            out.as_deref(),
+            &config,
+            fail_fast,
+        ),
         Command::Text { input, out } => pdf_edit::text(&input, out.as_deref()),
         Command::Doctor => doctor::run(&config),
         Command::Stamp(args) => pdf_edit::stamp(args),

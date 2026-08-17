@@ -61,30 +61,42 @@ pub enum Command {
     },
     /// Strip metadata without re-encoding JPEG/PNG pixel data.
     Strip(StripArgs),
-    /// Rotate selected PDF pages by a multiple of 90 degrees.
+    /// Rotate PDF pages or JPEG images by a multiple of 90 degrees or to a target orientation.
     Rotate {
-        /// Source PDF file.
-        input: PathBuf,
+        /// Source PDF files or JPEG images, non-recursive directories, globs, or @list.txt manifests.
+        #[arg(required = true)]
+        inputs: Vec<String>,
         /// Clockwise angle in degrees; must be a multiple of 90.
-        degrees: i64,
-        /// Pages to rotate, for example all, 1-5, even or odd.
+        #[arg(required_unless_present = "orient")]
+        degrees: Option<i64>,
+        /// Target orientation (landscape or portrait).
+        #[arg(long, conflicts_with = "degrees")]
+        orient: Option<String>,
+        /// Pages to rotate, for example all, 1-5, even or odd (PDF only).
         #[arg(short, long, default_value = "all")]
         pages: String,
-        /// Destination PDF; may equal the input for an in-place update.
+        /// Destination file or directory; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Resize and center selected PDF pages on A4 or Letter.
+    /// Resize PDF pages or JPEG images.
     Resize {
-        /// Source PDF file.
-        input: PathBuf,
-        /// Target paper size: A4 or Letter.
+        /// Source PDF files or JPEG images, non-recursive directories, globs, or @list.txt manifests.
+        #[arg(required = true)]
+        inputs: Vec<String>,
+        /// Target paper size for PDFs: A4 or Letter.
         #[arg(short, long, default_value = "A4")]
         size: String,
-        /// Pages to resize, for example all, 1-5, even or odd.
+        /// Resize JPEG images so the longest edge is at most this many pixels.
+        #[arg(long)]
+        long_edge: Option<u32>,
+        /// Resize JPEG images so the shortest edge is at least this many pixels.
+        #[arg(long)]
+        short_edge: Option<u32>,
+        /// Pages to resize, for example all, 1-5, even or odd (PDF only).
         #[arg(short, long, default_value = "all")]
         pages: String,
-        /// Destination PDF; may equal the input for an in-place update.
+        /// Destination file or directory; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -249,6 +261,9 @@ pub struct OcrArgs {
     /// Combined Markdown output; when omitted, writes one .md file per input.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// Update the source PDF in-place with the searchable text layer instead of creating a new file.
+    #[arg(long, conflicts_with = "out")]
+    pub in_place: bool,
     /// HTTP or SOCKS5 proxy URL.
     #[arg(long)]
     pub proxy: Option<String>,
@@ -317,6 +332,18 @@ pub struct ConvertArgs {
     /// Allow output to overwrite an input file (e.g. jpg -> jpg in place).
     #[arg(long)]
     pub force: bool,
+    /// Resize images so the longest edge is at most this many pixels.
+    #[arg(long)]
+    pub long_edge: Option<u32>,
+    /// Resize images so the shortest edge is at least this many pixels.
+    #[arg(long)]
+    pub short_edge: Option<u32>,
+    /// Force rotation to 'landscape' or 'portrait'.
+    #[arg(long)]
+    pub orient: Option<String>,
+    /// JPEG quality (0-100), overrides config.
+    #[arg(short = 'q', long)]
+    pub quality: Option<u8>,
 }
 
 #[cfg(test)]

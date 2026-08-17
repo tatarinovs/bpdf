@@ -370,7 +370,7 @@ pub fn overlay_searchable_text(
     if overlays.is_empty() {
         return Ok(());
     }
-    
+
     let font_path = find_font(font_path)?;
     let font_data = fs::read(&font_path)
         .with_context(|| format!("failed to read font {}", font_path.display()))?;
@@ -378,11 +378,11 @@ pub fn overlay_searchable_text(
         .map_err(|error| anyhow::anyhow!("failed to parse {}: {error:?}", font_path.display()))?;
 
     let mut used = BTreeMap::<u16, char>::new();
-    
+
     // First, process all pages to build the 'used' glyph map and create content streams.
     // We cannot add objects to the document while building the font because we need all used characters first.
     let mut page_contents = Vec::with_capacity(overlays.len());
-    
+
     for overlay in overlays {
         let mut content = String::from("\nq\nBT\n3 Tr\n");
         if !overlay.scaled_words.is_empty() {
@@ -393,35 +393,35 @@ pub fn overlay_searchable_text(
                 let text = format!("{} ", word.text);
                 let encoded = encode_line(&text, &face, &mut used);
                 let word_pt_x = word.x;
-                
+
                 // We use line_height as the font size so that the entire line has a uniform font size,
                 // which prevents the selection highlight from jumping in height.
                 let font_size = word.line_height.max(word.height).max(4.0);
-                
+
                 // We position the baseline such that the top of the line bounding box matches the top of the font's Ascent.
                 // Ascent is usually around 80% of the total font height. We'll compute it exactly from the font metrics.
                 let _units_per_em = face.units_per_em() as f64;
                 let ascender = face.ascender() as f64;
                 let descender = face.descender() as f64;
-                
+
                 let line_top_y = overlay.page_height - word.line_y;
                 let total_font_height = ascender - descender;
-                
+
                 // Baseline is positioned below the top of the line by the font's scaled ascent.
                 let ascent_scaled = font_size * (ascender / total_font_height);
                 let word_pt_y = line_top_y - ascent_scaled;
-                
+
                 let target_width = word.width;
-                
+
                 let natural_width = text_width(&text, &face, 1.0); // at 1 pt size
                 let current_natural_width = natural_width * font_size;
-                
+
                 let scale = if current_natural_width > 0.0 {
                     (target_width / current_natural_width) * 100.0
                 } else {
                     100.0
                 };
-                
+
                 content.push_str(&format!("{:.1} Tz\n", scale));
                 content.push_str(&format!("/BpdfF0 {:.3} Tf\n", font_size));
                 content.push_str(&format!(
@@ -456,7 +456,7 @@ pub fn overlay_searchable_text(
         content.push_str("100 Tz\nET\nQ\n");
         page_contents.push((overlay.page_id, content));
     }
-    
+
     // Now that 'used' is fully populated, build the font objects.
     let units = f64::from(face.units_per_em());
     let scale_metric = |value: i16| f64::from(value) * 1000.0 / units;
@@ -521,21 +521,21 @@ pub fn overlay_searchable_text(
         "DescendantFonts" => vec![Object::Reference(cid_font_id)],
         "ToUnicode" => to_unicode_id,
     });
-    
+
     // Inject the new text stream into each page
     for (page_id, content) in page_contents {
         let new_content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        
+
         let mut resource_id_to_update = None;
-        
+
         {
             let page = document.get_object_mut(page_id)?.as_dict_mut()?;
-            
+
             // Ensure Resources dictionary exists and has Font dict
             match page.get_mut(b"Resources") {
                 Ok(Object::Reference(id)) => {
                     resource_id_to_update = Some(*id);
-                },
+                }
                 Ok(Object::Dictionary(r)) => {
                     let font_dict = match r.get_mut(b"Font") {
                         Ok(Object::Dictionary(f)) => f,
@@ -545,7 +545,7 @@ pub fn overlay_searchable_text(
                         }
                     };
                     font_dict.set("BpdfF0", type0_font_id);
-                },
+                }
                 _ => {
                     let mut r = dictionary! {};
                     r.set("Font", dictionary! { "BpdfF0" => type0_font_id });
@@ -560,7 +560,10 @@ pub fn overlay_searchable_text(
                     page.set("Contents", Object::Array(arr));
                 }
                 Ok(Object::Reference(id)) => {
-                    page.set("Contents", vec![Object::Reference(id), Object::Reference(new_content_id)]);
+                    page.set(
+                        "Contents",
+                        vec![Object::Reference(id), Object::Reference(new_content_id)],
+                    );
                 }
                 Ok(val) => {
                     page.set("Contents", vec![val, Object::Reference(new_content_id)]);
@@ -570,7 +573,7 @@ pub fn overlay_searchable_text(
                 }
             }
         }
-        
+
         if let Some(res_id) = resource_id_to_update {
             let res_dict = document.get_object_mut(res_id)?.as_dict_mut()?;
             let font_dict = match res_dict.get_mut(b"Font") {
@@ -583,7 +586,7 @@ pub fn overlay_searchable_text(
             font_dict.set("BpdfF0", type0_font_id);
         }
     }
-    
+
     Ok(())
 }
 

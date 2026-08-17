@@ -28,6 +28,11 @@ pub struct ImageOptions {
     pub ffmpeg: PathBuf,
     pub jpeg_quality: u8,
     pub image_dpi: u32,
+    pub long_edge: Option<u32>,
+    pub short_edge: Option<u32>,
+    pub orient: Option<String>,
+    pub rotation_degrees: Option<i64>,
+    pub force_reencode: bool,
 }
 
 pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
@@ -49,7 +54,13 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
             dpi_target_for_dimensions(width, height, page_size, options.image_dpi)
         });
 
-    if format == Some(Format::Jpeg) && jpeg_target.is_none() {
+    let needs_reencode = options.force_reencode
+        || options.long_edge.is_some()
+        || options.short_edge.is_some()
+        || options.orient.is_some()
+        || options.rotation_degrees.is_some_and(|deg| deg.rem_euclid(360) != 0);
+
+    if format == Some(Format::Jpeg) && jpeg_target.is_none() && !needs_reencode {
         return metadata::strip_jpeg(&input, options.keep_icc);
     }
 
@@ -66,10 +77,7 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
             )
         })?,
     };
-    let target_dimensions =
-        jpeg_target.or_else(|| dpi_target(&image, page_size, options.image_dpi));
-
-    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+    apply_transformations(image, options, page_size, jpeg_target)
 }
 
 /// Convert raw image bytes into JPEG for PDF page creation.
@@ -85,9 +93,15 @@ pub fn bytes_to_jpeg(
             .and_then(|r| r.into_dimensions().ok())
             .and_then(|(w, h)| dpi_target_for_dimensions(w, h, page_size, options.image_dpi));
         if jpeg_target.is_none() {
-            if let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
-                return Ok(stripped);
-            }
+            let needs_reencode = options.force_reencode
+                || options.long_edge.is_some()
+                || options.short_edge.is_some()
+                || options.orient.is_some()
+                || options.rotation_degrees.is_some_and(|deg| deg.rem_euclid(360) != 0);
+            if !needs_reencode
+                && let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
+                    return Ok(stripped);
+                }
         }
     }
 
@@ -97,8 +111,7 @@ pub fn bytes_to_jpeg(
         .decode()
         .context("failed to decode image bytes")?;
 
-    let target_dimensions = dpi_target(&image, page_size, options.image_dpi);
-    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+    apply_transformations(image, options, page_size, None)
 }
 
 /// Decode every logical page/frame for PDF construction. Single-image callers
@@ -225,10 +238,6 @@ pub fn optimize_for_ocr(bytes: &[u8]) -> Result<Vec<u8>> {
     resize_to_jpeg_with_filter(&image, target_dimensions, 80, FilterType::CatmullRom)
 }
 
-pub fn ffmpeg_to_jpeg(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
-    ffmpeg_to_jpeg_for_page(path, options, None)
-}
-
 fn ffmpeg_to_jpeg_for_page(
     path: &Path,
     options: &ImageOptions,
@@ -242,8 +251,7 @@ fn decoded_to_jpeg_for_page(
     options: &ImageOptions,
     page_size: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let target_dimensions = dpi_target(&image, page_size, options.image_dpi);
-    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+    apply_transformations(image, options, page_size, None)
 }
 
 fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
@@ -396,6 +404,56 @@ fn resize_to_jpeg_with_filter(
     }
 }
 
+pub(crate) fn apply_transformations(
+    mut image: DynamicImage,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+    default_target: Option<(u32, u32)>,
+) -> Result<Vec<u8>> {
+    if let Some(orient) = &options.orient {
+        let (w, h) = image.dimensions();
+        let is_landscape = w > h;
+        match orient.to_lowercase().as_str() {
+            "portrait" if is_landscape => {
+                image = image.rotate90();
+            }
+            "landscape" if !is_landscape => {
+                image = image.rotate90();
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(degrees) = options.rotation_degrees {
+        let degrees = degrees.rem_euclid(360);
+        match degrees {
+            90 => image = image.rotate90(),
+            180 => image = image.rotate180(),
+            270 => image = image.rotate270(),
+            _ => {} // 0 or invalid multiple of 90 handled as no-op
+        }
+    }
+
+    let (w, h) = image.dimensions();
+    let target_dimensions = if let Some(long) = options.long_edge {
+        fit_dimensions(w, h, long, long)
+    } else if let Some(short) = options.short_edge {
+        let scale = (f64::from(short) / f64::from(w)).max(f64::from(short) / f64::from(h));
+        if (scale - 1.0).abs() > f64::EPSILON {
+            Some((
+                (f64::from(w) * scale).round().max(1.0) as u32,
+                (f64::from(h) * scale).round().max(1.0) as u32,
+            ))
+        } else {
+            None
+        }
+    } else {
+        default_target.or_else(|| dpi_target(&image, page_size, options.image_dpi))
+    };
+
+    resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
+}
+
 #[cfg(test)]
 mod tests {
     use image::codecs::gif::GifEncoder;
@@ -453,6 +511,11 @@ mod tests {
                 ffmpeg: PathBuf::from("missing-ffmpeg"),
                 jpeg_quality: 85,
                 image_dpi: 0,
+                force_reencode: false,
+                long_edge: None,
+                short_edge: None,
+                orient: None,
+                rotation_degrees: None,
             },
             None,
         )
@@ -491,6 +554,11 @@ mod tests {
                 ffmpeg: PathBuf::from("missing-ffmpeg"),
                 jpeg_quality: 85,
                 image_dpi: 0,
+                force_reencode: false,
+                long_edge: None,
+                short_edge: None,
+                orient: None,
+                rotation_degrees: None,
             },
             None,
         )
