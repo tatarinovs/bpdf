@@ -1,25 +1,39 @@
-use std::io::Cursor;
-
 use anyhow::{Context, Result, bail};
-use image::{DynamicImage, GrayImage, ImageReader, Limits, RgbImage};
+use image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::{Object, Stream};
+
+fn decompress_flate(data: &[u8]) -> Result<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec_zlib(data)
+        .or_else(|_| miniz_oxide::inflate::decompress_to_vec(data))
+        .map_err(|e| anyhow::anyhow!("flate decompression failed: {e:?}"))
+}
 
 pub(crate) fn decode(stream: &Stream) -> Result<DynamicImage> {
     let filters = stream.filters().unwrap_or_default();
-    if filters.as_slice() == [b"DCTDecode".as_slice()] {
-        let mut reader = ImageReader::new(Cursor::new(&stream.content))
-            .with_guessed_format()
-            .context("failed to detect embedded JPEG")?;
-        let mut limits = Limits::default();
-        limits.max_alloc = Some(super::MAX_DECOMPRESSED_BYTES as u64);
-        reader.limits(limits);
-        return reader.decode().context("failed to decode embedded JPEG");
+
+    // Check if the stream contains JPEG (DCTDecode / DCT)
+    if filters.iter().any(|f| *f == b"DCTDecode" || *f == b"DCT") {
+        if stream.content.starts_with(&[0xff, 0xd8]) {
+            if let Ok(img) = image::load_from_memory(&stream.content) {
+                return Ok(img);
+            }
+        }
+        if let Ok(decompressed) = decompress_flate(&stream.content) {
+            if decompressed.starts_with(&[0xff, 0xd8]) {
+                if let Ok(img) = image::load_from_memory(&decompressed) {
+                    return Ok(img);
+                }
+            }
+            if let Ok(img) = image::load_from_memory(&decompressed) {
+                return Ok(img);
+            }
+        }
     }
-    if filters
-        .iter()
-        .any(|filter| !matches!(*filter, b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode"))
-    {
-        bail!("unsupported PDF image filter");
+
+    if stream.content.starts_with(&[0xff, 0xd8]) {
+        if let Ok(img) = image::load_from_memory(&stream.content) {
+            return Ok(img);
+        }
     }
 
     let width = dimension(stream, b"Width")?;
@@ -30,55 +44,126 @@ pub(crate) fn decode(stream: &Stream) -> Result<DynamicImage> {
         .ok()
         .and_then(|value| value.as_i64().ok())
         .unwrap_or(8);
-    if bits != 8 {
-        bail!("only 8-bit PDF images are supported");
-    }
+
     let color_space = stream
         .dict
         .get(b"ColorSpace")
         .ok()
         .and_then(color_space_name)
-        .context("unsupported PDF image color space")?;
+        .unwrap_or("DeviceGray");
+
     let channels = match color_space {
-        "DeviceGray" => 1usize,
-        "DeviceRGB" => 3,
+        "DeviceGray" | "CalGray" => 1usize,
+        "DeviceRGB" | "CalRGB" => 3,
         "DeviceCMYK" => 4,
-        _ => bail!("unsupported PDF image color space {color_space}"),
-    };
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(channels))
-        .context("embedded image dimensions are too large")?;
-    if expected > super::MAX_DECOMPRESSED_BYTES {
-        bail!("embedded image exceeds the 256 MiB decoded-size limit");
-    }
-    let raw = if filters.is_empty() {
-        if stream.content.len() > expected {
-            bail!("embedded image data is longer than expected");
+        _ => {
+            if color_space.contains("RGB") {
+                3
+            } else if color_space.contains("CMYK") {
+                4
+            } else {
+                1
+            }
         }
+    };
+
+    let raw = if filters.is_empty() {
         stream.content.clone()
+    } else if filters.iter().any(|f| *f == b"FlateDecode" || *f == b"Fl") {
+        decompress_flate(&stream.content).unwrap_or_else(|_| stream.content.clone())
     } else {
         stream
-            .decompressed_content_with_limit(expected)
-            .context("failed to decompress embedded image")?
+            .decompressed_content_with_limit(super::MAX_DECOMPRESSED_BYTES)
+            .unwrap_or_else(|_| stream.content.clone())
     };
-    if raw.len() != expected {
-        bail!("embedded image data length does not match its dimensions");
+
+    if raw.starts_with(&[0xff, 0xd8]) || raw.starts_with(&[0x89, b'P', b'N', b'G']) {
+        if let Ok(img) = image::load_from_memory(&raw) {
+            return Ok(img);
+        }
     }
 
-    match color_space {
-        "DeviceGray" => Ok(DynamicImage::ImageLuma8(
-            GrayImage::from_raw(width, height, raw).context("invalid grayscale image data")?,
-        )),
-        "DeviceRGB" => Ok(DynamicImage::ImageRgb8(
-            RgbImage::from_raw(width, height, raw).context("invalid RGB image data")?,
-        )),
-        "DeviceCMYK" => Ok(DynamicImage::ImageRgb8(
-            RgbImage::from_raw(width, height, cmyk_to_rgb(&raw))
-                .context("invalid converted CMYK image")?,
-        )),
-        _ => unreachable!(),
+    if bits == 1 {
+        let row_bytes = (width as usize + 7) / 8;
+        let invert = stream
+            .dict
+            .get(b"Decode")
+            .ok()
+            .and_then(|d| d.as_array().ok())
+            .and_then(|arr| arr.first().and_then(|v| v.as_i64().ok()))
+            .map(|v| v == 1)
+            .unwrap_or(false);
+
+        let mut gray_pixels = Vec::with_capacity((width * height) as usize);
+        for y in 0..height as usize {
+            let row_start = y * row_bytes;
+            if row_start >= raw.len() {
+                break;
+            }
+            let row_end = (row_start + row_bytes).min(raw.len());
+            let row = &raw[row_start..row_end];
+            for x in 0..width as usize {
+                let byte_idx = x / 8;
+                let bit_idx = 7 - (x % 8);
+                let bit = if byte_idx < row.len() {
+                    (row[byte_idx] >> bit_idx) & 1
+                } else {
+                    0
+                };
+                let pixel = if (bit == 1) ^ invert { 255u8 } else { 0u8 };
+                gray_pixels.push(pixel);
+            }
+        }
+        if gray_pixels.len() < (width * height) as usize {
+            gray_pixels.resize((width * height) as usize, 255);
+        }
+        return Ok(DynamicImage::ImageLuma8(
+            GrayImage::from_raw(width, height, gray_pixels)
+                .context("failed to create 1-bit grayscale image")?,
+        ));
     }
+
+    if bits == 8 {
+        return match color_space {
+            "DeviceGray" | "CalGray" => Ok(DynamicImage::ImageLuma8(
+                GrayImage::from_raw(width, height, raw).context("invalid grayscale image data")?,
+            )),
+            "DeviceCMYK" => Ok(DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, cmyk_to_rgb(&raw))
+                    .context("invalid converted CMYK image")?,
+            )),
+            _ if channels == 1 => Ok(DynamicImage::ImageLuma8(
+                GrayImage::from_raw(width, height, raw).context("invalid grayscale image data")?,
+            )),
+            _ if channels == 4 => Ok(DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, cmyk_to_rgb(&raw))
+                    .context("invalid converted CMYK image")?,
+            )),
+            _ => Ok(DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, raw).context("invalid RGB image data")?,
+            )),
+        };
+    }
+
+    if bits == 16 {
+        let raw8: Vec<u8> = raw.chunks_exact(2).map(|chunk| chunk[0]).collect();
+        return match channels {
+            1 => Ok(DynamicImage::ImageLuma8(
+                GrayImage::from_raw(width, height, raw8)
+                    .context("invalid 16-to-8 grayscale image data")?,
+            )),
+            4 => Ok(DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, cmyk_to_rgb(&raw8))
+                    .context("invalid converted 16-to-8 CMYK image")?,
+            )),
+            _ => Ok(DynamicImage::ImageRgb8(
+                RgbImage::from_raw(width, height, raw8)
+                    .context("invalid 16-to-8 RGB image data")?,
+            )),
+        };
+    }
+
+    bail!("unsupported bits per component: {bits}")
 }
 
 pub(crate) fn dimension(stream: &Stream, key: &[u8]) -> Result<u32> {

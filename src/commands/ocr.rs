@@ -7,7 +7,7 @@ use crate::cli::OcrArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
-use crate::ocr::{OcrEngine, OcrOptions};
+use crate::ocr::{OcrBackend, OcrEngine, OcrOptions};
 use crate::output;
 
 pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
@@ -30,7 +30,14 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
             .clone()
             .unwrap_or_else(|| config.ocr_cache_dir.clone())
     });
+
+    let engine_name = args.engine.as_deref().unwrap_or(&config.ocr_engine);
+    let backend = OcrBackend::parse(engine_name, &config.groq_api_key)?;
+    let lang = args.lang.or_else(|| config.ocr_lang.clone());
+
     let engine = OcrEngine::new(OcrOptions {
+        backend,
+        lang,
         api_key: config.groq_api_key.clone(),
         proxy: args.proxy.unwrap_or_else(|| config.proxy.clone()),
         model: args.model.unwrap_or_else(|| config.ocr_model.clone()),
@@ -43,6 +50,30 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
         max_tokens: config.ocr_max_tokens,
         cache_dir,
     })?;
+
+    let is_pdf_output = args
+        .out
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+
+    if is_pdf_output {
+        let output_path = args.out.as_ref().unwrap();
+        let mut documents = Vec::new();
+        for spec in &specs {
+            let doc = engine.create_searchable_pdf_for_spec(spec, config)?;
+            documents.push(doc);
+        }
+        if documents.is_empty() {
+            bail!("no pages could be extracted for searchable PDF");
+        }
+        let mut doc = crate::pdf::merge_documents(documents)?;
+        let bytes = crate::pdf::save_to_bytes(&mut doc)?;
+        write_output(output_path, &bytes)?;
+        return finish_batch("ocr", specs.len(), 0, 1);
+    }
 
     for spec in &specs {
         if let Some(pages) = &spec.pages {
@@ -110,4 +141,50 @@ fn extract(engine: &OcrEngine, specs: &[InputSpec], fail_fast: bool) -> Vec<Resu
         }
     }
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ocr_pdf_output_creates_searchable_pdf_on_windows() {
+        if !cfg!(windows) || !crate::winocr::is_available() {
+            return;
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let image_path = temp_dir.path().join("scan.png");
+        let output_pdf = temp_dir.path().join("searchable.pdf");
+
+        // Create a 100x40 image with some pixels
+        let mut img = image::RgbImage::new(100, 40);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([255, 255, 255]);
+        }
+        img.save(&image_path).unwrap();
+
+        let config = Config::default();
+        let args = OcrArgs {
+            inputs: vec![image_path.to_str().unwrap().to_owned()],
+            out: Some(output_pdf.clone()),
+            proxy: None,
+            model: None,
+            prompt: None,
+            endpoint: None,
+            force_ocr: false,
+            ffmpeg: None,
+            jobs: Some(1),
+            no_cache: true,
+            cache_dir: None,
+            engine: Some("windows".to_owned()),
+            lang: None,
+        };
+
+        let result = run(args, &config, true);
+        assert!(result.is_ok(), "OCR to PDF failed: {:?}", result.err());
+        assert!(output_pdf.is_file());
+
+        let doc = lopdf::Document::load(&output_pdf).unwrap();
+        assert_eq!(doc.get_pages().len(), 1);
+    }
 }

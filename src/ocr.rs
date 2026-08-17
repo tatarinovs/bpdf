@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -10,7 +9,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use lopdf::Document;
 use serde_json::{Value, json};
-use tempfile::Builder;
 use ureq::{Agent, Proxy};
 
 use crate::encoding::base64;
@@ -23,8 +21,33 @@ const MAX_ATTEMPTS: usize = 10;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
 const TEXT_LAYER_THRESHOLD: usize = 100;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OcrBackend {
+    Groq,
+    Windows,
+    Auto,
+}
+
+impl OcrBackend {
+    pub fn parse(value: &str, _api_key: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "groq" => Ok(Self::Groq),
+            "windows" | "win" | "winocr" => {
+                if !cfg!(windows) {
+                    bail!("Windows Media OCR is only available on Windows");
+                }
+                Ok(Self::Windows)
+            }
+            "auto" => Ok(Self::Auto),
+            _ => bail!("unknown OCR engine '{value}'; valid options are groq, windows, auto"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OcrOptions {
+    pub backend: OcrBackend,
+    pub lang: Option<String>,
     pub api_key: String,
     pub proxy: String,
     pub model: String,
@@ -162,7 +185,8 @@ impl OcrEngine {
                     bail!("page ranges are only valid for PDF inputs");
                 }
                 let image = imageconv::for_ocr(path, &self.options.image)?;
-                self.run_vision(&image, file_label(path))
+                let res = self.recognize_image(&image, file_label(path))?;
+                Ok(res.text)
             }
             _ => bail!("unsupported OCR input: {}", path.display()),
         }
@@ -177,14 +201,167 @@ impl OcrEngine {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn extract_many(&self, paths: &[PathBuf]) -> Vec<Result<String>> {
-        if paths.len() <= 1 {
-            return paths.iter().map(|path| self.extract_text(path)).collect();
+    pub fn create_searchable_pdf_for_spec(
+        &self,
+        spec: &crate::fileset::InputSpec,
+        config: &crate::config::Config,
+    ) -> Result<lopdf::Document> {
+        match formats::detect(&spec.path) {
+            Some(Format::Pdf) => {
+                let mut document = pdf::load(&spec.path)?;
+                if let Some(pages) = &spec.pages {
+                    pdf::select_pages(&mut document, pages)?;
+                }
+                
+                struct PageImageInfo {
+                    page_id: lopdf::ObjectId,
+                    width: f64,
+                    height: f64,
+                    images: Vec<ExtractedImage>,
+                }
+                
+                let mut page_images = Vec::new();
+                for (page_number, page_id) in document.get_pages() {
+                    let images = match document.get_page_images(page_id) {
+                        Ok(images) => images,
+                        Err(error) => {
+                            output::warn(format!("page {page_number}: cannot inspect images: {error}"));
+                            continue;
+                        }
+                    };
+                    
+                    let page_rotation = crate::pdf::transform::page_geometry(&document, page_id)
+                        .map(|g| g.rotation)
+                        .unwrap_or(0);
+                    let page_width = crate::pdf::transform::page_geometry(&document, page_id)
+                        .map(|g| (g.right - g.left).abs())
+                        .unwrap_or(595.0);
+                    let page_height = crate::pdf::transform::page_geometry(&document, page_id)
+                        .map(|g| (g.top - g.bottom).abs())
+                        .unwrap_or(842.0);
+
+                    let mut extracted_images = Vec::new();
+                    for (index, image_info) in images.into_iter().enumerate() {
+                        let stream = match document.get_object(image_info.id).and_then(|obj| obj.as_stream()) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let mut image = match pdf::image::decode(stream) {
+                            Ok(img) => img,
+                            Err(_) => continue,
+                        };
+                        if page_rotation == 90 {
+                            image = image.rotate90();
+                        } else if page_rotation == 180 {
+                            image = image.rotate180();
+                        } else if page_rotation == 270 {
+                            image = image.rotate270();
+                        }
+                        
+                        let area = image.width().saturating_mul(image.height());
+                        if area > 100_000 {
+                            if let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, self.options.image.jpeg_quality) {
+                                extracted_images.push(ExtractedImage { label: format!("page-{page_number}-image-{}", index + 1), bytes });
+                            }
+                        }
+                    }
+                    
+                    if !extracted_images.is_empty() {
+                        page_images.push(PageImageInfo { page_id, width: page_width, height: page_height, images: extracted_images });
+                    }
+                }
+                
+                if page_images.is_empty() {
+                    bail!("no extractable images found in {}", spec.path.display());
+                }
+
+                let recognize = |info: &PageImageInfo| -> Result<crate::textpdf::PageTextOverlay> {
+                    let mut all_scaled_words = Vec::new();
+                    let mut all_fallback_text = String::new();
+                    
+                    for image in &info.images {
+                        output::info(format!("OCR {} (searchable layer)...", image.label));
+                        let page_res = match self.recognize_image(&image.bytes, &image.label) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                output::warn(format!("Failed to OCR {}: {}", image.label, e));
+                                continue;
+                            }
+                        };
+                        
+                        let (img_w, img_h) = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
+                            .with_guessed_format()
+                            .ok()
+                            .and_then(|r| r.into_dimensions().ok())
+                            .unwrap_or((
+                                page_res.image_width.max(1),
+                                page_res.image_height.max(1),
+                            ));
+                            
+                        let scale_x = info.width / f64::from(img_w.max(1));
+                        let scale_y = info.height / f64::from(img_h.max(1));
+                        
+                        for mut word in page_res.words {
+                            word.x *= scale_x;
+                            word.y *= scale_y;
+                            word.width *= scale_x;
+                            word.height *= scale_y;
+                            word.line_y *= scale_y;
+                            word.line_height *= scale_y;
+                            all_scaled_words.push(word);
+                        }
+                        
+                        if !all_fallback_text.is_empty() && !page_res.text.is_empty() {
+                            all_fallback_text.push_str("\n\n");
+                        }
+                        all_fallback_text.push_str(&page_res.text);
+                    }
+                        
+                    Ok(crate::textpdf::PageTextOverlay {
+                        page_id: info.page_id,
+                        page_width: info.width,
+                        page_height: info.height,
+                        scaled_words: all_scaled_words,
+                        fallback_text: if all_fallback_text.is_empty() { None } else { Some(all_fallback_text) },
+                    })
+                };
+                
+                let results = parallel_map(&page_images, self.options.jobs, recognize);
+                let mut overlays = Vec::with_capacity(results.len());
+                for r in results {
+                    overlays.push(r?);
+                }
+                
+                crate::textpdf::overlay_searchable_text(&mut document, &overlays, config.font_path.as_deref())?;
+                Ok(document)
+            }
+            Some(format) if format.is_image() => {
+                if spec.pages.is_some() {
+                    bail!("page ranges are only valid for PDF inputs");
+                }
+                let jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
+                let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+                    .unwrap_or((1, 1));
+                output::info(format!("OCR {} (searchable layer)...", spec.path.display()));
+                let page_res = self.recognize_image(&jpeg, file_label(&spec.path))?;
+                let page_input = crate::textpdf::SearchablePageInput {
+                    jpeg_bytes: jpeg,
+                    width: w,
+                    height: h,
+                    words: page_res.words,
+                    fallback_text: Some(page_res.text),
+                };
+                let doc = crate::textpdf::render_searchable_pdf(&[page_input], &config.page_size, config.font_path.as_deref())?;
+                Ok(doc)
+            }
+            _ => bail!(
+                "unsupported OCR input for PDF output: {}",
+                spec.path.display()
+            ),
         }
-        parallel_map(paths, self.options.jobs, |path| {
-            self.extract_text_with_mode(path, None, false)
-        })
     }
 
     pub fn check_connection(&self) -> Result<()> {
@@ -240,7 +417,8 @@ impl OcrEngine {
 
         let recognize = |image: &ExtractedImage| {
             output::info(format!("OCR {}...", image.label));
-            self.run_vision(&image.bytes, &image.label)
+            self.recognize_image(&image.bytes, &image.label)
+                .map(|res| res.text)
         };
         let results = if parallel_images {
             parallel_map(&images, self.options.jobs, recognize)
@@ -262,6 +440,125 @@ impl OcrEngine {
             bail!("all {failures} embedded images failed OCR");
         }
         Ok(parts.join("\n\n---\n\n"))
+    }
+
+    pub fn recognize_image(
+        &self,
+        original: &[u8],
+        label: &str,
+    ) -> Result<crate::winocr::OcrPageResult> {
+        match self.options.backend {
+            OcrBackend::Windows => self.recognize_image_winocr(original, label),
+            OcrBackend::Groq => {
+                let text = self.run_vision(original, label)?;
+                Ok(crate::winocr::OcrPageResult {
+                    text,
+                    words: Vec::new(),
+                    image_width: 0,
+                    image_height: 0,
+                })
+            }
+            OcrBackend::Auto => {
+                if !self.options.api_key.trim().is_empty() {
+                    match self.run_vision(original, label) {
+                        Ok(text) => return Ok(crate::winocr::OcrPageResult {
+                            text,
+                            words: Vec::new(),
+                            image_width: 0,
+                            image_height: 0,
+                        }),
+                        Err(error) => {
+                            output::warn(format!("Groq OCR failed for {label}: {error}, falling back to Windows OCR..."));
+                        }
+                    }
+                }
+                if cfg!(windows) && crate::winocr::is_available() {
+                    self.recognize_image_winocr(original, label)
+                } else {
+                    bail!("no OCR engine available (Groq failed/missing key, Windows OCR unavailable)");
+                }
+            }
+        }
+    }
+
+    fn recognize_image_winocr(&self, original: &[u8], label: &str) -> Result<crate::winocr::OcrPageResult> {
+        let lang_str = self.options.lang.as_deref().unwrap_or("default");
+        if let Some(cache_dir) = &self.options.cache_dir {
+            let key = sha256_hex(&[
+                b"bpdf-ocr-winocr-v1\0",
+                lang_str.as_bytes(),
+                b"\0",
+                original,
+            ]);
+            let path = cache_dir.join(format!("{key}.json"));
+            let item_lock = {
+                let mut locks = self
+                    .cache_locks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                locks
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
+            if let Ok(data) = fs::read_to_string(&path) {
+                if let Ok(saved) = serde_json::from_str::<Value>(&data) {
+                    output::info(format!("OCR cache hit: {label}"));
+                    let text = saved["text"].as_str().unwrap_or_default().to_owned();
+                    let words = saved["words"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|w| {
+                                    Some(crate::winocr::OcrWordBox {
+                                        text: w["text"].as_str()?.to_owned(),
+                                        x: w["x"].as_f64()?,
+                                        y: w["y"].as_f64()?,
+                                        width: w["width"].as_f64()?,
+                                        height: w["height"].as_f64()?,
+                                        line_y: w["line_y"].as_f64().unwrap_or(w["y"].as_f64()?),
+                                        line_height: w["line_height"].as_f64().unwrap_or(w["height"].as_f64()?),
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let w = saved["width"].as_u64().unwrap_or(0) as u32;
+                    let h = saved["height"].as_u64().unwrap_or(0) as u32;
+                    return Ok(crate::winocr::OcrPageResult {
+                        text,
+                        words,
+                        image_width: w,
+                        image_height: h,
+                    });
+                }
+            }
+            let res = crate::winocr::recognize_image_bytes(
+                original,
+                self.options.lang.as_deref(),
+            )?;
+            let json_val = json!({
+                "text": res.text,
+                "width": res.image_width,
+                "height": res.image_height,
+                "words": res.words.iter().map(|w| json!({
+                    "text": w.text,
+                    "x": w.x,
+                    "y": w.y,
+                    "width": w.width,
+                    "height": w.height,
+                    "line_y": w.line_y,
+                    "line_height": w.line_height,
+                })).collect::<Vec<_>>(),
+            });
+            if let Ok(json_str) = serde_json::to_string(&json_val) {
+                let _ = fs::create_dir_all(cache_dir);
+                let _ = atomic::write_atomic(&path, json_str.as_bytes());
+            }
+            return Ok(res);
+        }
+        crate::winocr::recognize_image_bytes(original, self.options.lang.as_deref())
     }
 
     fn run_vision(&self, original: &[u8], label: &str) -> Result<String> {
@@ -481,30 +778,43 @@ pub fn extract_pdf_images(
                 continue;
             }
         };
-        for (index, image) in images.into_iter().enumerate() {
-            let stream = document.get_object(image.id)?.as_stream()?;
-            let filters = image.filters.unwrap_or_default();
-            let label = format!("page-{page_number}-image-{}", index + 1);
-            let bytes = if filters.iter().any(|filter| filter == "DCTDecode") {
-                stream.content.clone()
-            } else if filters.iter().any(|filter| filter == "JPXDecode") {
-                convert_encoded_image(&stream.content, ".jp2", options)?
-            } else {
-                let image = pdf::image::decode(stream)
-                    .with_context(|| format!("{label}: unsupported PDF image encoding"))?;
-                imageconv::encode_jpeg_on_white(&image, options.jpeg_quality)?
+        let page_rotation = crate::pdf::transform::page_geometry(document, page_id)
+            .map(|g| g.rotation)
+            .unwrap_or(0);
+
+        let mut best_image: Option<(u32, ExtractedImage)> = None;
+
+        for (index, image_info) in images.into_iter().enumerate() {
+            let stream = match document.get_object(image_info.id).and_then(|obj| obj.as_stream()) {
+                Ok(s) => s,
+                Err(_) => continue,
             };
-            output.push(ExtractedImage { label, bytes });
+            let _label = format!("page-{page_number}-image-{}", index + 1);
+            let mut image = match pdf::image::decode(stream) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            if page_rotation == 90 {
+                image = image.rotate90();
+            } else if page_rotation == 180 {
+                image = image.rotate180();
+            } else if page_rotation == 270 {
+                image = image.rotate270();
+            }
+            
+            let area = image.width().saturating_mul(image.height());
+            if best_image.as_ref().map_or(true, |(best_area, _)| area > *best_area) {
+                if let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality) {
+                    best_image = Some((area, ExtractedImage { label: format!("page-{page_number}"), bytes }));
+                }
+            }
+        }
+        
+        if let Some((_, best)) = best_image {
+            output.push(best);
         }
     }
     Ok(output)
-}
-
-fn convert_encoded_image(bytes: &[u8], suffix: &str, options: &ImageOptions) -> Result<Vec<u8>> {
-    let mut temporary = Builder::new().suffix(suffix).tempfile()?;
-    temporary.write_all(bytes)?;
-    temporary.as_file_mut().sync_all()?;
-    imageconv::ffmpeg_to_jpeg(temporary.path(), options)
 }
 
 fn has_text_layer(text: &str, pages: usize) -> bool {
@@ -565,6 +875,8 @@ mod tests {
         let config = crate::config::Config::default();
         let image = config.image_options(None, None);
         OcrOptions {
+            backend: OcrBackend::Groq,
+            lang: None,
             api_key: String::new(),
             proxy: String::new(),
             model: config.ocr_model,
@@ -576,6 +888,28 @@ mod tests {
             jobs: 1,
             max_tokens: config.ocr_max_tokens,
             cache_dir: None,
+        }
+    }
+
+    #[test]
+    fn ocr_backend_parsing() {
+        assert_eq!(
+            OcrBackend::parse("groq", "").unwrap(),
+            OcrBackend::Groq
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                OcrBackend::parse("windows", "").unwrap(),
+                OcrBackend::Windows
+            );
+            assert_eq!(
+                OcrBackend::parse("winocr", "").unwrap(),
+                OcrBackend::Windows
+            );
+            assert_eq!(
+                OcrBackend::parse("auto", "key123").unwrap(),
+                OcrBackend::Groq
+            );
         }
     }
 

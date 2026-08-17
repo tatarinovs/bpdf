@@ -21,6 +21,7 @@ mod pdf;
 mod process;
 mod textpdf;
 mod wic;
+mod winocr;
 mod xml;
 
 use std::ffi::OsString;

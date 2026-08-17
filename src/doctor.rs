@@ -114,7 +114,37 @@ pub fn run(config: &Config) -> Result<()> {
         Err(error) => check("ocr_cache", false, format!("{error:#}"), &mut failures),
     }
 
+    let win_ocr_langs = crate::winocr::available_languages();
+    match win_ocr_langs {
+        Ok(langs) if !langs.is_empty() => {
+            check(
+                "windows_ocr",
+                true,
+                format!("available (languages: {})", langs.join(", ")),
+                &mut failures,
+            );
+        }
+        Ok(_) => {
+            check(
+                "windows_ocr",
+                false,
+                "no OCR language packs installed",
+                &mut failures,
+            );
+        }
+        Err(error) => {
+            check(
+                "windows_ocr",
+                false,
+                format!("{error:#}"),
+                &mut failures,
+            );
+        }
+    }
+
     let network_result = OcrEngine::new(OcrOptions {
+        backend: crate::ocr::OcrBackend::Groq,
+        lang: None,
         api_key: config.groq_api_key.clone(),
         proxy: config.proxy.clone(),
         model: config.ocr_model.clone(),

@@ -276,6 +276,12 @@ pub struct OcrArgs {
     /// Override the OCR cache directory.
     #[arg(long)]
     pub cache_dir: Option<PathBuf>,
+    /// OCR engine: groq, windows (or winocr), auto.
+    #[arg(long)]
+    pub engine: Option<String>,
+    /// OCR language tag for Windows OCR (e.g. ru, en-US).
+    #[arg(long)]
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Args)]

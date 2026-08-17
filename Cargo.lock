@@ -144,6 +144,7 @@ dependencies = [
  "glob",
  "image",
  "lopdf",
+ "miniz_oxide",
  "serde",
  "serde_json",
  "tempfile",
