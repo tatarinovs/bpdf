@@ -43,7 +43,7 @@ if not defined RC_EXE (
 )
 
 echo [2/4] Compiling Windows resources...
-"%RC_EXE%" /nologo /c65001 /i "%RESOURCE_DIR%" /i "%CD%\resources" /i "%CD%\ico" ^
+"%RC_EXE%" /nologo /c65001 /i "%RESOURCE_DIR%" /i "%CD%\resources" ^
   /fo "%RESOURCE_FILE%" "%CD%\resources\bpdf.rc"
 if errorlevel 1 goto :error
 

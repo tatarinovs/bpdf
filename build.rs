@@ -6,7 +6,6 @@ fn main() {
     println!("cargo::rerun-if-changed=resources/bpdf.rc");
     println!("cargo::rerun-if-changed=resources/bpdf.ico");
     println!("cargo::rerun-if-changed=resources/bpdf.manifest");
-    println!("cargo::rerun-if-changed=ico");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
