@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use super::common::{OutputRegistry, finish_batch, handle_results, write_output};
+use super::common::{err_pdf_only_page_ranges, finish_batch, handle_results, OutputRegistry, write_output};
 use crate::cli::ConvertArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -75,7 +75,7 @@ fn build_plans(
             let plan = (|| match formats::detect(&input) {
                 Some(format) if format.is_image() => {
                     if spec.pages.is_some() {
-                        bail!("page ranges are only valid for PDF inputs");
+                        return Err(err_pdf_only_page_ranges(&input));
                     }
                     let output = image_output_path(&input, output_dir)?;
                     registry.reserve(&input, &output, force)?;

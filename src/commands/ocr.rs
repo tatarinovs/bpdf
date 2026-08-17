@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::common::{DOCUMENT_SEPARATOR, finish_batch, write_output};
+use super::common::{err_pdf_only_page_ranges, DOCUMENT_SEPARATOR, finish_batch, write_output};
 use crate::cli::OcrArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -14,10 +14,7 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Ocr)?;
     for spec in &specs {
         if spec.pages.is_some() && formats::detect(&spec.path) != Some(Format::Pdf) {
-            bail!(
-                "page ranges are only valid for PDF inputs: {}",
-                spec.path.display()
-            );
+            return Err(err_pdf_only_page_ranges(&spec.path));
         }
     }
 

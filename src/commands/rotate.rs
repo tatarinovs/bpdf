@@ -2,12 +2,11 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{finish_batch, handle_results, same_path, write_output};
+use super::common::{err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output};
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
 use crate::imageconv::{self, ImageOptions};
-use crate::output;
 use crate::pdf::{self, transform};
 
 #[derive(Debug, Clone, Copy)]
@@ -74,19 +73,8 @@ fn rotate_one(
 ) -> Result<()> {
     let input = &spec.path;
     let format = formats::detect(input);
-    let output_path = explicit_out
-        .map(|p| {
-            if p.is_dir() {
-                p.join(input.file_name().unwrap_or_default())
-            } else {
-                p.to_path_buf()
-            }
-        })
-        .unwrap_or_else(|| input.clone());
+    let output_path = resolve_in_place_output(input, explicit_out, "Rotating");
 
-    if same_path(input, &output_path) {
-        output::info(format!("Rotating in-place: {}", input.display()));
-    }
 
     match format {
         Some(Format::Pdf) => {
@@ -99,11 +87,9 @@ fn rotate_one(
         }
         Some(Format::Jpeg) => {
             if spec.pages.is_some() || pages != "all" {
-                bail!(
-                    "page ranges are only valid for PDF inputs: {}",
-                    input.display()
-                );
+                return Err(err_pdf_only_page_ranges(input));
             }
+
             let bytes = imageconv::to_jpeg(input, image_options, None)?;
             write_output(&output_path, &bytes)?;
         }

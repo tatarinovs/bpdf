@@ -163,10 +163,7 @@ impl OcrEngine {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn extract_text(&self, path: &Path) -> Result<String> {
-        self.extract_text_with_mode(path, None, true)
-    }
+
 
     pub fn extract_spec(&self, spec: &crate::fileset::InputSpec) -> Result<String> {
         self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), true)
@@ -182,7 +179,7 @@ impl OcrEngine {
             Some(Format::Pdf) => self.process_pdf(path, pages_filter, parallel_pdf_images),
             Some(format) if format.is_image() => {
                 if pages_filter.is_some() {
-                    bail!("page ranges are only valid for PDF inputs");
+                    return Err(crate::commands::common::err_pdf_only_page_ranges(path));
                 }
                 let image = imageconv::for_ocr(path, &self.options.image)?;
                 let res = self.recognize_image(&image, file_label(path))?;
@@ -361,7 +358,7 @@ impl OcrEngine {
             }
             Some(format) if format.is_image() => {
                 if spec.pages.is_some() {
-                    bail!("page ranges are only valid for PDF inputs");
+                    return Err(crate::commands::common::err_pdf_only_page_ranges(&spec.path));
                 }
                 let jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
                 let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))

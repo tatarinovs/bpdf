@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{finish_batch, handle_results, same_path, write_output};
+use super::common::{finish_batch, handle_results, resolve_in_place_output, write_output};
 use crate::cli::StripArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -45,15 +45,7 @@ fn strip_one(
     }
     let input = &spec.path;
     let format = formats::detect(input);
-    let output_path = explicit_out
-        .map(|p| {
-            if p.is_dir() {
-                p.join(input.file_name().unwrap_or_default())
-            } else {
-                p.to_path_buf()
-            }
-        })
-        .unwrap_or_else(|| input.clone());
+    let output_path = resolve_in_place_output(input, explicit_out, "Stripping metadata");
 
     let bytes = match format {
         Some(Format::Jpeg) => metadata::strip_jpeg(&fs::read(input)?, options.keep_icc)?,
@@ -67,10 +59,6 @@ fn strip_one(
             return Ok(false);
         }
     };
-
-    if same_path(input, &output_path) {
-        output::info(format!("Stripping metadata in-place: {}", input.display()));
-    }
 
     write_output(&output_path, &bytes)?;
     Ok(true)

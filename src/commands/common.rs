@@ -145,3 +145,25 @@ pub fn join_numbers(values: &[u32]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+
+pub fn resolve_in_place_output(input: &Path, explicit_out: Option<&Path>, verb: &str) -> PathBuf {
+    let output_path = explicit_out
+        .map(|p| {
+            if p.is_dir() {
+                p.join(input.file_name().unwrap_or_default())
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .unwrap_or_else(|| input.to_path_buf());
+
+    if same_path(input, &output_path) {
+        crate::output::info(format!("{} in-place: {}", verb, input.display()));
+    }
+
+    output_path
+}
+
+pub fn err_pdf_only_page_ranges(input: &Path) -> anyhow::Error {
+    anyhow::anyhow!("page ranges are only valid for PDF inputs: {}", input.display())
+}

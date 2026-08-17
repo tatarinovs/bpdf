@@ -1,4 +1,4 @@
-mod common;
+pub(crate) mod common;
 mod convert;
 mod merge;
 mod ocr;
