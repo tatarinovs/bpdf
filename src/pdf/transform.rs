@@ -25,14 +25,69 @@ impl StampMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+}
+
+impl BlendMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().replace("-", "").as_str() {
+            "normal" => Ok(Self::Normal),
+            "multiply" => Ok(Self::Multiply),
+            "screen" => Ok(Self::Screen),
+            "overlay" => Ok(Self::Overlay),
+            "darken" => Ok(Self::Darken),
+            "lighten" => Ok(Self::Lighten),
+            "colordodge" => Ok(Self::ColorDodge),
+            "colorburn" => Ok(Self::ColorBurn),
+            "hardlight" => Ok(Self::HardLight),
+            "softlight" => Ok(Self::SoftLight),
+            "difference" => Ok(Self::Difference),
+            "exclusion" => Ok(Self::Exclusion),
+            _ => bail!("unsupported blend mode: {}", value),
+        }
+    }
+
+    pub fn to_pdf_name(self) -> &'static [u8] {
+        match self {
+            Self::Normal => b"Normal",
+            Self::Multiply => b"Multiply",
+            Self::Screen => b"Screen",
+            Self::Overlay => b"Overlay",
+            Self::Darken => b"Darken",
+            Self::Lighten => b"Lighten",
+            Self::ColorDodge => b"ColorDodge",
+            Self::ColorBurn => b"ColorBurn",
+            Self::HardLight => b"HardLight",
+            Self::SoftLight => b"SoftLight",
+            Self::Difference => b"Difference",
+            Self::Exclusion => b"Exclusion",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StampOptions {
     pub path: PathBuf,
     pub position: String,
-    pub scale: f64,
+    pub scale: Option<f64>,
+    pub dpi: Option<f64>,
     pub opacity: f64,
     pub pages: String,
     pub mode: StampMode,
+    pub blend_mode: BlendMode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,9 +311,20 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     if !(0.0..=1.0).contains(&options.opacity) {
         bail!("stamp opacity must be between 0 and 1");
     }
-    if options.scale < 0.0 {
+    if let Some(scale) = options.scale
+        && scale < 0.0
+    {
         bail!("stamp scale cannot be negative");
     }
+    if let Some(dpi) = options.dpi
+        && dpi <= 0.0
+    {
+        bail!("stamp dpi must be positive");
+    }
+
+    let detected_dpi = detect_image_dpi(&options.path);
+    let is_calibrated = options.dpi.is_some() || detected_dpi.is_some();
+    let dpi = options.dpi.or(detected_dpi).unwrap_or(96.0);
 
     let image = image::open(&options.path)
         .with_context(|| format!("failed to read stamp {}", options.path.display()))?
@@ -300,6 +366,18 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     }
     let image_id = document.add_object(Stream::new(image_dictionary, rgb));
 
+    let ext_gstate_id = if options.blend_mode != BlendMode::Normal {
+        Some(document.add_object(dictionary! {
+            "Type" => "ExtGState",
+            "BM" => Object::Name(options.blend_mode.to_pdf_name().to_vec()),
+        }))
+    } else {
+        None
+    };
+
+    const STAMP_RESOURCE: &[u8] = b"BpdfStamp";
+    const GSTATE_RESOURCE: &[u8] = b"BpdfExtGState";
+
     let page_map = document.get_pages();
     let selected = parse_page_selection(&options.pages, page_map.len())?;
     for (number, page_id) in page_map {
@@ -307,23 +385,46 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             continue;
         }
         let geometry = page_geometry(document, page_id)?;
-        let resource_name = format!("BpdfStamp{number}");
-        install_xobject_resource(document, page_id, resource_name.as_bytes(), image_id)?;
+        install_xobject_resource(document, page_id, STAMP_RESOURCE, image_id)?;
+        if let Some(ext_gstate_id) = ext_gstate_id {
+            install_extgstate_resource(document, page_id, GSTATE_RESOURCE, ext_gstate_id)?;
+        }
 
-        let natural_width = f64::from(pixel_width) * 72.0 / 96.0;
-        let natural_height = f64::from(pixel_height) * 72.0 / 96.0;
-        let scale = if options.scale > 0.0 {
-            options.scale
-        } else {
-            1.0f64
-                .min(geometry.raw_width() * 0.25 / natural_width)
-                .min(geometry.raw_height() * 0.25 / natural_height)
+        let natural_width = f64::from(pixel_width) * 72.0 / dpi;
+        let natural_height = f64::from(pixel_height) * 72.0 / dpi;
+        let scale = match options.scale {
+            Some(s) if s > 0.0 => s,
+            Some(_) => {
+                // scale == 0.0: auto-fit up to 25% of the page
+                1.0f64
+                    .min(geometry.raw_width() * 0.25 / natural_width)
+                    .min(geometry.raw_height() * 0.25 / natural_height)
+            }
+            None => {
+                if is_calibrated {
+                    // DPI was explicitly passed or detected from image metadata: use 100% natural physical size
+                    1.0
+                } else {
+                    // Uncalibrated 96 DPI fallback: auto-fit up to 25% of the page
+                    1.0f64
+                        .min(geometry.raw_width() * 0.25 / natural_width)
+                        .min(geometry.raw_height() * 0.25 / natural_height)
+                }
+            }
         };
         let width = natural_width * scale;
         let height = natural_height * scale;
         let (x, y) = stamp_position(&options.position, geometry, width, height)?;
-        let content =
-            format!("q\n{width:.6} 0 0 {height:.6} {x:.6} {y:.6} cm\n/{resource_name} Do\nQ\n");
+
+        let mut content = String::new();
+        content.push_str("q\n");
+        if ext_gstate_id.is_some() {
+            content.push_str("/BpdfExtGState gs\n");
+        }
+        content.push_str(&format!(
+            "{width:.6} 0 0 {height:.6} {x:.6} {y:.6} cm\n/BpdfStamp Do\nQ\n"
+        ));
+
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
 
         let under = match options.mode {
@@ -650,6 +751,155 @@ fn append_content_objects(
     }
 }
 
+fn detect_image_dpi(path: &std::path::Path) -> Option<f64> {
+    let bytes = std::fs::read(path).ok()?;
+    detect_image_dpi_from_bytes(&bytes)
+}
+
+fn detect_image_dpi_from_bytes(bytes: &[u8]) -> Option<f64> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        detect_png_dpi(bytes)
+    } else if bytes.starts_with(b"\xFF\xD8") {
+        detect_jpeg_dpi(bytes)
+    } else {
+        None
+    }
+}
+
+fn detect_png_dpi(bytes: &[u8]) -> Option<f64> {
+    let mut offset = 8;
+    while offset + 8 <= bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().ok()?) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if chunk_type == b"pHYs" && offset + 8 + length <= bytes.len() && length >= 9 {
+            let chunk_data = &bytes[offset + 8..offset + 8 + length];
+            let ppu_x = u32::from_be_bytes(chunk_data[0..4].try_into().ok()?);
+            let unit = chunk_data[8];
+            if unit == 1 && ppu_x > 0 {
+                let dpi = (ppu_x as f64) * 0.0254;
+                return Some(dpi.round());
+            }
+        } else if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            break;
+        }
+        offset += 12 + length;
+    }
+    None
+}
+
+fn detect_jpeg_dpi(bytes: &[u8]) -> Option<f64> {
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xFF {
+            break;
+        }
+        let marker = bytes[offset + 1];
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        let length = u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
+        if length < 2 || offset + 2 + length > bytes.len() {
+            break;
+        }
+        let segment_data = &bytes[offset + 4..offset + 2 + length];
+
+        if marker == 0xE0 && segment_data.starts_with(b"JFIF\0") && segment_data.len() >= 9 {
+            let units = segment_data[7];
+            let x_density = u16::from_be_bytes(segment_data[8..10].try_into().ok()?) as f64;
+            if x_density > 0.0 {
+                if units == 1 {
+                    return Some(x_density);
+                } else if units == 2 {
+                    return Some((x_density * 2.54).round());
+                }
+            }
+        }
+
+        if marker == 0xE1 && segment_data.starts_with(b"Exif\0\0") && segment_data.len() >= 14 {
+            let exif = &segment_data[6..];
+            if let Some(dpi) = parse_exif_dpi(exif) {
+                return Some(dpi);
+            }
+        }
+
+        offset += 2 + length;
+    }
+    None
+}
+
+fn parse_exif_dpi(exif: &[u8]) -> Option<f64> {
+    if exif.len() < 8 {
+        return None;
+    }
+    let is_le = match &exif[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let read_u16 = |buf: &[u8], pos: usize| -> Option<u16> {
+        let b = buf.get(pos..pos + 2)?;
+        Some(if is_le {
+            u16::from_le_bytes(b.try_into().ok()?)
+        } else {
+            u16::from_be_bytes(b.try_into().ok()?)
+        })
+    };
+    let read_u32 = |buf: &[u8], pos: usize| -> Option<u32> {
+        let b = buf.get(pos..pos + 4)?;
+        Some(if is_le {
+            u32::from_le_bytes(b.try_into().ok()?)
+        } else {
+            u32::from_be_bytes(b.try_into().ok()?)
+        })
+    };
+
+    let ifd0_offset = read_u32(exif, 4)? as usize;
+    if ifd0_offset + 2 > exif.len() {
+        return None;
+    }
+    let num_entries = read_u16(exif, ifd0_offset)? as usize;
+    let mut x_res: Option<f64> = None;
+    let mut unit: u16 = 2;
+
+    for i in 0..num_entries {
+        let entry_offset = ifd0_offset + 2 + i * 12;
+        if entry_offset + 12 > exif.len() {
+            break;
+        }
+        let tag = read_u16(exif, entry_offset)?;
+        let val_offset = read_u32(exif, entry_offset + 8)? as usize;
+
+        match tag {
+            0x011A => {
+                if val_offset + 8 <= exif.len() {
+                    let num = read_u32(exif, val_offset)? as f64;
+                    let den = read_u32(exif, val_offset + 4)? as f64;
+                    if den > 0.0 {
+                        x_res = Some(num / den);
+                    }
+                }
+            }
+            0x0128 => {
+                let u = read_u16(exif, entry_offset + 8)?;
+                unit = u;
+            }
+            _ => {}
+        }
+    }
+
+    let res = x_res?;
+    if res <= 0.0 {
+        return None;
+    }
+    if unit == 2 {
+        Some(res.round())
+    } else if unit == 3 {
+        Some((res * 2.54).round())
+    } else {
+        Some(res.round())
+    }
+}
+
 fn install_xobject_resource(
     document: &mut Document,
     page_id: ObjectId,
@@ -666,6 +916,30 @@ fn install_xobject_resource(
         .unwrap_or_default();
     xobjects.set(name, xobject_id);
     resources.set("XObject", xobjects);
+    let resources_id = document.add_object(resources);
+    document
+        .get_object_mut(page_id)?
+        .as_dict_mut()?
+        .set("Resources", resources_id);
+    Ok(())
+}
+
+fn install_extgstate_resource(
+    document: &mut Document,
+    page_id: ObjectId,
+    name: &[u8],
+    extgstate_id: ObjectId,
+) -> Result<()> {
+    let mut resources = inherited_value(document, page_id, b"Resources")
+        .and_then(|value| resolve_dictionary(document, &value))
+        .unwrap_or_default();
+    let mut extgstates = resources
+        .get(b"ExtGState")
+        .ok()
+        .and_then(|value| resolve_dictionary(document, value))
+        .unwrap_or_default();
+    extgstates.set(name, extgstate_id);
+    resources.set("ExtGState", extgstates);
     let resources_id = document.add_object(resources);
     document
         .get_object_mut(page_id)?
@@ -789,6 +1063,82 @@ fn stamp_position(value: &str, page: PageGeometry, width: f64, height: f64) -> R
         _ => bail!("unsupported stamp position {position}"),
     };
     Ok((x + offset_x, y + offset_y))
+}
+
+pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let pages = document.get_pages();
+    if pages.is_empty() {
+        return Ok(());
+    }
+
+    let valid_entries: Vec<(&str, ObjectId)> = entries
+        .iter()
+        .filter_map(|(title, page_num)| {
+            pages
+                .get(page_num)
+                .map(|&page_id| (title.as_str(), page_id))
+        })
+        .collect();
+
+    if valid_entries.is_empty() {
+        return Ok(());
+    }
+
+    let outline_root_id = document.new_object_id();
+    let item_ids: Vec<ObjectId> = (0..valid_entries.len())
+        .map(|_| document.new_object_id())
+        .collect();
+
+    for (i, (&(title, page_id), &item_id)) in valid_entries.iter().zip(&item_ids).enumerate() {
+        let mut dict = dictionary! {
+            "Title" => info_string(title),
+            "Parent" => outline_root_id,
+            "Dest" => vec![
+                Object::Reference(page_id),
+                Object::Name(b"Fit".to_vec()),
+            ],
+        };
+        if i > 0 {
+            dict.set("Prev", item_ids[i - 1]);
+        }
+        if i + 1 < item_ids.len() {
+            dict.set("Next", item_ids[i + 1]);
+        }
+        document.objects.insert(item_id, Object::Dictionary(dict));
+    }
+
+    let root_dict = dictionary! {
+        "Type" => "Outlines",
+        "First" => item_ids[0],
+        "Last" => item_ids[item_ids.len() - 1],
+        "Count" => item_ids.len() as i64,
+    };
+    document
+        .objects
+        .insert(outline_root_id, Object::Dictionary(root_dict));
+
+    let catalog_id = if let Ok(root) = document.trailer.get(b"Root") {
+        root.as_reference()?
+    } else {
+        let id = document.new_object_id();
+        document
+            .objects
+            .insert(id, Object::Dictionary(dictionary! { "Type" => "Catalog" }));
+        document.trailer.set("Root", id);
+        id
+    };
+
+    let catalog = document
+        .get_object_mut(catalog_id)
+        .context("catalog object not found")?
+        .as_dict_mut()
+        .context("catalog is not a dictionary")?;
+    catalog.set("Outlines", outline_root_id);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1038,10 +1388,12 @@ mod tests {
             &StampOptions {
                 path: temporary.path().to_path_buf(),
                 position: "br".to_owned(),
-                scale: 1.0,
+                scale: Some(1.0),
+                dpi: Some(96.0),
                 opacity: 0.5,
                 pages: "all".to_owned(),
                 mode: StampMode::Over,
+                blend_mode: BlendMode::Normal,
             },
         )
         .unwrap();
@@ -1111,80 +1463,123 @@ mod tests {
         let title_bytes = last_item.get(b"Title").unwrap().as_str().unwrap();
         assert!(title_bytes.starts_with(&[0xfe, 0xff]));
     }
-}
 
-pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let pages = document.get_pages();
-    if pages.is_empty() {
-        return Ok(());
-    }
+    #[test]
+    fn test_detect_png_phys_dpi() {
+        // Construct minimal valid PNG with pHYs chunk at 300 DPI (11811 pixels/meter)
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        // IHDR chunk
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        png.extend_from_slice(&[0, 0, 0, 0]); // CRC placeholder
+        // pHYs chunk: 11811 (0x2E23) ppm ≈ 300 dpi, unit 1 (meter)
+        png.extend_from_slice(&9u32.to_be_bytes());
+        png.extend_from_slice(b"pHYs");
+        png.extend_from_slice(&11811u32.to_be_bytes());
+        png.extend_from_slice(&11811u32.to_be_bytes());
+        png.push(1); // unit = meter
+        png.extend_from_slice(&[0, 0, 0, 0]); // CRC
+        // IEND chunk
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]);
 
-    let valid_entries: Vec<(&str, ObjectId)> = entries
-        .iter()
-        .filter_map(|(title, page_num)| {
-            pages
-                .get(page_num)
-                .map(|&page_id| (title.as_str(), page_id))
-        })
-        .collect();
-
-    if valid_entries.is_empty() {
-        return Ok(());
-    }
-
-    let outline_root_id = document.new_object_id();
-    let item_ids: Vec<ObjectId> = (0..valid_entries.len())
-        .map(|_| document.new_object_id())
-        .collect();
-
-    for (i, (&(title, page_id), &item_id)) in valid_entries.iter().zip(&item_ids).enumerate() {
-        let mut dict = dictionary! {
-            "Title" => info_string(title),
-            "Parent" => outline_root_id,
-            "Dest" => vec![
-                Object::Reference(page_id),
-                Object::Name(b"Fit".to_vec()),
-            ],
-        };
-        if i > 0 {
-            dict.set("Prev", item_ids[i - 1]);
-        }
-        if i + 1 < item_ids.len() {
-            dict.set("Next", item_ids[i + 1]);
-        }
-        document.objects.insert(item_id, Object::Dictionary(dict));
+        let dpi = detect_image_dpi_from_bytes(&png);
+        assert_eq!(dpi, Some(300.0));
     }
 
-    let root_dict = dictionary! {
-        "Type" => "Outlines",
-        "First" => item_ids[0],
-        "Last" => item_ids[item_ids.len() - 1],
-        "Count" => item_ids.len() as i64,
-    };
-    document
-        .objects
-        .insert(outline_root_id, Object::Dictionary(root_dict));
+    #[test]
+    fn test_detect_jpeg_jfif_dpi() {
+        // Construct minimal JPEG with JFIF APP0 marker (300 DPI, unit = 1 inch)
+        let mut jpeg = Vec::new();
+        jpeg.extend_from_slice(b"\xFF\xD8"); // SOI
+        jpeg.extend_from_slice(b"\xFF\xE0"); // APP0
+        jpeg.extend_from_slice(&16u16.to_be_bytes()); // length
+        jpeg.extend_from_slice(b"JFIF\0");
+        jpeg.extend_from_slice(&[1, 2]); // version 1.2
+        jpeg.push(1); // units: 1 = dots per inch
+        jpeg.extend_from_slice(&300u16.to_be_bytes()); // X density
+        jpeg.extend_from_slice(&300u16.to_be_bytes()); // Y density
+        jpeg.extend_from_slice(&[0, 0]); // thumbnail
+        jpeg.extend_from_slice(b"\xFF\xD9"); // EOI
 
-    let catalog_id = if let Ok(root) = document.trailer.get(b"Root") {
-        root.as_reference()?
-    } else {
-        let id = document.new_object_id();
-        document
-            .objects
-            .insert(id, Object::Dictionary(dictionary! { "Type" => "Catalog" }));
-        document.trailer.set("Root", id);
-        id
-    };
+        let dpi = detect_image_dpi_from_bytes(&jpeg);
+        assert_eq!(dpi, Some(300.0));
+    }
 
-    let catalog = document
-        .get_object_mut(catalog_id)
-        .context("catalog object not found")?
-        .as_dict_mut()
-        .context("catalog is not a dictionary")?;
-    catalog.set("Outlines", outline_root_id);
+    #[test]
+    fn test_detect_jpeg_jfif_dpcm() {
+        // Construct minimal JPEG with JFIF APP0 marker (118 DPCM ≈ 300 DPI, unit = 2 cm)
+        let mut jpeg = Vec::new();
+        jpeg.extend_from_slice(b"\xFF\xD8"); // SOI
+        jpeg.extend_from_slice(b"\xFF\xE0"); // APP0
+        jpeg.extend_from_slice(&16u16.to_be_bytes()); // length
+        jpeg.extend_from_slice(b"JFIF\0");
+        jpeg.extend_from_slice(&[1, 2]);
+        jpeg.push(2); // units: 2 = dots per cm
+        jpeg.extend_from_slice(&118u16.to_be_bytes()); // 118 * 2.54 = 299.72 ≈ 300
+        jpeg.extend_from_slice(&118u16.to_be_bytes());
+        jpeg.extend_from_slice(&[0, 0]);
+        jpeg.extend_from_slice(b"\xFF\xD9");
 
-    Ok(())
+        let dpi = detect_image_dpi_from_bytes(&jpeg);
+        assert_eq!(dpi, Some(300.0));
+    }
+
+    #[test]
+    fn test_detect_jpeg_exif_dpi() {
+        // Construct minimal JPEG with Exif APP1 marker (600 DPI, unit = 2 inch)
+        let mut jpeg = Vec::new();
+        jpeg.extend_from_slice(b"\xFF\xD8"); // SOI
+        jpeg.extend_from_slice(b"\xFF\xE1"); // APP1
+
+        let mut exif_payload = Vec::new();
+        exif_payload.extend_from_slice(b"Exif\0\0");
+        let tiff_start = exif_payload.len();
+        exif_payload.extend_from_slice(b"II\x2A\x00"); // Little-endian TIFF header
+        exif_payload.extend_from_slice(&8u32.to_le_bytes()); // Offset to IFD0 = 8
+
+        // IFD0: 2 entries
+        exif_payload.extend_from_slice(&2u16.to_le_bytes());
+
+        // Entry 1: 0x011A (XResolution), type 5 (RATIONAL), count 1, offset 38 (from TIFF start)
+        exif_payload.extend_from_slice(&0x011Au16.to_le_bytes());
+        exif_payload.extend_from_slice(&5u16.to_le_bytes());
+        exif_payload.extend_from_slice(&1u32.to_le_bytes());
+        exif_payload.extend_from_slice(&38u32.to_le_bytes());
+
+        // Entry 2: 0x0128 (ResolutionUnit), type 3 (SHORT), count 1, value 2 (inches)
+        exif_payload.extend_from_slice(&0x0128u16.to_le_bytes());
+        exif_payload.extend_from_slice(&3u16.to_le_bytes());
+        exif_payload.extend_from_slice(&1u32.to_le_bytes());
+        exif_payload.extend_from_slice(&2u16.to_le_bytes());
+        exif_payload.extend_from_slice(&[0, 0]); // padding to 4 bytes
+
+        // Next IFD offset = 0
+        exif_payload.extend_from_slice(&0u32.to_le_bytes());
+
+        // Offset 38 from TIFF start: Rational value (600 / 1)
+        assert_eq!(exif_payload.len() - tiff_start, 38);
+        exif_payload.extend_from_slice(&600u32.to_le_bytes()); // numerator
+        exif_payload.extend_from_slice(&1u32.to_le_bytes()); // denominator
+
+        let app1_len = (exif_payload.len() + 2) as u16;
+        jpeg.extend_from_slice(&app1_len.to_be_bytes());
+        jpeg.extend_from_slice(&exif_payload);
+        jpeg.extend_from_slice(b"\xFF\xD9"); // EOI
+
+        let dpi = detect_image_dpi_from_bytes(&jpeg);
+        assert_eq!(dpi, Some(600.0));
+    }
+
+    #[test]
+    fn test_uncalibrated_image_returns_none() {
+        let dummy_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0DIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00IEND\x00\x00\x00\x00";
+        assert_eq!(detect_image_dpi_from_bytes(dummy_png), None);
+
+        let dummy_jpeg = b"\xFF\xD8\xFF\xD9";
+        assert_eq!(detect_image_dpi_from_bytes(dummy_jpeg), None);
+    }
 }

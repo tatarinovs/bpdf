@@ -336,7 +336,7 @@ mod tests {
     fn rejects_binary_files_with_null_bytes() {
         let temp_dir = tempfile::tempdir().unwrap();
         let binary_path = temp_dir.path().join("data.bin");
-        std::fs::write(&binary_path, &[0x89, 0x50, 0x4E, 0x47, 0x00, 0x00, 0x00]).unwrap();
+        std::fs::write(&binary_path, [0x89, 0x50, 0x4E, 0x47, 0x00, 0x00, 0x00]).unwrap();
         assert_eq!(detect(&binary_path), None);
         assert!(!is_text_file(&binary_path));
     }

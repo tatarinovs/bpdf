@@ -119,9 +119,11 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
                 path,
                 position: args.stamp_pos,
                 scale: args.stamp_scale,
+                dpi: args.stamp_dpi,
                 opacity: args.stamp_op,
                 pages: args.stamp_pages,
                 mode: StampMode::parse(&args.stamp_mode)?,
+                blend_mode: transform::BlendMode::parse(&args.stamp_blend)?,
             },
         )?;
     }

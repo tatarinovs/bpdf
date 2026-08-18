@@ -173,18 +173,24 @@ pub struct StampArgs {
     /// Anchor (br, bl, tr, tl, c, tc, bc, l, r) or X,Y mm offset from bottom-right.
     #[arg(long, default_value = "br")]
     pub position: String,
-    /// Stamp scale; 0 selects an automatic size up to 25% of the page.
-    #[arg(long, default_value_t = 0.0)]
-    pub scale: f64,
+    /// Stamp scale multiplier; omit for 1:1 physical size, or set to 0 for auto-sizing up to 25% of the page.
+    #[arg(long)]
+    pub scale: Option<f64>,
     /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub opacity: f64,
+    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG if omitted).
+    #[arg(long)]
+    pub dpi: Option<f64>,
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(long, default_value = "all")]
     pub pages: String,
     /// Layer mode: auto, over or under.
     #[arg(long, default_value = "auto")]
     pub mode: String,
+    /// Blend mode: normal, multiply, screen, overlay, darken, lighten, colordodge, colorburn, hardlight, softlight, difference, exclusion.
+    #[arg(long, default_value = "normal")]
+    pub blend: String,
 }
 
 #[derive(Debug, Args)]
@@ -215,18 +221,24 @@ pub struct MergeArgs {
     /// Stamp anchor or X,Y mm offset from the bottom-right.
     #[arg(long, default_value = "br")]
     pub stamp_pos: String,
-    /// Stamp scale; 0 selects an automatic size up to 25% of the page.
-    #[arg(long, default_value_t = 0.0)]
-    pub stamp_scale: f64,
+    /// Stamp scale multiplier; omit for 1:1 physical size, or set to 0 for auto-sizing up to 25% of the page.
+    #[arg(long)]
+    pub stamp_scale: Option<f64>,
     /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub stamp_op: f64,
+    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG if omitted).
+    #[arg(long)]
+    pub stamp_dpi: Option<f64>,
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(long, default_value = "all")]
     pub stamp_pages: String,
     /// Stamp layer mode: auto, over or under.
     #[arg(long, default_value = "auto")]
     pub stamp_mode: String,
+    /// Stamp blend mode: normal, multiply, etc.
+    #[arg(long, default_value = "normal")]
+    pub stamp_blend: String,
 
     /// Preserve embedded ICC colour profiles.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]

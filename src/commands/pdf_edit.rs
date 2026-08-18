@@ -59,9 +59,11 @@ pub fn stamp(args: StampArgs) -> Result<()> {
         out,
         position,
         scale,
+        dpi,
         opacity,
         pages,
         mode,
+        blend,
     } = args;
     edit_pdf(&input, out, "stamped", |document| {
         transform::apply_stamp(
@@ -70,9 +72,11 @@ pub fn stamp(args: StampArgs) -> Result<()> {
                 path: stamp,
                 position,
                 scale,
+                dpi,
                 opacity,
                 pages,
                 mode: StampMode::parse(&mode)?,
+                blend_mode: transform::BlendMode::parse(&blend)?,
             },
         )
     })

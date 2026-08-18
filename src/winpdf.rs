@@ -16,8 +16,6 @@ pub fn render_pdf_to_jpegs(
 
     let path_hstring = HSTRING::from(input.as_os_str());
 
-    
-
     (|| -> Result<Vec<(PathBuf, Vec<u8>)>> {
         let file = StorageFile::GetFileFromPathAsync(&path_hstring)?
             .join()

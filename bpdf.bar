@@ -56,8 +56,7 @@ iconic11=0
 menu11=Оптимизировать PDF (сжатие)
 button12=%COMMANDER_PATH%\tools\bpdf\bpdf.exe,11
 cmd12=%COMMANDER_PATH%\tools\bpdf\bpdf.exe stamp
-param12=?%P%N "%Pseal.png"
-iconic12=0
+param12=%P%N D:\tk.png --position="-120,22" --mode over --blend multiply --dpi 300 --scale 1 -o %P%N
 menu12=Вставить штамп в PDF
 button13=%COMMANDER_PATH%\tools\bpdf\bpdf.exe,14
 cmd13=%COMMANDER_PATH%\tools\bpdf\bpdf.exe convert

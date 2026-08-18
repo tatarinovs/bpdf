@@ -148,9 +148,10 @@ fn execute(
             let mut should_render = render;
             if !should_render
                 && let Ok(text) = pdf::extract_text(&document)
-                    && !text.trim().is_empty() {
-                        should_render = true;
-                    }
+                && !text.trim().is_empty()
+            {
+                should_render = true;
+            }
 
             if should_render {
                 output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
