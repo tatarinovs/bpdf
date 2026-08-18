@@ -170,3 +170,51 @@ pub fn err_pdf_only_page_ranges(input: &Path) -> anyhow::Error {
         input.display()
     )
 }
+
+pub fn validate_single_out(out: Option<&Path>, count: usize) -> Result<()> {
+    if out.is_some() && count != 1 {
+        bail!("--out is only valid with one input file");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub mod test_utils {
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::Path;
+
+    pub fn sample_png(path: &Path) {
+        sample_png_with_size(path, 2, 2);
+    }
+
+    pub fn sample_png_with_size(path: &Path, width: u32, height: u32) {
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([10, 20, 30])))
+            .save_with_format(path, ImageFormat::Png)
+            .unwrap();
+    }
+
+    pub fn sample_jpeg(path: &Path, width: u32, height: u32) {
+        let bytes = sample_jpeg_bytes(width, height);
+        fs::write(path, bytes).unwrap();
+    }
+
+    pub fn sample_jpeg_default(path: &Path) {
+        sample_jpeg(path, 2, 2);
+    }
+
+    pub fn sample_jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([10, 20, 30])))
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        jpeg
+    }
+
+    pub fn sample_pdf(path: &Path) {
+        let jpeg = sample_jpeg_bytes(2, 2);
+        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        document.save(path).unwrap();
+    }
+}

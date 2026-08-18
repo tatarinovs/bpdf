@@ -3,7 +3,9 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{finish_batch, handle_results, resolve_in_place_output, write_output};
+use super::common::{
+    finish_batch, handle_results, resolve_in_place_output, validate_single_out, write_output,
+};
 use crate::cli::StripArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -13,9 +15,7 @@ use crate::{metadata, output, pdf};
 
 pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Strip)?;
-    if args.out.is_some() && specs.len() != 1 {
-        bail!("--out is only valid with one input file");
-    }
+    validate_single_out(args.out.as_deref(), specs.len())?;
     let options = config.image_options(args.keep_icc, args.ffmpeg);
     let mut outputs = 0usize;
     let results = specs
@@ -67,29 +67,9 @@ fn strip_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-    use std::io::Cursor;
-
-    fn sample_png(path: &Path) {
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(path, ImageFormat::Png)
-            .unwrap();
-    }
-
-    fn sample_jpeg(path: &Path) {
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(path, ImageFormat::Jpeg)
-            .unwrap();
-    }
-
-    fn sample_pdf(path: &Path) {
-        let mut jpeg = Vec::new();
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
-            .unwrap();
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
-        document.save(path).unwrap();
-    }
+    use crate::commands::common::test_utils::{
+        sample_jpeg_default as sample_jpeg, sample_pdf, sample_png,
+    };
 
     fn args(inputs: &[&Path], out: Option<std::path::PathBuf>) -> StripArgs {
         StripArgs {

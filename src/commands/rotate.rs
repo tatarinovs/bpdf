@@ -3,7 +3,8 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use super::common::{
-    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output,
+    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output,
+    validate_single_out, write_output,
 };
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -42,9 +43,7 @@ pub fn run(
     };
 
     let specs = expand(inputs, InputFormatSet::Rotate)?;
-    if out.is_some() && specs.len() != 1 {
-        bail!("--out is only valid with one input file");
-    }
+    validate_single_out(out, specs.len())?;
 
     let mut image_options = config.image_options(None, None);
     match mode {
@@ -105,30 +104,9 @@ fn rotate_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, RgbImage};
+    use crate::commands::common::test_utils::*;
+    use image::GenericImageView;
     use std::fs;
-    use std::io::Cursor;
-
-    fn sample_png(path: &Path) {
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(path, ImageFormat::Png)
-            .unwrap();
-    }
-
-    fn sample_jpeg(path: &Path, width: u32, height: u32) {
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([10, 20, 30])))
-            .save_with_format(path, ImageFormat::Jpeg)
-            .unwrap();
-    }
-
-    fn sample_pdf(path: &Path) {
-        let mut jpeg = Vec::new();
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
-            .unwrap();
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
-        document.save(path).unwrap();
-    }
 
     #[test]
     fn refuses_multiple_inputs_with_explicit_out() {

@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use ::image::codecs::jpeg::JpegDecoder;
+use ::image::{ColorType, ExtendedColorType, ImageDecoder};
+use anyhow::{Context, Result, bail};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
 use serde_json::{Value, json};
 
@@ -459,65 +462,23 @@ struct JpegInfo {
 }
 
 fn jpeg_info(bytes: &[u8]) -> Result<JpegInfo> {
-    if !bytes.starts_with(&[0xff, 0xd8]) {
-        bail!("not a JPEG file");
-    }
-    let mut position = 2usize;
-
-    while position + 4 <= bytes.len() {
-        if bytes[position] != 0xff {
-            position += 1;
-            continue;
-        }
-        while position < bytes.len() && bytes[position] == 0xff {
-            position += 1;
-        }
-        if position >= bytes.len() {
-            break;
-        }
-        let marker = bytes[position];
-        position += 1;
-
-        if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
-            continue;
-        }
-        if position + 2 > bytes.len() {
-            break;
-        }
-        let length = u16::from_be_bytes([bytes[position], bytes[position + 1]]) as usize;
-        if length < 2 || position + length > bytes.len() {
-            bail!("invalid JPEG segment");
-        }
-
-        let is_sof = matches!(
-            marker,
-            0xc0 | 0xc1
-                | 0xc2
-                | 0xc3
-                | 0xc5
-                | 0xc6
-                | 0xc7
-                | 0xc9
-                | 0xca
-                | 0xcb
-                | 0xcd
-                | 0xce
-                | 0xcf
-        );
-        if is_sof {
-            if length < 8 {
-                bail!("truncated JPEG SOF segment");
-            }
-            return Ok(JpegInfo {
-                height: u16::from_be_bytes([bytes[position + 3], bytes[position + 4]]),
-                width: u16::from_be_bytes([bytes[position + 5], bytes[position + 6]]),
-                components: bytes[position + 7],
-            });
-        }
-        position += length;
-    }
-
-    Err(anyhow!("JPEG dimensions were not found"))
+    let decoder = JpegDecoder::new(Cursor::new(bytes)).context("not a valid JPEG file")?;
+    let (width, height) = decoder.dimensions();
+    let components = match decoder.original_color_type() {
+        ExtendedColorType::L8 => 1,
+        ExtendedColorType::Rgb8 | ExtendedColorType::Bgr8 => 3,
+        ExtendedColorType::Cmyk8 => 4,
+        other => match decoder.color_type() {
+            ColorType::L8 => 1,
+            ColorType::Rgb8 => 3,
+            _ => bail!("unsupported JPEG color format: {other:?}"),
+        },
+    };
+    Ok(JpegInfo {
+        width: u16::try_from(width).context("JPEG width exceeds u16")?,
+        height: u16::try_from(height).context("JPEG height exceeds u16")?,
+        components,
+    })
 }
 
 fn remove_keys(dictionary: &mut Dictionary, keys: &[&[u8]]) {
@@ -544,20 +505,8 @@ fn pdf_text(object: &Object) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use ::image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-
     use super::*;
-
-    fn sample_jpeg(width: u32, height: u32) -> Vec<u8> {
-        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb([10, 20, 30])));
-        let mut bytes = Vec::new();
-        image
-            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Jpeg)
-            .unwrap();
-        bytes
-    }
+    use crate::commands::common::test_utils::sample_jpeg_bytes as sample_jpeg;
 
     #[test]
     fn parses_page_selections() {
