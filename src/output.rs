@@ -22,6 +22,10 @@ pub fn init(quiet: bool, json_mode: bool) {
     );
 }
 
+pub fn is_json() -> bool {
+    MODE.load(Ordering::Relaxed) == JSON
+}
+
 pub fn info(message: impl AsRef<str>) {
     emit("info", "progress", message.as_ref(), None, false);
 }

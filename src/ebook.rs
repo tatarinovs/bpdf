@@ -116,11 +116,12 @@ fn parse_fb2_xml(xml: &str) -> Result<String> {
     }
 
     if let Some(authors) = extract_fb2_authors(xml)
-        && !authors.is_empty() {
-            output.push_str("Author: ");
-            output.push_str(&authors);
-            output.push_str("\n\n");
-        }
+        && !authors.is_empty()
+    {
+        output.push_str("Author: ");
+        output.push_str(&authors);
+        output.push_str("\n\n");
+    }
 
     // Extract annotation if present
     if let Some(annotation_xml) = extract_tag_value(xml, "annotation") {
@@ -356,9 +357,10 @@ fn parse_epub_spine(opf: &str) -> Vec<String> {
 
     for line in opf.split('<') {
         if line.starts_with("itemref ")
-            && let Some(idref) = extract_xml_attribute(line, "idref") {
-                spine.push(idref);
-            }
+            && let Some(idref) = extract_xml_attribute(line, "idref")
+        {
+            spine.push(idref);
+        }
     }
 
     spine
@@ -442,17 +444,16 @@ fn convert_html_to_text(html: &str) -> String {
                 "br" => {
                     buf.push('\n');
                 }
-                "li"
-                    if tag_is_closing => {
-                        let text = xml::decode_entities(&buf);
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            result.push_str("- ");
-                            result.push_str(trimmed);
-                            result.push('\n');
-                        }
-                        buf.clear();
+                "li" if tag_is_closing => {
+                    let text = xml::decode_entities(&buf);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        result.push_str("- ");
+                        result.push_str(trimmed);
+                        result.push('\n');
                     }
+                    buf.clear();
+                }
                 _ => {}
             }
         } else if in_tag {

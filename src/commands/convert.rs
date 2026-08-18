@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use super::common::{err_pdf_only_page_ranges, finish_batch, handle_results, OutputRegistry, write_output};
+use super::common::{
+    OutputRegistry, err_pdf_only_page_ranges, finish_batch, handle_results, write_output,
+};
 use crate::cli::ConvertArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -14,6 +16,7 @@ use crate::{ocr, output, pdf};
 #[derive(Debug)]
 enum Plan {
     Image(PathBuf),
+    Tiff,
     Pdf(Option<String>),
 }
 
@@ -46,6 +49,7 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
                 plan,
                 output_dir,
                 args.force,
+                args.render,
                 &image_options,
                 &mut registry,
             )
@@ -77,9 +81,16 @@ fn build_plans(
                     if spec.pages.is_some() {
                         return Err(err_pdf_only_page_ranges(&input));
                     }
-                    let output = image_output_path(&input, output_dir)?;
-                    registry.reserve(&input, &output, force)?;
-                    Ok(Plan::Image(output))
+                    let is_tiff = input.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                        e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
+                    });
+                    if is_tiff {
+                        Ok(Plan::Tiff)
+                    } else {
+                        let output = image_output_path(&input, output_dir)?;
+                        registry.reserve(&input, &output, force)?;
+                        Ok(Plan::Image(output))
+                    }
                 }
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
                 _ => bail!("unsupported convert input: {}", input.display()),
@@ -94,6 +105,7 @@ fn execute(
     plan: Plan,
     output_dir: Option<&Path>,
     force: bool,
+    render: bool,
     image_options: &ImageOptions,
     registry: &mut OutputRegistry,
 ) -> Result<usize> {
@@ -104,9 +116,61 @@ fn execute(
             write_output(&output, &jpeg)?;
             Ok(1)
         }
+        Plan::Tiff => {
+            output::info(format!("Converting TIFF pages from {}", input.display()));
+            let frames = imageconv::to_jpegs_for_pdf(input, image_options, None)?;
+            if frames.is_empty() {
+                bail!("no decodable frames found in {}", input.display());
+            }
+            let file_stem = input
+                .file_stem()
+                .with_context(|| format!("{} has no file stem", input.display()))?;
+            let count = frames.len();
+            for (i, bytes) in frames.into_iter().enumerate() {
+                let suffix = if count > 1 {
+                    format!("page_{}.jpg", i + 1)
+                } else {
+                    "jpg".to_string()
+                };
+                let output = output_dir
+                    .map(|directory| directory.join(file_stem).with_extension(&suffix))
+                    .unwrap_or_else(|| input.with_extension(&suffix));
+                registry.reserve(input, &output, force)?;
+                output::info(format!("Saving page to {}", output.display()));
+                write_output(&output, &bytes)?;
+            }
+            Ok(count)
+        }
         Plan::Pdf(pages) => {
-            output::info(format!("Extracting images from PDF {}", input.display()));
             let mut document = pdf::load(input)?;
+
+            // Auto-detect text pages if --render was not explicitly provided
+            let mut should_render = render;
+            if !should_render
+                && let Ok(text) = pdf::extract_text(&document)
+                    && !text.trim().is_empty() {
+                        should_render = true;
+                    }
+
+            if should_render {
+                output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
+                if pages.is_some() {
+                    output::warn(
+                        "Page selection is not yet supported for PDF rendering, rendering all pages.",
+                    );
+                }
+                let rendered =
+                    crate::winpdf::render_pdf_to_jpegs(input, output_dir, image_options)?;
+                let count = rendered.len();
+                for (output_path, bytes) in rendered {
+                    output::info(format!("Saving rendered page to {}", output_path.display()));
+                    registry.reserve(input, &output_path, force)?;
+                    write_output(&output_path, &bytes)?;
+                }
+                return Ok(count);
+            }
+
+            output::info(format!("Extracting images from PDF {}", input.display()));
             if let Some(pages) = pages {
                 pdf::select_pages(&mut document, &pages)?;
             }
@@ -177,6 +241,7 @@ mod tests {
             short_edge: None,
             orient: None,
             quality: None,
+            render: false,
         }
     }
 

@@ -163,8 +163,6 @@ impl OcrEngine {
         })
     }
 
-
-
     pub fn extract_spec(&self, spec: &crate::fileset::InputSpec) -> Result<String> {
         self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), true)
     }
@@ -265,12 +263,13 @@ impl OcrEngine {
                             && let Ok(bytes) = imageconv::encode_jpeg_on_white(
                                 &image,
                                 self.options.image.jpeg_quality,
-                            ) {
-                                extracted_images.push(ExtractedImage {
-                                    label: format!("page-{page_number}-image-{}", index + 1),
-                                    bytes,
-                                });
-                            }
+                            )
+                        {
+                            extracted_images.push(ExtractedImage {
+                                label: format!("page-{page_number}-image-{}", index + 1),
+                                bytes,
+                            });
+                        }
                     }
 
                     if !extracted_images.is_empty() {
@@ -358,7 +357,9 @@ impl OcrEngine {
             }
             Some(format) if format.is_image() => {
                 if spec.pages.is_some() {
-                    return Err(crate::commands::common::err_pdf_only_page_ranges(&spec.path));
+                    return Err(crate::commands::common::err_pdf_only_page_ranges(
+                        &spec.path,
+                    ));
                 }
                 let jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
                 let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))
@@ -538,38 +539,39 @@ impl OcrEngine {
             };
             let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
             if let Ok(data) = fs::read_to_string(&path)
-                && let Ok(saved) = serde_json::from_str::<Value>(&data) {
-                    output::info(format!("OCR cache hit: {label}"));
-                    let text = saved["text"].as_str().unwrap_or_default().to_owned();
-                    let words = saved["words"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|w| {
-                                    Some(crate::winocr::OcrWordBox {
-                                        text: w["text"].as_str()?.to_owned(),
-                                        x: w["x"].as_f64()?,
-                                        y: w["y"].as_f64()?,
-                                        width: w["width"].as_f64()?,
-                                        height: w["height"].as_f64()?,
-                                        line_y: w["line_y"].as_f64().unwrap_or(w["y"].as_f64()?),
-                                        line_height: w["line_height"]
-                                            .as_f64()
-                                            .unwrap_or(w["height"].as_f64()?),
-                                    })
+                && let Ok(saved) = serde_json::from_str::<Value>(&data)
+            {
+                output::info(format!("OCR cache hit: {label}"));
+                let text = saved["text"].as_str().unwrap_or_default().to_owned();
+                let words = saved["words"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|w| {
+                                Some(crate::winocr::OcrWordBox {
+                                    text: w["text"].as_str()?.to_owned(),
+                                    x: w["x"].as_f64()?,
+                                    y: w["y"].as_f64()?,
+                                    width: w["width"].as_f64()?,
+                                    height: w["height"].as_f64()?,
+                                    line_y: w["line_y"].as_f64().unwrap_or(w["y"].as_f64()?),
+                                    line_height: w["line_height"]
+                                        .as_f64()
+                                        .unwrap_or(w["height"].as_f64()?),
                                 })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let w = saved["width"].as_u64().unwrap_or(0) as u32;
-                    let h = saved["height"].as_u64().unwrap_or(0) as u32;
-                    return Ok(crate::winocr::OcrPageResult {
-                        text,
-                        words,
-                        image_width: w,
-                        image_height: h,
-                    });
-                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let w = saved["width"].as_u64().unwrap_or(0) as u32;
+                let h = saved["height"].as_u64().unwrap_or(0) as u32;
+                return Ok(crate::winocr::OcrPageResult {
+                    text,
+                    words,
+                    image_width: w,
+                    image_height: h,
+                });
+            }
             let res = crate::winocr::recognize_image_bytes(original, self.options.lang.as_deref())?;
             let json_val = json!({
                 "text": res.text,
@@ -842,15 +844,16 @@ pub fn extract_pdf_images(
             if best_image
                 .as_ref()
                 .is_none_or(|(best_area, _)| area > *best_area)
-                && let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality) {
-                    best_image = Some((
-                        area,
-                        ExtractedImage {
-                            label: format!("page-{page_number}"),
-                            bytes,
-                        },
-                    ));
-                }
+                && let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality)
+            {
+                best_image = Some((
+                    area,
+                    ExtractedImage {
+                        label: format!("page-{page_number}"),
+                        bytes,
+                    },
+                ));
+            }
         }
 
         if let Some((_, best)) = best_image {
@@ -1003,7 +1006,9 @@ mod tests {
         document.save(temporary.path()).unwrap();
         let engine = OcrEngine::new(options_without_api_key()).unwrap();
 
-        let extracted = engine.extract_text(temporary.path()).unwrap();
+        let extracted = engine
+            .extract_text_with_mode(temporary.path(), None, false)
+            .unwrap();
 
         assert!(!extracted.trim().is_empty());
     }

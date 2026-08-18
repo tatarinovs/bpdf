@@ -28,17 +28,20 @@ pub fn extract_text(path: &Path) -> Result<String> {
         "odp" => extract_opendocument(&mut archive),
         _ => {
             if let Ok(text) = extract_docx(&mut archive)
-                && !text.is_empty() {
-                    return Ok(text);
-                }
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
             if let Ok(text) = extract_pptx(&mut archive)
-                && !text.is_empty() {
-                    return Ok(text);
-                }
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
             if let Ok(text) = extract_xlsx(&mut archive)
-                && !text.is_empty() {
-                    return Ok(text);
-                }
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
             extract_opendocument(&mut archive)
         }
     }
@@ -97,19 +100,20 @@ fn extract_opendocument(archive: &mut ZipArchive<File>) -> Result<String> {
                 }
             }
         } else if tag.starts_with("<text:p")
-            && let Some(gt) = tag.find('>') {
-                let content_start = gt + 1;
-                if let Some(end) = tag[content_start..].find("</text:p>") {
-                    let p_text = xml::strip_tags(&tag[content_start..content_start + end]);
-                    let trimmed = p_text.trim();
-                    if !trimmed.is_empty() {
-                        out.push_str(trimmed);
-                        out.push_str("\n\n");
-                    }
-                    cursor = &tag[content_start + end + 9..];
-                    continue;
+            && let Some(gt) = tag.find('>')
+        {
+            let content_start = gt + 1;
+            if let Some(end) = tag[content_start..].find("</text:p>") {
+                let p_text = xml::strip_tags(&tag[content_start..content_start + end]);
+                let trimmed = p_text.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(trimmed);
+                    out.push_str("\n\n");
                 }
+                cursor = &tag[content_start + end + 9..];
+                continue;
             }
+        }
         cursor = &tag[6..];
     }
 
@@ -163,16 +167,17 @@ fn extract_xlsx(archive: &mut ZipArchive<File>) -> Result<String> {
                     if cell.contains("t=\"s\"") {
                         if let Some(v_start) = cell.find("<v>")
                             && let Some(v_end) = cell[v_start + 3..].find("</v>")
-                                && let Ok(idx) =
-                                    cell[v_start + 3..v_start + 3 + v_end].parse::<usize>()
-                                    && let Some(val) = shared_strings.get(idx) {
-                                        row_values.push(val.clone());
-                                    }
-                    } else if let Some(v_start) = cell.find("<v>")
-                        && let Some(v_end) = cell[v_start + 3..].find("</v>") {
-                            let val = &cell[v_start + 3..v_start + 3 + v_end];
-                            row_values.push(xml::decode_entities(val));
+                            && let Ok(idx) = cell[v_start + 3..v_start + 3 + v_end].parse::<usize>()
+                            && let Some(val) = shared_strings.get(idx)
+                        {
+                            row_values.push(val.clone());
                         }
+                    } else if let Some(v_start) = cell.find("<v>")
+                        && let Some(v_end) = cell[v_start + 3..].find("</v>")
+                    {
+                        let val = &cell[v_start + 3..v_start + 3 + v_end];
+                        row_values.push(xml::decode_entities(val));
+                    }
                 }
 
                 if !row_values.is_empty() {

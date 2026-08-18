@@ -2,13 +2,16 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output};
+use super::common::{
+    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output,
+};
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
 use crate::imageconv::{self, ImageOptions};
 use crate::pdf::{self, transform};
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     inputs: &[String],
     size: &str,
@@ -35,9 +38,12 @@ pub fn run(
     image_options.short_edge = short_edge;
     image_options.force_reencode = true;
 
-    let results = specs
-        .iter()
-        .map(|spec| (&spec.path, resize_one(spec, size, pages, out, &image_options)));
+    let results = specs.iter().map(|spec| {
+        (
+            &spec.path,
+            resize_one(spec, size, pages, out, &image_options),
+        )
+    });
     let failures = handle_results(
         results,
         fail_fast,

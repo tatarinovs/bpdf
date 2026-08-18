@@ -2,7 +2,9 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output};
+use super::common::{
+    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output, write_output,
+};
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
@@ -51,9 +53,12 @@ pub fn run(
     }
     image_options.force_reencode = true;
 
-    let results = specs
-        .iter()
-        .map(|spec| (&spec.path, rotate_one(spec, mode, pages, out, &image_options)));
+    let results = specs.iter().map(|spec| {
+        (
+            &spec.path,
+            rotate_one(spec, mode, pages, out, &image_options),
+        )
+    });
     let failures = handle_results(
         results,
         fail_fast,
@@ -74,7 +79,6 @@ fn rotate_one(
     let input = &spec.path;
     let format = formats::detect(input);
     let output_path = resolve_in_place_output(input, explicit_out, "Rotating");
-
 
     match format {
         Some(Format::Pdf) => {

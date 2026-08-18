@@ -344,6 +344,9 @@ pub struct ConvertArgs {
     /// JPEG quality (0-100), overrides config.
     #[arg(short = 'q', long)]
     pub quality: Option<u8>,
+    /// Render PDF pages to JPEG instead of extracting embedded images.
+    #[arg(long)]
+    pub render: bool,
 }
 
 #[cfg(test)]

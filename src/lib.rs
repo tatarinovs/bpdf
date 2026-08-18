@@ -22,6 +22,7 @@ mod process;
 mod textpdf;
 mod wic;
 mod winocr;
+mod winpdf;
 mod xml;
 
 use std::ffi::OsString;
@@ -58,4 +59,8 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
 
 pub fn report_error(error: &anyhow::Error) {
     output::error(format!("{error:#}"));
+}
+
+pub fn is_json_mode() -> bool {
+    output::is_json()
 }

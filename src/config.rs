@@ -68,7 +68,7 @@ impl Default for Config {
             jpeg_quality: 95,
             office_timeout_seconds: 120,
             ocr_timeout_seconds: 120,
-            ocr_jobs: 2,
+            ocr_jobs: 1,
             ocr_max_tokens: 4096,
             ocr_cache: true,
             ocr_cache_dir: default_cache_dir(),

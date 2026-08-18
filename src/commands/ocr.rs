@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::common::{err_pdf_only_page_ranges, DOCUMENT_SEPARATOR, finish_batch, write_output};
+use super::common::{DOCUMENT_SEPARATOR, err_pdf_only_page_ranges, finish_batch, write_output};
 use crate::cli::OcrArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -61,7 +61,11 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
         let mut failures = 0usize;
         for spec in &specs {
             if let Some(pages) = &spec.pages {
-                output::info(format!("Queued OCR (in-place): {}:{}", spec.path.display(), pages));
+                output::info(format!(
+                    "Queued OCR (in-place): {}:{}",
+                    spec.path.display(),
+                    pages
+                ));
             } else {
                 output::info(format!("Queued OCR (in-place): {}", spec.path.display()));
             }
@@ -102,9 +106,8 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
                         spec.path.display()
                     ));
                     if fail_fast {
-                        return Err(error).with_context(|| {
-                            format!("failed to process {}", spec.path.display())
-                        });
+                        return Err(error)
+                            .with_context(|| format!("failed to process {}", spec.path.display()));
                     }
                 }
             }
@@ -272,8 +275,9 @@ mod tests {
             *pixel = image::Rgb([255, 255, 255]);
         }
         let mut img_bytes = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut img_bytes, image::ImageFormat::Jpeg).unwrap();
-        
+        img.write_to(&mut img_bytes, image::ImageFormat::Jpeg)
+            .unwrap();
+
         let image_stream = lopdf::Stream::new(
             lopdf::dictionary! {
                 "Type" => "XObject",

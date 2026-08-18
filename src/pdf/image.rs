@@ -14,14 +14,16 @@ pub(crate) fn decode(stream: &Stream) -> Result<DynamicImage> {
     // Check if the stream contains JPEG (DCTDecode / DCT)
     if filters.iter().any(|f| *f == b"DCTDecode" || *f == b"DCT") {
         if stream.content.starts_with(&[0xff, 0xd8])
-            && let Ok(img) = image::load_from_memory(&stream.content) {
-                return Ok(img);
-            }
+            && let Ok(img) = image::load_from_memory(&stream.content)
+        {
+            return Ok(img);
+        }
         if let Ok(decompressed) = decompress_flate(&stream.content) {
             if decompressed.starts_with(&[0xff, 0xd8])
-                && let Ok(img) = image::load_from_memory(&decompressed) {
-                    return Ok(img);
-                }
+                && let Ok(img) = image::load_from_memory(&decompressed)
+            {
+                return Ok(img);
+            }
             if let Ok(img) = image::load_from_memory(&decompressed) {
                 return Ok(img);
             }
@@ -29,9 +31,10 @@ pub(crate) fn decode(stream: &Stream) -> Result<DynamicImage> {
     }
 
     if stream.content.starts_with(&[0xff, 0xd8])
-        && let Ok(img) = image::load_from_memory(&stream.content) {
-            return Ok(img);
-        }
+        && let Ok(img) = image::load_from_memory(&stream.content)
+    {
+        return Ok(img);
+    }
 
     let width = dimension(stream, b"Width")?;
     let height = dimension(stream, b"Height")?;
@@ -75,9 +78,10 @@ pub(crate) fn decode(stream: &Stream) -> Result<DynamicImage> {
     };
 
     if (raw.starts_with(&[0xff, 0xd8]) || raw.starts_with(&[0x89, b'P', b'N', b'G']))
-        && let Ok(img) = image::load_from_memory(&raw) {
-            return Ok(img);
-        }
+        && let Ok(img) = image::load_from_memory(&raw)
+    {
+        return Ok(img);
+    }
 
     if bits == 1 {
         let row_bytes = (width as usize).div_ceil(8);

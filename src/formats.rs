@@ -72,14 +72,8 @@ impl InputFormatSet {
             Self::Ocr | Self::Convert => {
                 format.is_image() || format == Format::Pdf || format == Format::Cbz
             }
-            Self::Strip => matches!(
-                format,
-                Format::Jpeg | Format::Png | Format::Pdf
-            ),
-            Self::Rotate | Self::Resize => matches!(
-                format,
-                Format::Pdf | Format::Jpeg
-            ),
+            Self::Strip => matches!(format, Format::Jpeg | Format::Png | Format::Pdf),
+            Self::Rotate | Self::Resize => matches!(format, Format::Pdf | Format::Jpeg),
         })
     }
 }

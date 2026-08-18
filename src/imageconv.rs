@@ -58,7 +58,9 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
         || options.long_edge.is_some()
         || options.short_edge.is_some()
         || options.orient.is_some()
-        || options.rotation_degrees.is_some_and(|deg| deg.rem_euclid(360) != 0);
+        || options
+            .rotation_degrees
+            .is_some_and(|deg| deg.rem_euclid(360) != 0);
 
     if format == Some(Format::Jpeg) && jpeg_target.is_none() && !needs_reencode {
         return metadata::strip_jpeg(&input, options.keep_icc);
@@ -97,11 +99,12 @@ pub fn bytes_to_jpeg(
                 || options.long_edge.is_some()
                 || options.short_edge.is_some()
                 || options.orient.is_some()
-                || options.rotation_degrees.is_some_and(|deg| deg.rem_euclid(360) != 0);
-            if !needs_reencode
-                && let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
-                    return Ok(stripped);
-                }
+                || options
+                    .rotation_degrees
+                    .is_some_and(|deg| deg.rem_euclid(360) != 0);
+            if !needs_reencode && let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
+                return Ok(stripped);
+            }
         }
     }
 

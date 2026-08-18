@@ -165,5 +165,8 @@ pub fn resolve_in_place_output(input: &Path, explicit_out: Option<&Path>, verb: 
 }
 
 pub fn err_pdf_only_page_ranges(input: &Path) -> anyhow::Error {
-    anyhow::anyhow!("page ranges are only valid for PDF inputs: {}", input.display())
+    anyhow::anyhow!(
+        "page ranges are only valid for PDF inputs: {}",
+        input.display()
+    )
 }

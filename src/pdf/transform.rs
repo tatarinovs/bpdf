@@ -565,13 +565,15 @@ pub fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeome
 
 fn inherited_value(document: &Document, page_id: ObjectId, key: &[u8]) -> Option<Object> {
     let mut current = page_id;
-    loop {
+    // Protect against infinite loops in malformed PDFs with cyclical Parent chains
+    for _ in 0..100 {
         let dictionary = document.get_dictionary(current).ok()?;
         if let Ok(value) = dictionary.get(key) {
             return Some(value.clone());
         }
         current = dictionary.get(b"Parent").ok()?.as_reference().ok()?;
     }
+    None
 }
 
 fn set_page_rotation(document: &mut Document, page_id: ObjectId, rotation: i64) -> Result<()> {

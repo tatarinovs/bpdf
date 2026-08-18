@@ -86,7 +86,9 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
 
 fn reject_pages(spec: &InputSpec) -> Result<()> {
     if spec.pages.is_some() {
-        return Err(crate::commands::common::err_pdf_only_page_ranges(&spec.path));
+        return Err(crate::commands::common::err_pdf_only_page_ranges(
+            &spec.path,
+        ));
     }
     Ok(())
 }
