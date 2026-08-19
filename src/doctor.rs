@@ -47,13 +47,21 @@ pub fn run(config: &Config) -> Result<()> {
         &mut failures,
     );
 
-    let raw_decoder = crate::wic::availability();
-    check(
-        "raw_decoder",
-        raw_decoder.is_ok(),
-        raw_decoder.unwrap_or_else(|error| format!("{error:#}")),
-        &mut failures,
-    );
+    let raw_ok = !config.raw_develop || crate::wic::availability().is_ok();
+    let raw_status = if config.raw_develop {
+        match crate::wic::availability() {
+            Ok(name) => format!("develop mode active: {name}"),
+            Err(error) => format!("develop mode active, but WIC codec failed: {error:#}"),
+        }
+    } else {
+        match crate::wic::availability() {
+            Ok(_) => {
+                "available (pure Rust preview default, WIC develop codec installed)".to_string()
+            }
+            Err(_) => "available (pure Rust preview default)".to_string(),
+        }
+    };
+    check("raw_decoder", raw_ok, raw_status, &mut failures);
 
     let office_options = OfficeOptions {
         powershell: config.powershell.clone(),

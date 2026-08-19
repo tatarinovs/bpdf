@@ -41,6 +41,7 @@ pub struct Config {
     pub ocr_cache: bool,
     pub ocr_cache_dir: PathBuf,
     pub image_dpi: u32,
+    pub raw_develop: bool,
 }
 
 impl Default for Config {
@@ -73,6 +74,7 @@ impl Default for Config {
             ocr_cache: true,
             ocr_cache_dir: default_cache_dir(),
             image_dpi: 150,
+            raw_develop: false,
         }
     }
 }
@@ -90,6 +92,7 @@ impl Config {
             orient: None,
             rotation_degrees: None,
             force_reencode: false,
+            raw_develop: self.raw_develop,
         }
     }
 

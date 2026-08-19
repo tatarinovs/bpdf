@@ -1,8 +1,5 @@
 # bpdf — Быстрая и легкая утилита для работы с PDF и документами
 
-Начиная с версии 0.3 команды отделены от общего ядра, устранён повторный разбор
-PDF при `split` и сокращено копирование данных при обработке изображений.
-Архитектура описана в [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **bpdf** — это консольный инструмент (CLI) на языке Rust для комплексной обработки PDF-файлов, изображений, текстовых документов и файлов Microsoft Office (Word, Excel, PowerPoint). Утилита ориентирована на высокую скорость, минимальный размер, надежность операций (атомарная запись) и гибкую автоматизацию (поддержка NDJSON, списков файлов и переменных окружения).
 
@@ -33,7 +30,7 @@ PDF при `split` и сокращено копирование данных п�
 - **ОС:** Windows 10 / 11 (x64) или Linux / macOS.
 - **Внешние форматы изображений:** Для HEIC/HEIF, AVIF, PSD, JPEG 2000/JPEG-LS, DDS, EXR, HDR, QOI, TGA, PCX, PNM, SGI, XBM, DPX, FITS и других редких растров требуется установленный `ffmpeg` в системном `PATH` либо параметр `--ffmpeg C:\path\to\ffmpeg.exe`. Фактический набор декодеров зависит от сборки FFmpeg.
 - **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
-- **RAW-снимки камер:** В Windows CR2/CR3, NEF/NRW, ARW, DNG, RAF, ORF, RW2 и другие RAW декодируются системным Windows Imaging Component. Нужен компактный Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`.
+- **RAW-снимки камер:** По умолчанию снимки `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, `.orf`, `.rw2` и другие мгновенно обрабатываются в **Pure Rust** путём извлечения полноразмерного встроенного превью от процессора камеры (кроссплатформенно: Windows, Linux, macOS). Полная проявка сенсора через Windows Imaging Component включается опцией `raw_develop = true` в `config.toml` (требует Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`).
 - **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
 - **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.toml`, в том числе через `%GROQ_API_KEY%`.
 
@@ -304,7 +301,7 @@ bpdf convert <INPUTS>... [OPTIONS]
 - `--force` — Разрешить замену уже существующих выходных файлов, включая конвертацию на месте. Коллизии, при которых два входных файла дают один выходной путь, запрещены даже с `--force`.
 
 ### 14. `bpdf doctor`
-Проверяет окружение, валидность конфигурации, доступность утилит, системного RAW-кодека WIC и ключей API.
+Проверяет окружение, валидность конфигурации, доступность утилит, декодеров RAW (Pure Rust / WIC) и ключей API.
 
 ```powershell
 bpdf doctor
@@ -321,8 +318,7 @@ bpdf doctor
 - Встроенный Rust-декодер используется для JPEG, PNG, BMP, GIF, TIFF, WebP и APNG. Для BMP/GIF/TIFF/WebP/APNG при ошибке встроенного декодера автоматически пробуется FFmpeg.
 - Через FFmpeg обрабатываются HEIC/HEIF, AVIF, PSD, JPEG 2000 (`.jp2`, `.j2k`, `.j2c`, `.jpc`, `.jpf`, `.jpx`), JPEG-LS (`.jls`), DDS, EXR, HDR, QOI, TGA, PCX, PNM (`.pnm`, `.ppm`, `.pgm`, `.pbm`, `.pam`), SGI, XBM, DPX, FITS (`.fits`, `.fit`, `.fts`), PGX, Sun Raster, XWD и PIX. Берётся первый видеопоток и первый кадр.
 - Через встроенные кодеки Windows Imaging Component обрабатываются JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO. Для ICO выбирается изображение с наибольшим разрешением.
-- В Windows через WIC и Microsoft Raw Image Extension обрабатываются `.3fr`, `.arw`, `.bay`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw` и `.x3f`. Поддержка конкретной камеры зависит от версии системного RAW-кодека. На Linux и macOS RAW пока не поддерживается.
-- После декодирования WIC используются те же настройки `image_dpi` и `jpeg_quality`, что и для встроенных форматов; отдельный промежуточный файл не создаётся.
+- Снимки фотокамер `.3fr`, `.arw`, `.bay`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw` и `.x3f` по умолчанию декодируются в **Pure Rust** без внешних утилит и кодеков через извлечение полноразмерного аппаратного JPEG-превью камеры. При необходимости полной проявки сенсора на Windows через WIC используется опция `raw_develop = true` в `config.toml`.
 - При `merge` все логические страницы TIFF и все кадры GIF/APNG/анимированного WebP добавляются в PDF по порядку. Ограничение безопасности — не более 10 000 кадров из одного файла. `convert`, `ocr` и `strip` работают с одним основным кадром.
 - JPEG XL не заявлен как поддерживаемый: декодер JXL отсутствует во многих сборках FFmpeg.
 
@@ -405,11 +401,14 @@ auto_rotate = false
 keep_icc = false
 optimize = false
 strip_metadata = false
+bookmarks = false
 page_size = "A4"
 jpeg_quality = 95 # качество JPEG при merge и optimize
 image_dpi = 150   # целевой DPI при merge и optimize; 0 отключает уменьшение
+raw_develop = false # false = быстрое Pure-Rust превью, true = полная проявка WIC
 
 # Настройки OCR
+ocr_engine = "groq" # "groq" (облачный Vision), "windows" (локальный WinOCR) или "auto"
 ocr_model = "qwen/qwen3.6-27b"
 # ocr_prompt = '''Extract all text exactly as it appears...'''
 ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
@@ -463,7 +462,7 @@ bpdf convert photo.avif design.psd --out converted
 # Конвертация JPEG 2000, JPEG-LS, JPEG XR и ICO в JPEG
 bpdf convert scan.jp2 medical.jls photo.jxr icon.ico --out converted
 
-# Конвертация RAW-снимков через Windows Raw Image Extension
+# Конвертация RAW-снимков фотоаппаратов в JPEG (быстрое превью без кодеков)
 bpdf convert photo.cr3 photo.nef photo.arw --out converted
 
 # Все страницы TIFF и кадры анимации становятся страницами PDF

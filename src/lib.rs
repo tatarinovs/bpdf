@@ -19,6 +19,7 @@ mod office_fallback;
 mod output;
 mod pdf;
 mod process;
+mod raw;
 mod textpdf;
 mod wic;
 mod winocr;

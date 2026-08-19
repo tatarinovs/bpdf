@@ -33,6 +33,7 @@ pub struct ImageOptions {
     pub orient: Option<String>,
     pub rotation_degrees: Option<i64>,
     pub force_reencode: bool,
+    pub raw_develop: bool,
 }
 
 pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
@@ -42,6 +43,9 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
     }
     if format.is_some_and(Format::requires_wic) {
         return decoded_to_jpeg_for_page(crate::wic::decode(path)?, options, page_size);
+    }
+    if format == Some(Format::CameraRaw) {
+        return raw_to_jpeg_for_page(path, options, page_size);
     }
 
     let input = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -213,6 +217,39 @@ fn decode_tiff_pages(
     page_size: Option<&str>,
 ) -> Result<Vec<Vec<u8>>> {
     Ok(vec![to_jpeg(path, options, page_size)?])
+}
+
+fn raw_to_jpeg_for_page(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Result<Vec<u8>> {
+    if !options.raw_develop {
+        match crate::raw::read_preview(path) {
+            Ok(preview_bytes) => {
+                return bytes_to_jpeg(&preview_bytes, options, page_size);
+            }
+            Err(preview_error) => {
+                #[cfg(windows)]
+                {
+                    if let Ok(decoded) = crate::wic::decode(path) {
+                        return decoded_to_jpeg_for_page(decoded, options, page_size);
+                    }
+                }
+                return Err(preview_error);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        decoded_to_jpeg_for_page(crate::wic::decode(path)?, options, page_size)
+    }
+    #[cfg(not(windows))]
+    {
+        let preview_bytes = crate::raw::read_preview(path)?;
+        bytes_to_jpeg(&preview_bytes, options, page_size)
+    }
 }
 
 pub fn for_ocr(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
@@ -519,6 +556,7 @@ mod tests {
                 short_edge: None,
                 orient: None,
                 rotation_degrees: None,
+                raw_develop: false,
             },
             None,
         )
@@ -562,6 +600,7 @@ mod tests {
                 short_edge: None,
                 orient: None,
                 rotation_degrees: None,
+                raw_develop: false,
             },
             None,
         )
@@ -572,5 +611,38 @@ mod tests {
                 .iter()
                 .all(|frame| image::guess_format(frame).unwrap() == ImageFormat::Jpeg)
         );
+    }
+
+    #[test]
+    fn camera_raw_preview_is_extracted_and_converted_to_jpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("photo.CR2");
+
+        let mut jpeg_bytes = Vec::new();
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(10, 10, Rgb([200, 100, 50])))
+            .write_to(&mut Cursor::new(&mut jpeg_bytes), ImageFormat::Jpeg)
+            .unwrap();
+
+        let mut fake_raw = Vec::new();
+        fake_raw.extend_from_slice(b"RAW_HEADER_PADDING");
+        fake_raw.extend_from_slice(&jpeg_bytes);
+        fake_raw.extend_from_slice(b"RAW_FOOTER");
+        fs::write(&path, fake_raw).unwrap();
+
+        let options = ImageOptions {
+            keep_icc: false,
+            ffmpeg: PathBuf::from("missing-ffmpeg"),
+            jpeg_quality: 85,
+            image_dpi: 0,
+            force_reencode: false,
+            long_edge: None,
+            short_edge: None,
+            orient: None,
+            rotation_degrees: None,
+            raw_develop: false,
+        };
+
+        let result = to_jpeg(&path, &options, None).unwrap();
+        assert_eq!(image::guess_format(&result).unwrap(), ImageFormat::Jpeg);
     }
 }

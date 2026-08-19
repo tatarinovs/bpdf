@@ -99,6 +99,7 @@ mod tests {
             short_edge: None,
             orient: None,
             rotation_degrees: None,
+            raw_develop: false,
         };
 
         let doc = load_cbz(temp_file.path(), &image_opts, Some("A4")).unwrap();

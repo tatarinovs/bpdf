@@ -39,11 +39,11 @@ impl Format {
     }
 
     pub const fn requires_wic(self) -> bool {
-        matches!(self, Self::WicRaster | Self::CameraRaw)
+        matches!(self, Self::WicRaster)
     }
 
     pub const fn requires_jpeg_conversion(self) -> bool {
-        self.requires_ffmpeg() || self.requires_wic()
+        self.requires_ffmpeg() || self.requires_wic() || matches!(self, Self::CameraRaw)
     }
 
     pub const fn is_office(self) -> bool {
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_raw_extensions_share_the_wic_adapter() {
+    fn camera_raw_extensions_require_jpeg_conversion() {
         for extension in [
             "3fr", "arw", "bay", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff", "gpr", "iiq",
             "k25", "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw", "rw2",
@@ -311,7 +311,7 @@ mod tests {
             let path = Path::new("camera").with_extension(extension);
             let format = detect(&path).unwrap();
             assert_eq!(format, Format::CameraRaw, "{extension}");
-            assert!(format.requires_wic(), "{extension}");
+            assert!(format.requires_jpeg_conversion(), "{extension}");
         }
     }
 

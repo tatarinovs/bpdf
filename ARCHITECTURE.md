@@ -9,8 +9,8 @@ shared services while keeping its executable and configuration compatible.
 main.rs
   -> lib.rs (process entry point)
     -> commands/* (use cases and output policy)
-      -> pdf, imageconv, ocr, office, textpdf (domain services/adapters)
-        -> atomic, process, encoding, hash (infrastructure)
+      -> pdf, imageconv, ocr, office, textpdf, raw, ebook, archive (domain services/adapters)
+        -> atomic, process, encoding, hash, winocr, winpdf, wic (infrastructure)
 ```
 
 The lower layers do not call command modules. Commands own CLI-specific policy
@@ -37,8 +37,10 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   once in `imageconv.rs`.
 - FFmpeg is an external decoder adapter only; decoded frames return to the same
   DPI sizing and JPEG encoding path as images handled by the Rust decoder.
-- On Windows, camera RAW files use Windows Imaging Component (WIC) and the
-  Microsoft Raw Image Extension, then return to that same sizing/encoding path.
+- Camera RAW files extract embedded JPEG previews in pure Rust (`raw.rs`) on all
+  platforms; full sensor demosaicing via Windows Imaging Component (WIC) and
+  the Microsoft Raw Image Extension is supported on Windows as an opt-in mode
+  or fallback.
 - JPEG XR/HD Photo and ICO reuse the same WIC adapter. Multi-page TIFF also
   iterates WIC frames instead of introducing a separate TIFF implementation.
 - GIF, APNG, and animated WebP frames share one animation-to-JPEG iterator in
