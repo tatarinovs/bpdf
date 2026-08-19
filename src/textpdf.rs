@@ -340,7 +340,7 @@ pub(crate) fn find_font(explicit: Option<&Path>) -> Result<PathBuf> {
         .map(PathBuf::from)
         .find(|path| path.is_file())
         .ok_or_else(|| {
-            anyhow::anyhow!("no Unicode TrueType font found; set font_path in config.jsonc")
+            anyhow::anyhow!("no Unicode TrueType font found; set font_path in config.toml")
         })
 }
 

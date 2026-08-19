@@ -56,7 +56,7 @@ echo [4/4] Preparing dist directory...
 if not exist "%CD%\dist" mkdir "%CD%\dist"
 if errorlevel 1 goto :error
 copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
-copy /y "%CD%\config.example.jsonc" "%CD%\dist\config.example.jsonc" >nul || goto :error
+copy /y "%CD%\config.example.toml" "%CD%\dist\config.example.toml" >nul || goto :error
 copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
 copy /y "%CD%\bpdf.bar" "%CD%\dist\bpdf.bar" >nul || goto :error
 

@@ -122,12 +122,10 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let mut clean_json = strip_jsonc_comments(text);
+        let clean_text = expand_env_string(text);
 
-        clean_json = expand_env_vars(clean_json);
-
-        let config: Self =
-            serde_json::from_str(&clean_json).context("syntax error or invalid field type")?;
+        let config: Self = basic_toml::from_str(&clean_text)
+            .context("syntax error or invalid field type in configuration")?;
 
         if !(1..=100).contains(&config.jpeg_quality) {
             bail!("jpeg_quality must be between 1 and 100");
@@ -160,68 +158,26 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn config_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("config.jsonc"), PathBuf::from("config.json")];
+    let mut candidates = vec![PathBuf::from("config.toml")];
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
-        let next_to_executable_jsonc = directory.join("config.jsonc");
-        if !candidates.contains(&next_to_executable_jsonc) {
-            candidates.push(next_to_executable_jsonc);
-        }
-        let next_to_executable_json = directory.join("config.json");
-        if !candidates.contains(&next_to_executable_json) {
-            candidates.push(next_to_executable_json);
+        let next_to_executable = directory.join("config.toml");
+        if !candidates.contains(&next_to_executable) {
+            candidates.push(next_to_executable);
         }
     }
     candidates
 }
 
-/// Strip `//` comments from JSONC text, respecting string literals.
-fn strip_jsonc_comments(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        // Full-line comment.
-        if trimmed.starts_with("//") {
-            output.push('\n');
-            continue;
-        }
-        // Scan for inline `//` outside of string literals.
-        let mut in_string = false;
-        let mut escape = false;
-        let bytes = line.as_bytes();
-        let mut cut = line.len();
-        for (index, &byte) in bytes.iter().enumerate() {
-            if escape {
-                escape = false;
-                continue;
-            }
-            if byte == b'\\' && in_string {
-                escape = true;
-                continue;
-            }
-            if byte == b'"' {
-                in_string = !in_string;
-                continue;
-            }
-            if !in_string && byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
-                cut = index;
-                break;
-            }
-        }
-        output.push_str(&line[..cut]);
-        output.push('\n');
-    }
-    output
-}
-
-fn expand_env_vars(mut text: String) -> String {
+fn expand_env_string(text: &str) -> String {
+    let mut result = text.to_owned();
     let mut i = 0;
-    while let Some(start) = text[i..].find('%') {
+    while let Some(start) = result[i..].find('%') {
         let absolute_start = i + start;
-        if let Some(end) = text[absolute_start + 1..].find('%') {
+        if let Some(end) = result[absolute_start + 1..].find('%') {
             let absolute_end = absolute_start + 1 + end;
-            let var_name = &text[absolute_start + 1..absolute_end];
+            let var_name = &result[absolute_start + 1..absolute_end];
 
             // Reject variable names with whitespace (avoids treating '% 10 % 20' as an env var)
             if var_name.contains(|c: char| c.is_whitespace()) || var_name.is_empty() {
@@ -230,9 +186,8 @@ fn expand_env_vars(mut text: String) -> String {
             }
 
             if let Ok(val) = std::env::var(var_name) {
-                let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
-                text.replace_range(absolute_start..=absolute_end, &escaped);
-                i = absolute_start + escaped.len();
+                result.replace_range(absolute_start..=absolute_end, &val);
+                i = absolute_start + val.len();
             } else {
                 i = absolute_end + 1;
             }
@@ -240,7 +195,7 @@ fn expand_env_vars(mut text: String) -> String {
             break;
         }
     }
-    text
+    result
 }
 
 #[cfg(test)]
@@ -248,21 +203,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_json_with_comments() {
+    fn parses_toml_config() {
         let config = Config::parse(
             r#"
-                {
-                    // comment
-                    "auto_rotate": true,
-                    "keep_icc": false,
-                    "page_size": "Letter",
-                    "ocr_prompt": "Keep # signs and: colons",
-                    "jpeg_quality": 91,
-                    "font_path": "C:\\Windows\\Fonts\\arial.ttf",
-                    "ocr_jobs": 3,
-                    "ocr_cache": false,
-                    "ocr_cache_dir": "D:\\cache\\bpdf"
-                }
+                # Top-level comment
+                auto_rotate = true
+                keep_icc = false
+                page_size = "Letter"
+                ocr_prompt = '''Keep # signs and: colons'''
+                jpeg_quality = 91
+                font_path = 'C:\Windows\Fonts\arial.ttf'
+                ocr_jobs = 3
+                ocr_cache = false
+                ocr_cache_dir = 'D:\cache\bpdf'
             "#,
         )
         .unwrap();
@@ -282,11 +235,34 @@ mod tests {
     }
 
     #[test]
-    fn inline_comment_is_stripped() {
+    fn toml_example_file_parses_successfully() {
+        let example_toml = include_str!("../config.example.toml");
+        let config = Config::parse(example_toml).expect("config.example.toml must be valid");
+        assert_eq!(config.page_size, "A4");
+        assert_eq!(config.jpeg_quality, 95);
+        assert_eq!(config.ocr_engine, "groq");
+    }
+
+    #[test]
+    fn toml_dist_config_parses_successfully() {
+        let dist_toml = include_str!("../dist/config.toml");
+        let config = Config::parse(dist_toml).expect("dist/config.toml must be valid");
+        assert!(config.auto_rotate);
+        assert!(config.keep_icc);
+        assert!(config.optimize);
+        assert!(config.strip_metadata);
+        assert_eq!(config.page_size, "A4");
+        assert_eq!(config.jpeg_quality, 95);
+        assert_eq!(config.image_dpi, 150);
+        assert_eq!(config.ocr_jobs, 1);
+    }
+
+    #[test]
+    fn toml_inline_comment_is_handled() {
         let config = Config::parse(
-            r#"{
-                "jpeg_quality": 80 // high quality
-            }"#,
+            r#"
+                jpeg_quality = 80 # high quality
+            "#,
         )
         .unwrap();
         assert_eq!(config.jpeg_quality, 80);
@@ -295,40 +271,53 @@ mod tests {
     #[test]
     fn url_inside_string_is_preserved() {
         let config = Config::parse(
-            r#"{
-                "ocr_endpoint": "https://api.groq.com/openai/v1/chat/completions"
-            }"#,
+            r#"
+                ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
+            "#,
         )
         .unwrap();
         assert!(config.ocr_endpoint.starts_with("https://"));
     }
 
     #[test]
-    fn expand_env_vars_replaces_known_variable() {
+    fn expand_env_string_replaces_known_variable() {
         unsafe { std::env::set_var("BPDF_TEST_VAR", "hello") };
-        let result = expand_env_vars("%BPDF_TEST_VAR% world".to_owned());
+        let result = expand_env_string("%BPDF_TEST_VAR% world");
         assert_eq!(result, "hello world");
         unsafe { std::env::remove_var("BPDF_TEST_VAR") };
     }
 
     #[test]
-    fn expand_env_vars_ignores_unknown_variable() {
-        let result = expand_env_vars("%BPDF_DEFINITELY_NOT_SET% world".to_owned());
+    fn expand_env_string_ignores_unknown_variable() {
+        let result = expand_env_string("%BPDF_DEFINITELY_NOT_SET% world");
         assert_eq!(result, "%BPDF_DEFINITELY_NOT_SET% world");
     }
 
     #[test]
-    fn expand_env_vars_rejects_whitespace_names() {
-        let result = expand_env_vars("% not a var % rest".to_owned());
+    fn expand_env_string_rejects_whitespace_names() {
+        let result = expand_env_string("% not a var % rest");
         assert_eq!(result, "% not a var % rest");
     }
 
     #[test]
-    fn expand_env_vars_escapes_backslashes_and_quotes() {
-        unsafe { std::env::set_var("BPDF_PATH_VAR", r#"C:\dir\"file"#) };
-        let result = expand_env_vars(r#"{"key": "%BPDF_PATH_VAR%"}"#.to_owned());
-        assert!(result.contains(r#"C:\\dir\\\"file"#));
-        unsafe { std::env::remove_var("BPDF_PATH_VAR") };
+    fn expand_env_in_config_fields() {
+        unsafe {
+            std::env::set_var("BPDF_PATH_VAR", r"C:\Tools\bin");
+            std::env::set_var("BPDF_KEY_VAR", "secret_key_123");
+        }
+        let config = Config::parse(
+            r#"
+                groq_api_key = "%BPDF_KEY_VAR%"
+                ffmpeg = '%BPDF_PATH_VAR%\ffmpeg.exe'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.groq_api_key, "secret_key_123");
+        assert_eq!(config.ffmpeg, PathBuf::from(r"C:\Tools\bin\ffmpeg.exe"));
+        unsafe {
+            std::env::remove_var("BPDF_PATH_VAR");
+            std::env::remove_var("BPDF_KEY_VAR");
+        }
     }
 
     #[test]

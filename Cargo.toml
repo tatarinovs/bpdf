@@ -1,6 +1,6 @@
 [package]
 name = "bpdf"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Second-generation loss-conscious PDF and image processing toolkit"
@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "multimedia"]
 
 [dependencies]
 anyhow = "1.0.100"
+basic-toml = "0.1"
 clap = { version = "4.6.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "string", "suggestions"] }
 glob = "0.3.3"
 image = { version = "0.25.10", default-features = false, features = [

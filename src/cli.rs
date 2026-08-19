@@ -9,7 +9,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
     propagate_version = true
 )]
 pub struct Cli {
-    /// Configuration file (otherwise searches config.jsonc/config.json in cwd and beside bpdf).
+    /// Configuration file (otherwise searches config.toml in cwd and beside bpdf).
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
