@@ -35,7 +35,7 @@ PDF при `split` и сокращено копирование данных п�
 - **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
 - **RAW-снимки камер:** В Windows CR2/CR3, NEF/NRW, ARW, DNG, RAF, ORF, RW2 и другие RAW декодируются системным Windows Imaging Component. Нужен компактный Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`.
 - **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
-- **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.jsonc`, в том числе через `%GROQ_API_KEY%`.
+- **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.toml`, в том числе через `%GROQ_API_KEY%`.
 
 ---
 
@@ -71,7 +71,7 @@ cargo test --all-targets
 
 Глобальные ключи могут передаваться перед любой подкомандой:
 
-- `--config <PATH>` — Путь к файлу конфигурации (по умолчанию ищется `config.jsonc` или `config.json` в текущем каталоге или рядом с `bpdf.exe`).
+- `--config <PATH>` — Путь к файлу конфигурации (по умолчанию ищется `config.toml` в текущем каталоге или рядом с `bpdf.exe`).
 - `--quiet` — Тихий режим. Подавляет вывод прогресса и информационных сообщений (конфликтует с `--json`).
 - `--json` — Потоковый режим вывода NDJSON (выводит события и результаты в формате JSON, по одному объекту на строку).
 - `--fail-fast` — Остановить пакетную команду после первой ошибки. Без этого флага остальные файлы обрабатываются, выводится итоговая сводка, а при наличии ошибок процесс завершается с ненулевым кодом.
@@ -378,60 +378,58 @@ C:\docs\appendix.pdf:even
 
 ---
 
-## Конфигурация (`config.jsonc`)
+## Конфигурация (`config.toml`)
 
-Параметры по умолчанию можно настроить в файле `config.jsonc`.
+Параметры по умолчанию можно настроить в файле `config.toml`.
 Файл ищется в следующей последовательности:
 1. Путь из флага `--config <PATH>`;
-2. `config.jsonc` или `config.json` в текущем рабочем каталоге;
-3. `config.jsonc` или `config.json` в папке с исполняемым файлом `bpdf.exe`.
+2. `config.toml` в текущем рабочем каталоге;
+3. `config.toml` в папке с исполняемым файлом `bpdf.exe`.
 
 ### Пример файла конфигурации
 
-```jsonc
-{
-    // API Ключ Groq для OCR
-    "groq_api_key": "%GROQ_API_KEY%",
+```toml
+# API Ключ Groq для OCR
+groq_api_key = "%GROQ_API_KEY%"
 
-    // Прокси-сервер (HTTP или SOCKS5)
-    "proxy": "",
-    // "proxy": "socks5://127.0.0.1:10808",
+# Прокси-сервер (HTTP или SOCKS5)
+proxy = ""
+# proxy = "socks5://127.0.0.1:10808"
 
-    // Метаданные по умолчанию
-    "author": "My Company",
-    "creator": "bpdf toolkit",
+# Метаданные по умолчанию
+author = "My Company"
+creator = "bpdf toolkit"
 
-    // Параметры обработки PDF
-    "auto_rotate": false,
-    "keep_icc": false,
-    "optimize": false,
-    "strip_metadata": false,
-    "page_size": "A4",
-    "jpeg_quality": 95, // качество JPEG при merge и optimize
-    "image_dpi": 150,   // целевой DPI при merge и optimize; 0 отключает уменьшение
+# Параметры обработки PDF
+auto_rotate = false
+keep_icc = false
+optimize = false
+strip_metadata = false
+page_size = "A4"
+jpeg_quality = 95 # качество JPEG при merge и optimize
+image_dpi = 150   # целевой DPI при merge и optimize; 0 отключает уменьшение
 
-    // Настройки OCR
-    "ocr_model": "qwen/qwen3.6-27b",
-    // "ocr_prompt": "Extract all text exactly as it appears...",
-    "ocr_endpoint": "https://api.groq.com/openai/v1/chat/completions",
-    "ocr_jobs": 2,
-    "ocr_cache": true,
-    // "ocr_cache_dir": "%LOCALAPPDATA%\\bpdf\\ocr-cache",
-    "ocr_timeout_seconds": 120,
-    "ocr_max_tokens": 4096,
+# Настройки OCR
+ocr_model = "qwen/qwen3.6-27b"
+# ocr_prompt = '''Extract all text exactly as it appears...'''
+ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
+ocr_jobs = 2
+ocr_cache = true
+# ocr_cache_dir = 'D:\cache\bpdf-ocr'
+ocr_timeout_seconds = 120
+ocr_max_tokens = 4096
 
-    // Пути к сторонним утилитам
-    // FFmpeg нужен для HEIC/HEIF, AVIF, PSD, JPEG 2000 и других внешних форматов
-    "ffmpeg": "ffmpeg",
-    "powershell": "powershell.exe",
-    // "font_path": "C:\\Windows\\Fonts\\arial.ttf",
-    "office_timeout_seconds": 120
-}
+# Пути к сторонним утилитам
+# FFmpeg нужен для HEIC/HEIF, AVIF, PSD, JPEG 2000 и других внешних форматов
+ffmpeg = 'ffmpeg'
+powershell = 'powershell.exe'
+# font_path = '%WINDIR%\Fonts\arial.ttf'
+office_timeout_seconds = 120
 ```
 
-Полный образец с комментариями и всеми необязательными полями находится в [`config.example.jsonc`](config.example.jsonc).
+Полный образец с комментариями и всеми необязательными полями находится в [`config.example.toml`](config.example.toml).
 
-В файле конфигурации поддерживаются подстановки переменных окружения в формате `%ИМЯ_ПЕРЕМЕННОЙ%` (например, `%GROQ_API_KEY%` или `%LOCALAPPDATA%`), а также стандартные комментарии `//`.
+В файле конфигурации поддерживаются подстановки переменных окружения в формате `%ИМЯ_ПЕРЕМЕННОЙ%` (например, `%GROQ_API_KEY%` или `%WINDIR%`), а также стандартные комментарии `#`. Для путей в Windows рекомендуется использовать одинарные кавычки `'...'` во избежание экранирования обратных слэшей.
 
 ---
 
