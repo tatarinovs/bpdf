@@ -263,9 +263,12 @@ pub fn strip_document_metadata(document: &mut Document) {
     }
 
     document.prune_objects();
+    document.renumber_objects();
 }
 
 pub fn save_to_bytes(document: &mut Document) -> Result<Vec<u8>> {
+    document.prune_objects();
+    document.renumber_objects();
     document.compress();
     let mut bytes = Vec::new();
     document

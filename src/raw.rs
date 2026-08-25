@@ -10,22 +10,25 @@ pub fn extract_preview(bytes: &[u8]) -> Option<&[u8]> {
 
     while i + 4 < bytes.len() {
         // Look for JPEG Start of Image (SOI) marker: 0xFF, 0xD8, 0xFF
-        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 && bytes[i + 2] == 0xFF
-            && let Some((jpeg_slice, width, height)) = parse_jpeg_stream(&bytes[i..]) {
-                let area = u64::from(width) * u64::from(height);
-                match best_preview {
-                    Some((_, best_area)) if area > best_area => {
-                        best_preview = Some((jpeg_slice, area));
-                    }
-                    None => {
-                        best_preview = Some((jpeg_slice, area));
-                    }
-                    _ => {}
+        if bytes[i] == 0xFF
+            && bytes[i + 1] == 0xD8
+            && bytes[i + 2] == 0xFF
+            && let Some((jpeg_slice, width, height)) = parse_jpeg_stream(&bytes[i..])
+        {
+            let area = u64::from(width) * u64::from(height);
+            match best_preview {
+                Some((_, best_area)) if area > best_area => {
+                    best_preview = Some((jpeg_slice, area));
                 }
-                // Skip past this JPEG stream to continue search
-                i += jpeg_slice.len();
-                continue;
+                None => {
+                    best_preview = Some((jpeg_slice, area));
+                }
+                _ => {}
             }
+            // Skip past this JPEG stream to continue search
+            i += jpeg_slice.len();
+            continue;
+        }
         i += 1;
     }
 

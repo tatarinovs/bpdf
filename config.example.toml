@@ -71,7 +71,7 @@ ocr_engine = "groq"
 ocr_model = "qwen/qwen3.6-27b"
 
 # Кастомный промпт для OCR. Раскомментируйте, чтобы переопределить стандартный промпт.
-# ocr_prompt = '''Extract all text exactly as it appears...'''
+# ocr_prompt = '''You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.'''
 
 # URL конечной точки (endpoint) для запросов к Groq API.
 ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"

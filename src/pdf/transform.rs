@@ -723,7 +723,13 @@ fn add_page_content(
     if under {
         contents.push(Object::Reference(content_id));
     }
-    append_content_objects(document, &mut contents, old);
+    if let Some(old_contents) = old {
+        let prefix_id = document.add_object(Stream::new(dictionary! {}, b"q\n".to_vec()));
+        let suffix_id = document.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec()));
+        contents.push(Object::Reference(prefix_id));
+        append_content_objects(document, &mut contents, Some(old_contents));
+        contents.push(Object::Reference(suffix_id));
+    }
     if !under {
         contents.push(Object::Reference(content_id));
     }
@@ -1581,5 +1587,70 @@ mod tests {
 
         let dummy_jpeg = b"\xFF\xD8\xFF\xD9";
         assert_eq!(detect_image_dpi_from_bytes(dummy_jpeg), None);
+    }
+
+    #[test]
+    fn stamp_isolates_page_graphics_state() {
+        let temporary = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 4, Rgba([255, 0, 0, 128])))
+            .save_with_format(temporary.path(), ImageFormat::Png)
+            .unwrap();
+        let mut document = one_page();
+        let page_id = *document.get_pages().get(&1).unwrap();
+
+        // Simulate a page with unclosed CTM (e.g. inverted Y coordinate transform)
+        let unclosed_stream_id = document.add_object(Stream::new(
+            dictionary! {},
+            b"0.75 0 0 -0.75 0 595.32 cm\nq\n0 0 100 100 re f\nQ\n".to_vec(),
+        ));
+        document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Contents", vec![Object::Reference(unclosed_stream_id)]);
+
+        apply_stamp(
+            &mut document,
+            &StampOptions {
+                path: temporary.path().to_path_buf(),
+                position: "br".to_owned(),
+                scale: Some(1.0),
+                dpi: Some(96.0),
+                opacity: 0.5,
+                pages: "all".to_owned(),
+                mode: StampMode::Over,
+                blend_mode: BlendMode::Normal,
+            },
+        )
+        .unwrap();
+
+        let contents = document.get_page_contents(page_id);
+        // Expect: [q_prefix, original_stream, Q_suffix, stamp_stream]
+        assert_eq!(contents.len(), 4);
+
+        let q_stream = document
+            .get_object(contents[0])
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(q_stream.content, b"q\n");
+
+        let orig_stream = document
+            .get_object(contents[1])
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(
+            orig_stream.content,
+            b"0.75 0 0 -0.75 0 595.32 cm\nq\n0 0 100 100 re f\nQ\n"
+        );
+
+        let q_close_stream = document
+            .get_object(contents[2])
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        assert_eq!(q_close_stream.content, b"Q\n");
     }
 }
