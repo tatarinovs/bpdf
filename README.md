@@ -1,414 +1,343 @@
-# bpdf — Быстрая и легкая утилита для работы с PDF и документами
+# bpdf — Fast, Lightweight PDF & Document Toolkit in Rust
 
+[![Version](https://img.shields.io/badge/Version-0.5.2-blue.svg)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-1.97%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-MIT%20%2F%20Apache--2.0-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-121%20passed-brightgreen.svg)]()
+[![Language](https://img.shields.io/badge/Язык-Русский-blue.svg)](README.ru.md)
 
-**bpdf** — это консольный инструмент (CLI) на языке Rust для комплексной обработки PDF-файлов, изображений, текстовых документов и файлов Microsoft Office (Word, Excel, PowerPoint). Утилита ориентирована на высокую скорость, минимальный размер, надежность операций (атомарная запись) и гибкую автоматизацию (поддержка NDJSON, списков файлов и переменных окружения).
+**bpdf** is a high-performance, single-binary CLI tool written in Rust for comprehensive processing of PDF files, images, text documents, e-books, and Microsoft Office files (Word, Excel, PowerPoint).
 
----
-
-## Возможности
-
-- **Объединение (Merge):** Склеивание PDF, обычных изображений, комиксов (CBZ), JPEG 2000/JPEG-LS/JPEG XR, HEIC/AVIF/PSD, RAW-снимков камер, электронных книг (EPUB, FB2, FB2.ZIP, HTMLZ), документов Word/Excel/PowerPoint/OpenDocument и текстовых файлов в единый PDF или текстовый файл.
-- **Многостраничные изображения и комиксы:** Все страницы TIFF, архивы CBZ (с естественной сортировкой страниц) и все кадры GIF/APNG/анимированного WebP становятся отдельными страницами PDF при `merge`.
-- **Распознавание текста (OCR) и создание Searchable PDF:** Извлечение текста со сканов, картинок и PDF в Markdown или создание PDF с невидимым текстовым слоем (`-o searchable.pdf`) через облачный **Groq Vision** (Qwen / Llama) или нативный локальный **Windows Media OCR** (без API-ключей и интернета).
-- **Оглавление и закладки (Bookmarks):** Автоматическое построение дерева закладок PDF Outlines при объединении файлов (`merge --bookmarks`).
-- **Умное кеширование OCR:** Content-addressed кеш на диске (SHA-256 хэш изображения + модель/движок + промпт). Повторные вызовы и параллельные потоки выполняются мгновенно без обращения к сети.
-- **Поддержка сетевых прокси:** Работа через HTTP и SOCKS5 прокси для обхода блокировок или корпоративных ограничений.
-- **Печати и штампы:** Наложение прозрачных PNG-изображений с точной позиционировкой (`br`, `center`, координаты в мм), настройкой масштаба, прозрачности и выбором слоя (`over`, `under`, `auto`).
-- **Форматирование и приведение страниц:** Приведение к стандартам A4/Letter, центрирование содержимого, единая ориентация по большинству страниц и сохранение исходных размеров страниц PDF (`none`/`original`/`keep`).
-- **Очистка метаданных (Strip):** Удаление EXIF-метаданных из JPEG/PNG без перекодирования пикселей, очистка метаданных PDF Info / XMP и конвертация внешних FFmpeg-форматов и RAW-снимков в чистое JPEG.
-- **Редактирование PDF:** Разбиение на страницы (`split`), извлечение диапазонов (`extract`), поворот (`rotate`), изменение размера (`resize`), оптимизация структуры и изображений по DPI (`optimize`).
-- **Безопасное изменение in-place:** Возможность перезаписи исходных файлов при явном указании флага `-o` для модификаторов PDF и `--force` для `convert`.
-- **Метаданные PDF Info:** Просмотр (`metadata show`) и редактирование (`metadata set`) полей Title, Author, Subject, Keywords, Creator.
-- **Диагностика (`doctor`):** Проверка конфигурации, доступности внешних утилит (`ffmpeg`, `powershell`, MS Office) и проверка API Groq без расхода лимитов OCR.
-- **Автоматизация:** Тихий режим (`--quiet`) и выгрузка результатов/ошибок в формате NDJSON (`--json`).
-- **Удобный ввод:** Поддержка шаблонов (globs `*.jpg`), непосредственного содержимого каталогов с естественной сортировкой (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`) и файловых манифестов (`@list.txt`). Вложенные каталоги автоматически не обходятся.
+Designed for speed, low memory footprint, safe atomic file operations, and flexible scripting automation (NDJSON streaming, natural file sorting, input manifests, and environment variable expansion).
 
 ---
 
-## Требования и внешние зависимости
+## Key Features
 
-- **ОС:** Windows 10 / 11 (x64) или Linux / macOS.
-- **Внешние форматы изображений:** Для HEIC/HEIF, AVIF, PSD, JPEG 2000/JPEG-LS, DDS, EXR, HDR, QOI, TGA, PCX, PNM, SGI, XBM, DPX, FITS и других редких растров требуется установленный `ffmpeg` в системном `PATH` либо параметр `--ffmpeg C:\path\to\ffmpeg.exe`. Фактический набор декодеров зависит от сборки FFmpeg.
-- **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
-- **RAW-снимки камер:** По умолчанию снимки `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, `.orf`, `.rw2` и другие мгновенно обрабатываются в **Pure Rust** путём извлечения полноразмерного встроенного превью от процессора камеры (кроссплатформенно: Windows, Linux, macOS). Полная проявка сенсора через Windows Imaging Component включается опцией `raw_develop = true` в `config.toml` (требует Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`).
-- **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
-- **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.toml`, в том числе через `%GROQ_API_KEY%`.
+- **Universal Merge:** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP), Office documents (Word, Excel, PowerPoint, OpenDocument), and text/source-code files into a single PDF or merged text document.
+- **Multipage Images & Animation Frames:** All TIFF pages, comic book archives (CBZ with natural sort), and all frames of GIF, APNG, and animated WebP become distinct sequential PDF pages.
+- **OCR & Searchable (Sandwich) PDF:** Extract text to Markdown or create a PDF with an invisible searchable text layer (`-o searchable.pdf` / `--in-place`) using cloud **Groq Vision** (Qwen / Llama) or native local **Windows Media OCR** (offline, zero external API keys).
+- **Table of Contents & Bookmarks:** Automatically build hierarchical PDF Outlines when merging documents (`merge --bookmarks`).
+- **Content-Addressed OCR Cache:** SHA-256 hash-based disk caching (image hash + engine/model + prompt). Repetitive tasks and concurrent workers resolve instantly with zero redundant network requests.
+- **Network Proxy Support:** Full HTTP and SOCKS5 proxy compatibility for bypassing network restrictions or corporate firewalls.
+- **Watermarks & Stamps:** Overlay transparent PNG stamps with precise anchor positioning (`br`, `center`, or millimeter X,Y offsets), scale factors, opacity, and blend modes (`multiply` for authentic wet-ink appearance, `over`, `under`, `auto`).
+- **Page Normalization & Resizing:** Fit and center pages to standard A4 or Letter, unify orientation by majority vote, or preserve native dimensions (`none`/`original`/`keep`).
+- **Lossless Metadata Stripping (Strip):** Remove EXIF / metadata from JPEG and PNG without re-encoding pixels; sanitize PDF Info / XMP metadata.
+- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), and DPI-aware image optimization (`optimize`).
+- **Safe In-Place Edits:** Safe in-place file replacement when `-o` is explicitly provided, with atomic temporary write-and-rename semantics to prevent data corruption.
+- **PDF Info Metadata:** View (`metadata show`) and update (`metadata set`) Title, Author, Subject, Keywords, and Creator properties.
+- **System Diagnostics (`doctor`):** Inspect runtime environment, configuration validity, helper binaries (`ffmpeg`, `powershell`, MS Office), and verify Groq API connectivity without consuming OCR quotas.
+- **Automation-Ready:** Silent mode (`--quiet`), NDJSON streaming events (`--json`), glob pattern expansion (`*.jpg`), directory ingestion with natural sorting (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`), and file lists (`@manifest.txt`).
 
 ---
 
-## Сборка и установка
+## Requirements & External Dependencies
 
-### Сборка через Cargo
+| Feature / Format | Windows | Linux / macOS | Notes |
+| :--- | :--- | :--- | :--- |
+| **Core (PDF, JPEG, PNG, BMP, GIF, TIFF, WebP, APNG)** | Native Pure Rust | Native Pure Rust | No external dependencies required. |
+| **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Native Pure Rust | Native Pure Rust | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
+| **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | Via FFmpeg | Uses Windows Imaging Component. |
+| **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or `--ffmpeg path/to/ffmpeg`. |
+| **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
+| **E-books (EPUB, FB2, FB2.ZIP)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction. |
+| **OCR (Windows Media OCR)** | Native Windows 10/11 | — | Offline, built-in, no API keys needed. |
+| **OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or environment variable. |
+
+---
+
+## Installation & Building
+
+### From Source via Cargo
 
 ```powershell
 cargo build --release
 cargo test --all-targets
 ```
 
-Сборка чистая и не требует сторонних C/C++ компиляторов.
+Build is completely clean and does not require third-party C/C++ compilers.
 
-### Готовая сборка под Windows (релизный скрипт)
+### Windows Optimized Build Script
 
-Для создания оптимизированного EXE со встроенными ресурсами Windows (иконка, манифест длинных путей, версии):
+To build an optimized Windows binary with embedded version information, application icon, and long path manifest:
 
 ```powershell
 .\build.bat
 ```
 
-Скрипт выполнит:
-1. Подготовку и проверку многослойной иконки (16x16 – 256x256 px; готовые ресурсы переиспользуются).
-2. Считывание версии из `Cargo.toml`.
-3. Компиляцию манифеста, версии и иконки через `rc.exe` (Windows SDK).
-4. Оптимизированную сборку `cargo build --release --locked`.
-5. Упаковку бинарного файла, файла конфигурации и документации в директорию `dist`.
+The script will:
+1. Validate and compile the multi-resolution icon (16x16 – 256x256 px).
+2. Read the package version from `Cargo.toml`.
+3. Compile Windows resource manifests using `rc.exe` (Windows SDK).
+4. Run `cargo build --release --locked`.
+5. Package the executable, sample config, and documentation into the `dist/` directory.
 
 ---
 
-## Глобальные флаги
+## Global Flags
 
-Глобальные ключи могут передаваться перед любой подкомандой:
+Global flags can be passed before any subcommand:
 
-- `--config <PATH>` — Путь к файлу конфигурации (по умолчанию ищется `config.toml` в текущем каталоге или рядом с `bpdf.exe`).
-- `--quiet` — Тихий режим. Подавляет вывод прогресса и информационных сообщений (конфликтует с `--json`).
-- `--json` — Потоковый режим вывода NDJSON (выводит события и результаты в формате JSON, по одному объекту на строку).
-- `--fail-fast` — Остановить пакетную команду после первой ошибки. Без этого флага остальные файлы обрабатываются, выводится итоговая сводка, а при наличии ошибок процесс завершается с ненулевым кодом.
-- `-h, --help` — Вывести справочную информацию.
-- `-V, --version` — Вывести версию программы.
+- `--config <PATH>` — Path to custom configuration file (defaults to `config.toml` in current directory or beside `bpdf.exe`).
+- `--quiet` — Silent mode; suppresses progress meters and informative messages.
+- `--json` — Output results and progress events as streamable NDJSON objects (one JSON object per line).
+- `--fail-fast` — Abort batch operations immediately upon the first error. Without this flag, remaining items continue processing and errors are summarized at the end.
+- `-h, --help` — Print help information.
+- `-V, --version` — Print version.
 
 ---
 
-## Команды и параметры
+## Commands & Usage
 
 ### 1. `bpdf merge`
-Объединяет PDF-файлы, изображения, документы Office и текстовые файлы в один документ.
+Combines PDF files, images, e-books, Office documents, and text files into a single document.
 
 ```powershell
 bpdf merge <INPUTS>... [OPTIONS]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Список входных файлов, папок, масок (`*.jpg`), диапазонов (`doc.pdf:1-5`) или файлов-списков (`@list.txt`). *(Обязательный)*.
-- `-o, --out <PATH>` — Путь к выходному файлу. Если не указан, имя генерируется автоматически (например, `document_merged.pdf`).
-- `-s, --size <SIZE>` — Размер страницы PDF. Значения: `A4`, `Letter`, либо `none`/`original`/`keep`, чтобы не менять размеры страниц входных PDF.
-- `--auto-rotate[=true|false]` — Поворачивать страницы к ориентации большинства страниц документа. При равенстве используется ориентация первой страницы; без ключа действует значение `auto_rotate` из конфигурации.
-- `--no-rotate` — Не поворачивать страницы и сохранять книжную или альбомную ориентацию каждой страницы даже при приведении к A4/Letter. Переопределяет `auto_rotate` из конфигурации и не может использоваться одновременно с `--auto-rotate`.
-- `--stamp <PATH>` — Путь к PNG-изображению для наложения штампа/печати.
-- `--stamp-pos <POS>` — Позиция штампа: `br` (bottom-right), `bl`, `tr`, `tl`, `c` (center), `tc`, `bc`, `l`, `r` или смещение `X,Y` в миллиметрах от правого нижнего угла (для отрицательных значений используйте `--stamp-pos="-X,Y"`).
-- `--stamp-dpi <DPI>` — Физическое разрешение штампа в DPI (автоматически считывается из PNG-файла, если сохранено сканером/Photoshop; по умолчанию `96.0`).
-- `--stamp-scale <SCALE>` — Множитель масштаба штампа (по умолчанию `1.0` при известном/указанном DPI; `0.0` — автоподбор до 25% страницы).
-- `--stamp-op <OPACITY>` — Прозрачность штампа от `0.0` (прозрачный) до `1.0` (непрозрачный).
-- `--stamp-pages <PAGES>` — Страницы для штампа (`all`, `first`, `last`, `1-5`, `even`, `odd`).
-- `--stamp-mode <MODE>` — Режим наложения штампа: `auto` (под текст, если есть шрифты), `over` (поверх содержимого), `under` (под содержимым).
-- `--stamp-blend <MODE>` — Режим наложения цвета (`normal`, `multiply`, `screen`, `overlay` и др.; `multiply` для реалистичных чернил).
-- `--keep-icc[=true|false]` — Сохранять цветовые профили ICC у изображений (по умолчанию `false` для уменьшения размера).
-- `--optimize[=true|false]` — Оптимизировать структуру PDF и уменьшать слишком большие встроенные изображения до `image_dpi` из конфигурации; JPEG кодируется с `jpeg_quality`.
-- `--strip-meta[=true|false]` — Удалять метаданные из итогового документа.
-- `--bookmarks[=true|false]` — Создавать оглавление/закладки (PDF Outlines) для каждого объединяемого файла.
-- `--author <STRING>` — Указать имя автора в свойствах PDF.
-- `--creator <STRING>` — Указать программу-создателя в свойствах PDF.
-- `--ffmpeg <PATH>` — Путь к FFmpeg для внешних форматов изображений и резервного декодирования.
+**Options:**
+- `<INPUTS>...` — Input files, folders, glob patterns (`*.jpg`), page ranges (`doc.pdf:1-5`), or file lists (`@list.txt`). *(Required)*.
+- `-o, --out <PATH>` — Output path. If omitted, an automatic name is generated (e.g. `doc_merged.pdf`).
+- `-s, --size <SIZE>` — Target page size: `A4`, `Letter`, or `none`/`original`/`keep` to preserve input PDF page dimensions.
+- `--auto-rotate[=true|false]` — Rotate pages to match the dominant orientation of the document.
+- `--no-rotate` — Disable auto-rotation, preserving each page's native orientation.
+- `--stamp <PATH>` — Path to PNG image to overlay as a stamp or watermark.
+- `--stamp-pos <POS>` — Stamp anchor: `br` (bottom-right), `bl`, `tr`, `tl`, `c` (center), `tc`, `bc`, `l`, `r` or millimeter offset `X,Y` from bottom-right (e.g. `--stamp-pos="-130,30"`).
+- `--stamp-dpi <DPI>` — Stamp resolution in DPI (auto-detected from PNG metadata if present; default `96.0`).
+- `--stamp-scale <SCALE>` — Stamp scale multiplier (default `1.0` for calibrated DPI; `0.0` for auto-fit up to 25% of page).
+- `--stamp-op <OPACITY>` — Stamp opacity from `0.0` (transparent) to `1.0` (opaque).
+- `--stamp-pages <PAGES>` — Pages to stamp (`all`, `first`, `last`, `1-5`, `even`, `odd`).
+- `--stamp-mode <MODE>` — Layering mode: `auto` (under text if fonts exist, over images), `over`, `under`.
+- `--stamp-blend <MODE>` — Blend mode (`normal`, `multiply`, `screen`, `overlay`, etc.; `multiply` provides authentic ink appearance).
+- `--keep-icc[=true|false]` — Preserve ICC color profiles in embedded images (default `false` to save space).
+- `--optimize[=true|false]` — Optimize PDF structure and downsample oversized images to `image_dpi`.
+- `--strip-meta[=true|false]` — Strip metadata from generated PDF.
+- `--bookmarks[=true|false]` — Generate PDF Outlines (table of contents) for each merged file.
+- `--author <STRING>` — Set Author metadata property.
+- `--creator <STRING>` — Set Creator metadata property.
+- `--ffmpeg <PATH>` — Custom path to `ffmpeg.exe`.
+
+---
 
 ### 2. `bpdf ocr`
-Распознает текст с документов и изображений с помощью облачного Groq Vision OCR или встроенного локального Windows Media OCR. При сохранении в `.pdf` автоматически создаёт Searchable (Sandwich) PDF с невидимым текстовым слоем поверх сканов.
+Extracts text from documents and images using cloud Groq Vision OCR or local Windows Media OCR. When outputting to `.pdf`, creates a **Searchable (Sandwich) PDF** with an invisible text layer aligned over the scans.
 
 ```powershell
 bpdf ocr <INPUTS>... [OPTIONS]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Входные файлы (JPG, PNG, PDF, RAW и др., включая диапазоны страниц для PDF: `doc.pdf:1-5`), папки или маски. *(Обязательный)*.
-- `-o, --out <PATH>` — Путь к итоговому файлу:
-  - Если расширение `.pdf` (например `-o searchable.pdf`) — создаётся **Searchable PDF** с текстовым слоем.
-  - Если расширение `.md` или путь не указан — создаются Markdown-файлы с распознанным текстом.
-- `--in-place` — Встроить распознанный текстовый слой (Searchable PDF) прямо в исходный PDF-файл на месте (перезаписывает файл, конфликтует с `-o/--out`, применимо только к PDF).
-- `--engine <ENGINE>` — Движок распознавания: `groq`, `windows` (или `winocr`), `auto`.
-- `--lang <LANG>` — Языковой тег для Windows OCR (например, `ru`, `en-US`).
-- `--proxy <URL>` — Прокси-сервер (`http://...` или `socks5://...`).
-- `--model <NAME>` — Модель Groq Vision (по умолчанию `qwen/qwen3.6-27b`).
-- `--prompt <TEXT>` — Кастомный текстовый промпт для модели.
-- `--endpoint <URL>` — URL конечной точки Groq API.
-- `--force-ocr` — Принудительно выполнять OCR через нейросеть, даже если у PDF есть извлекаемый текстовый слой.
-- `--jobs <NUM>` — Количество параллельных потоков OCR (от 1 до 64, по умолчанию `2`).
-- `--no-cache` — Отключить дисковый кеш OCR.
-- `--cache-dir <PATH>` — Путь к каталогу кеша OCR.
-- `--ffmpeg <PATH>` — Путь к FFmpeg для внешних форматов изображений и резервного декодирования.
+**Options:**
+- `<INPUTS>...` — Input files (JPG, PNG, PDF, RAW, etc., including page ranges: `scan.pdf:1-5`), directories, or globs.
+- `-o, --out <PATH>` — Output destination:
+  - If `.pdf` extension (e.g. `-o searchable.pdf`) — outputs a **Searchable PDF**.
+  - If `.md` or omitted — outputs Markdown files with recognized text.
+- `--in-place` — Inject the searchable text layer directly into the source PDF file (overwrites original safely).
+- `--engine <ENGINE>` — Recognition engine: `groq`, `windows` (or `winocr`), `auto`.
+- `--lang <LANG>` — Language tag for Windows OCR (e.g. `en-US`, `ru`, `de-DE`).
+- `--proxy <URL>` — HTTP or SOCKS5 proxy (`http://...` or `socks5://...`).
+- `--model <NAME>` — Groq Vision model (default `qwen/qwen3.6-27b`).
+- `--prompt <TEXT>` — Custom prompt instructions for vision model.
+- `--endpoint <URL>` — Groq API endpoint URL.
+- `--force-ocr` — Force OCR processing even if the PDF already contains extractable text.
+- `--jobs <NUM>` — Concurrent worker threads (from 1 to 64, default `1`).
+- `--no-cache` — Disable OCR disk cache.
+- `--cache-dir <PATH>` — Custom path for OCR cache directory.
+
+---
 
 ### 3. `bpdf split`
-Разбивает многостраничный PDF на отдельные одностраничные PDF-файлы.
+Splits a multipage PDF into separate single-page PDF files.
 
 ```powershell
 bpdf split <INPUT> [OUTPUT_DIR]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `[OUTPUT_DIR]` — Директория для сохранения страниц. По умолчанию — папка исходного файла.
+---
 
 ### 4. `bpdf extract`
-Извлекает указанные страницы из PDF в новый PDF-файл.
+Extracts specified page ranges from a PDF into a new PDF document.
 
 ```powershell
 bpdf extract <INPUT> <PAGES> [OUTPUT]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `<PAGES>` — Диапазон страниц (например: `1-5,8`, `first`, `last`, `even`, `odd`).
-- `[OUTPUT]` — Имя нового файла (по умолчанию `doc_extracted.pdf`). Не может совпадать с исходным файлом.
+**Example:**
+```powershell
+bpdf extract document.pdf 1-5,8,last output.pdf
+```
+
+---
 
 ### 5. `bpdf inspect`
-Показывает диагностическую информацию о PDF (версия, количество страниц, шрифты, изображения).
+Displays detailed diagnostic information about a PDF file (PDF version, page count, embedded fonts, images, dimensions, rotation).
 
 ```powershell
 bpdf inspect <INPUT> [--text]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `--text` — Дополнительно извлечь и выдать текстовый слой.
+---
 
 ### 6. `bpdf strip`
-Удаляет метаданные из JPEG, PNG и PDF (in-place по умолчанию). Неподдерживаемые форматы автоматически пропускаются без ошибки.
+Removes EXIF metadata from JPEG/PNG images without re-encoding, and sanitizes PDF Info / XMP dictionaries.
 
 ```powershell
 bpdf strip <INPUTS>... [OPTIONS]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Файлы или папки для очистки (JPEG, PNG, PDF; остальные пропускаются).
-- `-o, --out <PATH>` — Выходной файл или папка (допустимо только при одном входном файле). Если `-o` не указан, очистка выполняется **in-place**.
-- `--keep-icc[=true|false]` — Сохранять цветовой профиль ICC.
-- `--ffmpeg <PATH>` — Путь к FFmpeg для резервного декодирования.
+---
 
 ### 7. `bpdf rotate`
-Поворачивает страницы PDF или изображения JPEG на угол, кратный 90 градусам, либо приводит их к указанной ориентации (`portrait` или `landscape`). Неподдерживаемые форматы в папках пропускаются.
+Rotates PDF pages or JPEG images by multiples of 90 degrees, or aligns them to `portrait` or `landscape`.
 
 ```powershell
 bpdf rotate <INPUTS>... <DEGREES> [-p <PAGES>] [-o <OUT>]
 bpdf rotate <INPUTS>... --orient <landscape|portrait> [-p <PAGES>] [-o <OUT>]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Исходные PDF-файлы или картинки JPEG.
-- `<DEGREES>` — Угол поворота по часовой стрелке в градусах (`90`, `180`, `270`, `-90` и т.д., обязателен, если не указан `--orient`).
-- `--orient <MODE>` — Целевая ориентация (`portrait` или `landscape`, конфликтует с `<DEGREES>`).
-- `-p, --pages <PAGES>` — Страницы для поворота (по умолчанию `all`, применимо только к PDF).
-- `-o, --out <PATH>` — Выходной файл или папка (перезапись на месте по умолчанию, если не указано).
+---
 
 ### 8. `bpdf resize`
-Масштабирует и центрирует страницы PDF на листе формата A4 или Letter, либо изменяет размер изображений JPEG по `--long-edge` / `--short-edge` / формату листа. Неподдерживаемые форматы в папках пропускаются.
+Scales and centers PDF pages onto A4 or Letter sheets, or resizes JPEG images by long/short edge dimensions.
 
 ```powershell
 bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-o <OUT>]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Исходные PDF-файлы или картинки JPEG.
-- `-s, --size <SIZE>` — Целевой формат страницы PDF (`A4` или `Letter`, по умолчанию `A4`).
-- `--long-edge <PX>` — Изменить размер картинки так, чтобы длинная сторона была не больше указанного значения в пикселях.
-- `--short-edge <PX>` — Изменить размер картинки так, чтобы короткая сторона была не меньше указанного значения в пикселях.
-- `-p, --pages <PAGES>` — Выбранные страницы PDF (по умолчанию `all`).
-- `-o, --out <PATH>` — Выходной файл или папка (перезапись на месте по умолчанию).
+---
 
 ### 9. `bpdf text`
-Быстро извлекает текстовый слой из PDF без использования сторонних сервисов и сети.
+Instantly extracts the native text layer from a PDF document to stdout or file without network access.
 
 ```powershell
 bpdf text <INPUT> [-o <OUT>]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `-o, --out <PATH>` — Сохранить результат в файл вместо вывода в стандартный поток (stdout).
+---
 
 ### 10. `bpdf stamp`
-Накладывает прозрачный PNG-штамп на существующий PDF-документ.
+Applies a transparent PNG stamp or seal to an existing PDF document.
 
 ```powershell
 bpdf stamp <INPUT> <STAMP> [OPTIONS]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `<STAMP>` — Путь к PNG-файлу штампа.
-- `-o, --out <PATH>` — Выходной PDF (укажите `-o input.pdf` для перезаписи на месте).
-- `--position <POS>` — Позиционирование: `br`, `bl`, `tr`, `tl`, `c`, `tc`, `bc`, `l`, `r` или смещение `X,Y` в мм от правого нижнего угла (для отрицательных значений используйте `--position="-X,Y"`).
-- `--dpi <DPI>` — Физическое разрешение штампа в DPI (автоматически считывается из PNG-файла, если сохранено сканером/Photoshop; по умолчанию `96.0`).
-- `--scale <SCALE>` — Множитель масштаба (по умолчанию `1.0` при известном/указанном DPI; `0.0` — автоподбор до 25% страницы).
-- `--opacity <OPACITY>` — Прозрачность от 0.0 до 1.0 (по умолчанию `1.0`).
-- `--pages <PAGES>` — Диапазон страниц (по умолчанию `all`).
-- `--mode <MODE>` — Режим слоев (`auto`, `over`, `under`).
-- `--blend <MODE>` — Режим наложения цвета (`normal`, `multiply`, `screen`, `overlay` и др.; `multiply` идеален для реалистичных печатей поверх документов).
-
-**Примеры:**
+**Examples:**
 ```powershell
-# Наложение печати на последнюю страницу в левый нижний угол с реалистичным смешиванием чернил
-bpdf stamp "Доверенность.pdf" "stamp.png" --position="-130,30" --mode over --blend multiply --pages last -o "Доверенность_с_печатью.pdf"
+# Apply seal to last page in bottom-left with authentic ink multiplication
+bpdf stamp "Contract.pdf" "seal.png" --position="-130,30" --mode over --blend multiply --pages last -o "Contract_stamped.pdf"
 
-# Наложение штампа на все страницы поверх документов из 1C/Word (не перекрывая черный текст)
+# Apply stamp across all pages in-place
 bpdf stamp invoice.pdf stamp.png --position br --blend multiply -o invoice.pdf
 ```
 
+---
+
 ### 11. `bpdf optimize`
-Выполняет структурную оптимизацию PDF (удаление мусорных объектов, сжатие потоков) и уменьшает встроенные растровые изображения до разрешения `image_dpi` из конфигурации относительно размера страницы. Для `merge` и `optimize` используется один расчёт размера. JPEG перекодируется с качеством `jpeg_quality`; значение `image_dpi: 0` отключает уменьшение картинок, но оставляет структурную оптимизацию.
+Performs structural cleanup (removes dead objects, compresses streams) and resamples oversized embedded images to target `image_dpi`.
 
 ```powershell
 bpdf optimize <INPUT> [-o <OUT>]
 ```
 
-**Параметры:**
-- `<INPUT>` — Исходный PDF-файл.
-- `-o, --out <PATH>` — Выходной файл (укажите `-o input.pdf` для изменения на месте).
+---
 
 ### 12. `bpdf metadata`
-Управление метаданными PDF Info (Title, Author, Subject, Keywords, Creator).
+View and edit PDF document information dictionary entries (Title, Author, Subject, Keywords, Creator).
 
-#### Просмотр метаданных (`metadata show`):
 ```powershell
-bpdf metadata show <INPUT>
+# Show metadata
+bpdf metadata show document.pdf
+
+# Set metadata
+bpdf metadata set document.pdf --title "Financial Report 2026" --author "John Doe" -o document.pdf
 ```
 
-#### Изменение метаданных (`metadata set`):
-```powershell
-bpdf metadata set <INPUT> [OPTIONS]
-```
-- `-o, --out <PATH>` — Выходной файл (укажите `-o input.pdf` для изменения на месте).
-- `--title <STRING>` — Название документа.
-- `--author <STRING>` — Автор.
-- `--subject <STRING>` — Тема.
-- `--keywords <STRING>` — Ключевые слова.
-- `--creator <STRING>` — Программа-создатель.
+---
 
 ### 13. `bpdf convert`
-Конвертирует изображения (включая многостраничные TIFF, JPEG 2000/JPEG-LS/JPEG XR/ICO и редкие FFmpeg-форматы) в JPEG. Многостраничные TIFF-документы автоматически распаковываются на отдельные JPEG-файлы для каждой страницы. Для анимаций (GIF, WebP) берется только первый кадр.
-
-При передаче PDF-файлов команда по умолчанию извлекает оригинальные встроенные растровые изображения (идеально для сканов). Если PDF содержит текстовый слой (текстовые документы), программа автоматически переключается на нативный Windows-рендер и преобразует каждую страницу в JPEG-изображение.
+Converts images (multipage TIFF, JPEG 2000, JPEG-LS, JPEG XR, ICO, camera RAW, etc.) and PDF pages to JPEG format.
 
 ```powershell
 bpdf convert <INPUTS>... [OPTIONS]
 ```
 
-**Параметры:**
-- `<INPUTS>...` — Исходные изображения или PDF-файлы (включая диапазоны страниц для PDF: `doc.pdf:1-5`).
-- `-o, --out <PATH>` — Директория назначения для сохранённых JPEG-файлов.
-- `--render` — Для PDF: принудительно рендерить страницы в JPEG вместо извлечения встроенных картинок (полезно для принудительного рендера сканов).
-- `--long-edge <PX>` — Максимальный размер длинной стороны изображения.
-- `--short-edge <PX>` — Минимальный размер короткой стороны изображения.
-- `--orient <MODE>` — Принудительная ориентация (`landscape` или `portrait`).
-- `-q, --quality <0-100>` — Качество JPEG (переопределяет глобальный конфиг).
-- `--keep-icc[=true|false]` — Сохранять цветовые профили ICC.
-- `--ffmpeg <PATH>` — Путь к FFmpeg для внешних форматов изображений и резервного декодирования.
-- `--force` — Разрешить замену уже существующих выходных файлов, включая конвертацию на месте. Коллизии, при которых два входных файла дают один выходной путь, запрещены даже с `--force`.
+---
 
 ### 14. `bpdf doctor`
-Проверяет окружение, валидность конфигурации, доступность утилит, декодеров RAW (Pure Rust / WIC) и ключей API.
+Validates runtime environment, configuration file, helper binaries (`ffmpeg`, `powershell`, MS Office), RAW decoders, and Groq API authentication.
 
 ```powershell
 bpdf doctor
 ```
 
-Проверка API Groq выполняется безопасным запросом списка моделей без отправки изображений и списания OCR-лимитов. Ключи API и учетные данные в выводе маскируются.
-
 ---
 
-## Форматы входа и селекторы страниц
+## Page Selection Syntax
 
-### Форматы изображений
+In commands like `extract`, `rotate`, `resize`, `stamp`, `ocr`, and input specs:
+- `all` — all pages;
+- `first` — first page;
+- `last` (or `l`) — last page;
+- `even` — even pages (2, 4, 6...);
+- `odd` — odd pages (1, 3, 5...);
+- `1-5,8,last` — combination of individual pages and ranges.
 
-- Встроенный Rust-декодер используется для JPEG, PNG, BMP, GIF, TIFF, WebP и APNG. Для BMP/GIF/TIFF/WebP/APNG при ошибке встроенного декодера автоматически пробуется FFmpeg.
-- Через FFmpeg обрабатываются HEIC/HEIF, AVIF, PSD, JPEG 2000 (`.jp2`, `.j2k`, `.j2c`, `.jpc`, `.jpf`, `.jpx`), JPEG-LS (`.jls`), DDS, EXR, HDR, QOI, TGA, PCX, PNM (`.pnm`, `.ppm`, `.pgm`, `.pbm`, `.pam`), SGI, XBM, DPX, FITS (`.fits`, `.fit`, `.fts`), PGX, Sun Raster, XWD и PIX. Берётся первый видеопоток и первый кадр.
-- Через встроенные кодеки Windows Imaging Component обрабатываются JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO. Для ICO выбирается изображение с наибольшим разрешением.
-- Снимки фотокамер `.3fr`, `.arw`, `.bay`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw` и `.x3f` по умолчанию декодируются в **Pure Rust** без внешних утилит и кодеков через извлечение полноразмерного аппаратного JPEG-превью камеры. При необходимости полной проявки сенсора на Windows через WIC используется опция `raw_develop = true` в `config.toml`.
-- При `merge` все логические страницы TIFF и все кадры GIF/APNG/анимированного WebP добавляются в PDF по порядку. Ограничение безопасности — не более 10 000 кадров из одного файла. `convert`, `ocr` и `strip` работают с одним основным кадром.
-- JPEG XL не заявлен как поддерживаемый: декодер JXL отсутствует во многих сборках FFmpeg.
-
-### Электронные книги и текстовые форматы
-
-- **Электронные книги:** `.epub`, `.fb2`, `.fb2.zip` (распаковка архивов, автоизвлечение структуры глав, заголовков и метаданных Title/Author при конвертации в PDF).
-- Word: `.doc`, `.docx`, `.rtf`, `.odt`.
-- Excel: `.xls`, `.xlsx`, `.ods`.
-- PowerPoint: `.ppt`, `.pptx`, `.pps`, `.ppsx`, `.odp`.
-- Текст: `.md`, `.txt`, `.json`, `.jsonc`, `.xml`, `.yaml`, `.yml`, `.log`, `.ini`, `.cfg`, `.csv`, `.tsv`, а также **любые другие текстовые файлы и файлы исходного кода** (`.rs`, `.py`, `.c`, `.cpp`, `.js`, `.sql`, `LICENSE`, `.env` и т.д.), автоопределяемые по содержимому (эвристика валидации UTF-8 / ASCII).
-- Если все входы текстовые, по умолчанию они объединяются как текст. Явный выход `-o result.pdf` включает рендеринг текста в PDF.
-
-### Синтаксис диапазонов страниц
-В командах `extract`, `rotate`, `resize`, `stamp`, а также непосредственно во входных путях для `merge` поддерживается следующий синтаксис:
-- `all` — все страницы;
-- `first` — первая страница;
-- `last` (или `l`) — последняя страница;
-- `even` — четные страницы (2, 4, 6...);
-- `odd` — нечетные страницы (1, 3, 5...);
-- `1-5,8,last` — комбинация одиночных страниц и диапазонов.
-
-### Указание страниц прямо во входе (Input Spec)
-При объединении документов можно выбирать конкретные страницы отдельного PDF прямо в командной строке:
+### Per-Input Page Specifier in `merge`
 ```powershell
-bpdf merge scan.jpg report.pdf:1-3,last notes.txt -o result.pdf
+bpdf merge cover.jpg report.pdf:1-3,last notes.txt -o combined.pdf
 ```
 
-### Списки файлов (Манифесты `@list.txt`)
-Вы можете передавать текстовые файлы со списком входов, предваряя путь символом `@`:
+### File Lists (`@manifest.txt`)
 ```powershell
 bpdf merge @files.txt -o output.pdf
 ```
-Формат файла `files.txt`:
+
+*Example `files.txt`:*
 ```text
-# Комментарии игнорируются
+# Comments are ignored
 C:\docs\cover.jpg
 C:\docs\report.pdf:1-10
 C:\docs\appendix.pdf:even
 ```
 
-### Шаблоны (Globs) и директории
-Утилита автоматически расширяет маски файлов (`*.png`, `scans/*.pdf`) и сортирует файлы по естественному алфавитно-цифровому порядку (Natural Sort: `page1.jpg`, `page2.jpg`, `page10.jpg`). При передаче каталога обрабатываются только файлы непосредственно в нём; вложенные каталоги автоматически не обходятся.
-
 ---
 
-## Правила перезаписи файлов (In-place)
+## Configuration (`config.toml`)
 
-Во избежание случайной потери данных утилита придерживается следующих правил:
-1. **PDF-модификаторы (`rotate`, `resize`, `optimize`, `stamp`, `metadata set`):** Чтобы перезаписать исходный файл на месте, требуется явно передать его путь через флаг `-o` (например: `bpdf rotate doc.pdf 90 -o doc.pdf`). Без `-o` создается новый файл с суффиксом (например, `doc_rotated.pdf`).
-2. **Очистка метаданных (`strip`):** По умолчанию работает **in-place** (на месте), если не передан флаг `-o`.
-3. **Конвертация (`convert`):** Любая замена существующего файла, включая исходник (например, `bpdf convert photo.jpg`), требует `--force`. Если несколько входов дают одинаковый выходной путь, команда завершится ошибкой, чтобы не потерять ранее созданный результат.
-4. **Команда `extract`:** Категорически запрещает перезапись исходного PDF.
+`bpdf` automatically resolves configuration files in the following order:
+1. Path passed via `--config <PATH>`;
+2. `config.toml` in the current working directory;
+3. `config.toml` in the executable's folder.
 
----
-
-## Конфигурация (`config.toml`)
-
-Параметры по умолчанию можно настроить в файле `config.toml`.
-Файл ищется в следующей последовательности:
-1. Путь из флага `--config <PATH>`;
-2. `config.toml` в текущем рабочем каталоге;
-3. `config.toml` в папке с исполняемым файлом `bpdf.exe`.
-
-### Пример файла конфигурации
+### Example `config.toml`
 
 ```toml
-# API Ключ Groq для OCR
+# Groq API Key for Vision OCR
 groq_api_key = "%GROQ_API_KEY%"
 
-# Прокси-сервер (HTTP или SOCKS5)
+# Proxy Server (HTTP or SOCKS5)
 proxy = ""
 # proxy = "socks5://127.0.0.1:10808"
 
-# Метаданные по умолчанию
+# Default Metadata
 author = "My Company"
 creator = "bpdf toolkit"
 
-# Параметры обработки PDF
+# PDF Processing Defaults
 auto_rotate = false
 keep_icc = false
 optimize = false
 strip_metadata = false
 bookmarks = false
 page_size = "A4"
-jpeg_quality = 95 # качество JPEG при merge и optimize
-image_dpi = 150   # целевой DPI при merge и optimize; 0 отключает уменьшение
-raw_develop = false # false = быстрое Pure-Rust превью, true = полная проявка WIC
+jpeg_quality = 95 # JPEG quality for merge and optimize
+image_dpi = 150   # Target DPI for downsampling; 0 disables downsampling
+raw_develop = false # false = fast pure Rust preview, true = WIC sensor development
 
-# Настройки OCR
-ocr_engine = "groq" # "groq" (облачный Vision), "windows" (локальный WinOCR) или "auto"
+# OCR Settings
+ocr_engine = "groq" # "groq" (cloud vision), "windows" (local WinOCR), or "auto"
 ocr_model = "qwen/qwen3.6-27b"
 # ocr_prompt = '''Extract all text exactly as it appears...'''
 ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
@@ -418,96 +347,53 @@ ocr_cache = true
 ocr_timeout_seconds = 120
 ocr_max_tokens = 4096
 
-# Пути к сторонним утилитам
-# FFmpeg нужен для HEIC/HEIF, AVIF, PSD, JPEG 2000 и других внешних форматов
+# Third-party tools
 ffmpeg = 'ffmpeg'
 powershell = 'powershell.exe'
-# font_path = '%WINDIR%\Fonts\arial.ttf'
 office_timeout_seconds = 120
 ```
 
-Полный образец с комментариями и всеми необязательными полями находится в [`config.example.toml`](config.example.toml).
-
-В файле конфигурации поддерживаются подстановки переменных окружения в формате `%ИМЯ_ПЕРЕМЕННОЙ%` (например, `%GROQ_API_KEY%` или `%WINDIR%`), а также стандартные комментарии `#`. Для путей в Windows рекомендуется использовать одинарные кавычки `'...'` во избежание экранирования обратных слэшей.
+See [`config.example.toml`](config.example.toml) for complete descriptions of all parameters.
 
 ---
 
-## Примеры использования
+## Practical Examples
 
 ```powershell
-# Объединение изображений, отсканированного PDF и заметок в единый PDF
+# Merge images, scanned PDF, and notes into a single PDF
 bpdf merge scan.jpg invoice.pdf:1-3 notes.txt -o result.pdf
 
-# Объединение всех картинок из папки с приведением к A4 и автоповоротом
+# Merge all images in folder to A4 with auto-rotation and DPI optimization
 bpdf merge *.jpg -s A4 --auto-rotate --optimize -o scans.pdf
 
-# Объединение с сохранением исходной ориентации каждой страницы
-bpdf merge *.pdf -s A4 --no-rotate -o mixed.pdf
-
-# Наложение печати на документ в правый нижний угол с прозрачностью 60%
-bpdf merge invoice.pdf --stamp seal.png --stamp-pos br --stamp-op 0.6 -o stamped.pdf
-
-# Наложение печати с точным позиционированием (отступ 150 мм влево от правого нижнего угла)
-bpdf merge invoice.pdf --stamp seal.png --stamp-pos="-150,0" -o stamped.pdf
-
-# Распознавание текста со скана через Groq Vision в Markdown
+# Recognize scanned document with Groq Vision to Markdown
 bpdf ocr scan.jpg -o scan.md
 
-# Параллельное распознавание файлов с использованием прокси и кастомной модели
-bpdf ocr *.jpg --jobs 4 --proxy socks5://127.0.0.1:10808 --model qwen/qwen3.6-27b
+# Create Searchable PDF with invisible text layer
+bpdf ocr scan.pdf -o searchable.pdf
 
-# Конвертация AVIF и PSD в JPEG через FFmpeg
-bpdf convert photo.avif design.psd --out converted
+# In-place Searchable PDF generation across multiple files
+bpdf ocr doc1.pdf doc2.pdf --in-place
 
-# Конвертация JPEG 2000, JPEG-LS, JPEG XR и ICO в JPEG
-bpdf convert scan.jp2 medical.jls photo.jxr icon.ico --out converted
+# Convert camera RAW files to JPEG instantly (Pure Rust preview extraction)
+bpdf convert photo.cr3 photo.nef photo.arw --out converted/
 
-# Конвертация RAW-снимков фотоаппаратов в JPEG (быстрое превью без кодеков)
-bpdf convert photo.cr3 photo.nef photo.arw --out converted
-
-# Все страницы TIFF и кадры анимации становятся страницами PDF
-bpdf merge multipage.tiff animation.apng animation.webp -o pages.pdf
-
-# PowerPoint и OpenDocument в PDF
-bpdf merge slides.pptx report.odt table.ods -o office.pdf
-
-# Конвертация электронных книг (EPUB, FB2, FB2.ZIP) в PDF
-bpdf merge book.epub -o book.pdf
-bpdf merge story.fb2.zip -o story.pdf
-
-# JSON/XML/YAML как текстовый PDF
-bpdf merge data.json settings.xml config.yaml -o data.pdf
-
-# Наложение печати поверх документа с реалистичным смешиванием чернил (multiply)
-bpdf stamp document.pdf stamp.png --position="-130,30" --mode over --blend multiply
-
-# Очистка EXIF метаданных у всех фото в папке на месте (in-place)
+# Strip EXIF metadata from all photos in folder in-place
 bpdf strip photos/*.jpg
 
-# Разбиение PDF на отдельные страницы
-bpdf split document.pdf output_pages/
+# Apply realistic wet-ink stamp to PDF
+bpdf stamp contract.pdf seal.png --position br --blend multiply -o contract_stamped.pdf
 
-# Извлечение первых 5 страниц и последней страницы
-bpdf extract document.pdf 1-5,last selected.pdf
-
-# Поворот всех четных страниц PDF на 90 градусов на месте
-bpdf rotate document.pdf 90 --pages even -o document.pdf
-
-# Приведение страниц PDF к формату Letter
-bpdf resize document.pdf --size Letter -o document_letter.pdf
-
-# Извлечение встроенного текстового слоя в файл
-bpdf text document.pdf -o text_layer.txt
-
-# Установка свойств документа PDF
-bpdf metadata set document.pdf --title "Отчет 2026" --author "Иван Иванов" -o document.pdf
-
-# Извлечение картинки/конвертация изображений в JPEG
-bpdf convert photo.png document.pdf -o converted_jpegs/
-
-# Проверка работоспособности системы и интеграций
+# System & integrations health check
 bpdf doctor
-
-# Интеграция со скриптами в режиме NDJSON
-bpdf --json merge *.jpg -o result.pdf
 ```
+
+---
+
+## License
+
+Licensed under either of:
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
