@@ -6,49 +6,17 @@ mod platform {
 
     use anyhow::{Context, Result, anyhow, bail};
     use image::{DynamicImage, RgbaImage};
-    use windows::Win32::Foundation::{GENERIC_READ, RPC_E_CHANGED_MODE};
+    use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapCodecInfo,
         IWICBitmapDecoder, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
         WICComponentEnumerateDefault, WICDecodeMetadataCacheOnDemand, WICDecoder,
     };
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
-    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
     use windows::core::{Interface, PCWSTR};
 
     use super::Path;
-
-    struct ComApartment {
-        uninitialize: bool,
-    }
-
-    impl ComApartment {
-        fn initialize() -> Result<Self> {
-            let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            if result.is_ok() {
-                return Ok(Self { uninitialize: true });
-            }
-            if result == RPC_E_CHANGED_MODE {
-                return Ok(Self {
-                    uninitialize: false,
-                });
-            }
-            result
-                .ok()
-                .context("failed to initialize COM for Windows image decoding")?;
-            unreachable!()
-        }
-    }
-
-    impl Drop for ComApartment {
-        fn drop(&mut self) {
-            if self.uninitialize {
-                unsafe { CoUninitialize() };
-            }
-        }
-    }
+    use crate::com::ComApartment;
 
     pub struct Decoder {
         decoder: IWICBitmapDecoder,

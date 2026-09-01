@@ -73,7 +73,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             reject_pages(spec)?;
             let text = fs::read_to_string(&spec.path)
                 .with_context(|| format!("failed to read text file {}", spec.path.display()))?;
-            textpdf::render(&text, &options.text)
+            textpdf::render(text.trim_start_matches('\u{feff}'), &options.text)
         }
         Some(format) if format.is_ebook() => {
             reject_pages(spec)?;

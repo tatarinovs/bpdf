@@ -35,6 +35,7 @@ pub fn is_available() -> bool {
 pub fn available_languages() -> Result<Vec<String>> {
     #[cfg(windows)]
     {
+        let _apartment = crate::com::ComApartment::initialize()?;
         let languages = windows::Media::Ocr::OcrEngine::AvailableRecognizerLanguages()
             .context("failed to query Windows OCR languages")?;
         let mut result = Vec::new();
@@ -58,6 +59,7 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
     }
     #[cfg(windows)]
     {
+        let _apartment = crate::com::ComApartment::initialize()?;
         use windows::Globalization::Language;
         use windows::Graphics::Imaging::{BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
         use windows::Media::Ocr::OcrEngine;

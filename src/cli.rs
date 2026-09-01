@@ -109,7 +109,7 @@ pub enum Command {
         out: Option<PathBuf>,
     },
     /// Check configuration and external integrations without exposing secrets.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Apply a PNG stamp to an existing PDF.
     Stamp(StampArgs),
     /// Optimize PDF structure and downsample oversized images.
@@ -159,6 +159,13 @@ pub enum MetadataCommand {
         #[arg(long)]
         creator: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Delete all cached OCR responses and report reclaimed disk space.
+    #[arg(long, aliases = ["clear-cache"])]
+    pub clean_cache: bool,
 }
 
 #[derive(Debug, Args)]

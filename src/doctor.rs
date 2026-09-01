@@ -1,17 +1,34 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
+use crate::cli::DoctorArgs;
 use crate::config::Config;
 use crate::ocr::{OcrEngine, OcrOptions};
 use crate::office::{self, OfficeOptions};
 use crate::{output, process, textpdf};
 
-pub fn run(config: &Config) -> Result<()> {
+pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
+    if args.clean_cache {
+        let (removed, bytes) = clean_cache(&config.ocr_cache_dir)?;
+        output::result(
+            "clean_cache",
+            format!(
+                "Cleaned OCR cache at {}: removed {removed} file(s), freed {bytes} bytes",
+                config.ocr_cache_dir.display()
+            ),
+            json!({
+                "cache_dir": config.ocr_cache_dir.display().to_string(),
+                "removed_files": removed,
+                "bytes_freed": bytes,
+            }),
+        );
+    }
+
     let mut failures = 0usize;
 
     check(
@@ -231,4 +248,47 @@ fn probe_cache(directory: &PathBuf) -> Result<()> {
     fs::write(&path, b"bpdf")?;
     fs::remove_file(path)?;
     Ok(())
+}
+
+pub fn clean_cache(directory: &Path) -> Result<(usize, u64)> {
+    if !directory.exists() {
+        return Ok((0, 0));
+    }
+    let mut removed_count = 0usize;
+    let mut bytes_freed = 0u64;
+    let entries = fs::read_dir(directory)
+        .with_context(|| format!("failed to read cache directory {}", directory.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(meta) = entry.metadata() {
+                bytes_freed = bytes_freed.saturating_add(meta.len());
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed_count += 1;
+            }
+        }
+    }
+    Ok((removed_count, bytes_freed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn cleans_cache_directory_files_and_counts_bytes() {
+        let temp = tempdir().unwrap();
+        let file1 = temp.path().join("a.json");
+        let file2 = temp.path().join("b.md");
+        fs::write(&file1, b"12345").unwrap();
+        fs::write(&file2, b"1234567").unwrap();
+
+        let (count, bytes) = clean_cache(temp.path()).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 12);
+        assert!(!file1.exists());
+        assert!(!file2.exists());
+    }
 }

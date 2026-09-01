@@ -3,6 +3,7 @@ pub mod config;
 
 mod archive;
 mod atomic;
+mod com;
 mod commands;
 mod doctor;
 mod ebook;

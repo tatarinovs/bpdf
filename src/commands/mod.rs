@@ -68,7 +68,7 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
             fail_fast,
         ),
         Command::Text { input, out } => pdf_edit::text(&input, out.as_deref()),
-        Command::Doctor => doctor::run(&config),
+        Command::Doctor(args) => doctor::run(&config, &args),
         Command::Stamp(args) => pdf_edit::stamp(args),
         Command::Optimize { input, out } => {
             common::edit_pdf(&input, out, "optimized", |document| {

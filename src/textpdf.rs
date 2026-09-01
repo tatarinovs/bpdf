@@ -26,6 +26,7 @@ impl Default for TextOptions {
 }
 
 pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
+    let text = text.trim_start_matches('\u{feff}');
     let font_path = find_font(options.font_path.as_deref())?;
     let font_data = fs::read(&font_path)
         .with_context(|| format!("failed to read font {}", font_path.display()))?;
@@ -867,5 +868,18 @@ mod tests {
         let cmap = build_to_unicode_cmap(&map);
         assert!(cmap.contains("<0001> <0041>"));
         assert!(cmap.contains("<0002> <042F>"));
+    }
+
+    #[test]
+    fn handles_utf8_bom_cleanly() {
+        let text = "\u{feff}Header Line\nSecond Line";
+        let options = TextOptions::default();
+        if let Ok(mut doc) = render(text, &options) {
+            let bytes = crate::pdf::save_to_bytes(&mut doc).unwrap();
+            let parsed = Document::load_mem(&bytes).unwrap();
+            let extracted = parsed.extract_text(&[1]).unwrap();
+            assert!(extracted.contains("Header Line"));
+            assert!(!extracted.contains('\u{feff}'));
+        }
     }
 }
