@@ -58,6 +58,7 @@ if errorlevel 1 goto :error
 copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
 copy /y "%CD%\config.example.toml" "%CD%\dist\config.example.toml" >nul || goto :error
 copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
+copy /y "%CD%\README.en.md" "%CD%\dist\README.en.md" >nul || goto :error
 copy /y "%CD%\bpdf.bar" "%CD%\dist\bpdf.bar" >nul || goto :error
 
 echo.
