@@ -9,7 +9,7 @@ use tempfile::Builder;
 /// destination. `tempfile::persist` uses the platform replacement primitive,
 /// including replacement of an existing file on Windows.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(directory)
         .with_context(|| format!("failed to create {}", directory.display()))?;
 

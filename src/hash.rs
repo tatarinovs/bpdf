@@ -21,8 +21,8 @@ pub fn sha256_hex(parts: &[&[u8]]) -> String {
 
     fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
         let mut words = [0u32; 64];
-        for (index, bytes) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(bytes.try_into().expect("four-byte chunk"));
+        for (index, chunk) in block.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)

@@ -11,6 +11,7 @@ mod platform {
 
     impl ComApartment {
         pub fn initialize() -> Result<Self> {
+            // SAFETY: Initializing COM apartment with standard multithreaded flag
             let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
             if result.is_ok() || result == RPC_E_CHANGED_MODE {
                 return Ok(Self);

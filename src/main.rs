@@ -19,7 +19,7 @@ fn pause_if_standalone() {
             return;
         }
 
-        // Check if we are the only process attached to this console
+        // SAFETY: Querying console process list into fixed-size array
         let mut processes = [0u32; 2];
         let count =
             unsafe { windows::Win32::System::Console::GetConsoleProcessList(&mut processes) };

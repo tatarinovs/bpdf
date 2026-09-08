@@ -1,7 +1,7 @@
 # bpdf — Fast, Lightweight PDF & Document Toolkit in Rust
 
-[![Version](https://img.shields.io/badge/Version-0.5.2-blue.svg)](Cargo.toml)
-[![Rust](https://img.shields.io/badge/Rust-1.97%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
+[![Version](https://img.shields.io/badge/Version-0.5.4-blue.svg)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
 [![Language](https://img.shields.io/badge/Язык-Русский-blue.svg)](README.ru.md)
 

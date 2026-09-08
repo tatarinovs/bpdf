@@ -27,6 +27,7 @@ mod platform {
     impl Decoder {
         pub fn open(path: &Path) -> Result<Self> {
             let apartment = ComApartment::initialize()?;
+            // SAFETY: Creating COM factory singleton with valid CLSID and standard flags
             let factory: IWICImagingFactory =
                 unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
                     .context("failed to create Windows Imaging Component factory")?;
@@ -35,6 +36,7 @@ mod platform {
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect::<Vec<_>>();
+            // SAFETY: Passing null-terminated wide string from valid path
             let decoder = unsafe {
                 factory.CreateDecoderFromFilename(
                     PCWSTR(wide_path.as_ptr()),
@@ -57,6 +59,7 @@ mod platform {
         }
 
         pub fn frame_count(&self) -> Result<u32> {
+            // SAFETY: Calling method on valid decoder instance
             let count = unsafe { self.decoder.GetFrameCount() }
                 .context("failed to read WIC image frame count")?;
             if count == 0 {
@@ -66,18 +69,22 @@ mod platform {
         }
 
         pub fn decode_frame(&self, index: u32) -> Result<DynamicImage> {
+            // SAFETY: Requesting frame within bounds (caller validates index)
             let frame = unsafe { self.decoder.GetFrame(index) }
                 .with_context(|| format!("failed to open WIC image frame {}", index + 1))?;
             let mut width = 0;
             let mut height = 0;
+            // SAFETY: Passing mutable pointers to local u32 variables
             unsafe { frame.GetSize(&mut width, &mut height) }
                 .context("failed to read WIC image dimensions")?;
             if width == 0 || height == 0 {
                 bail!("WIC decoder returned empty image dimensions");
             }
 
+            // SAFETY: Creating converter from valid factory
             let converter = unsafe { self.factory.CreateFormatConverter() }
                 .context("failed to create WIC pixel converter")?;
+            // SAFETY: Converting valid frame to RGBA with standard parameters
             unsafe {
                 converter.Initialize(
                     &frame,
@@ -98,6 +105,7 @@ mod platform {
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| anyhow!("WIC image is too large"))?;
             let mut pixels = vec![0; length];
+            // SAFETY: Copying into pre-allocated buffer with correct stride and size
             unsafe { converter.CopyPixels(std::ptr::null(), stride, &mut pixels) }
                 .context("failed to copy decoded WIC pixels")?;
             let image = RgbaImage::from_raw(width, height, pixels)
@@ -108,9 +116,11 @@ mod platform {
         fn largest_frame_index(&self) -> Result<u32> {
             let mut largest = (0, 0u64);
             for index in 0..self.frame_count()? {
+                // SAFETY: Index is within frame_count bounds
                 let frame = unsafe { self.decoder.GetFrame(index) }?;
                 let mut width = 0;
                 let mut height = 0;
+                // SAFETY: Passing mutable pointers to local u32 variables
                 unsafe { frame.GetSize(&mut width, &mut height) }?;
                 let area = u64::from(width) * u64::from(height);
                 if area > largest.1 {
@@ -128,9 +138,11 @@ mod platform {
 
     pub fn availability() -> Result<String> {
         let _apartment = ComApartment::initialize()?;
+        // SAFETY: Creating COM factory singleton with valid CLSID
         let factory: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
                 .context("Windows Imaging Component is unavailable")?;
+        // SAFETY: Enumerating codecs with standard flags
         let codecs = unsafe {
             factory.CreateComponentEnumerator(
                 WICDecoder.0 as u32,
@@ -141,6 +153,7 @@ mod platform {
         loop {
             let mut item = [None];
             let mut fetched = 0;
+            // SAFETY: Fetching COM objects into valid array with count
             let status = unsafe { codecs.Next(&mut item, Some(&mut fetched)) };
             if fetched == 0 {
                 break;
@@ -154,12 +167,14 @@ mod platform {
             let Ok(codec) = item.cast::<IWICBitmapCodecInfo>() else {
                 continue;
             };
+            // SAFETY: Reading codec metadata into valid buffer with size tracking
             let extensions =
                 codec_string(|buffer, actual| unsafe { codec.GetFileExtensions(buffer, actual) })?;
             if extensions
                 .split(',')
                 .any(|extension| extension.trim().eq_ignore_ascii_case(".dng"))
             {
+                // SAFETY: Reading codec name into valid buffer
                 let name = codec_string(|buffer, actual| unsafe {
                     codec.GetFriendlyName(buffer, actual)
                 })?;

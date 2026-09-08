@@ -29,12 +29,12 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
                 &options.image,
                 Some(&options.text.page_size),
             )?;
-            let mut documents = jpegs
+            let documents = jpegs
                 .into_iter()
                 .map(|jpeg| pdf::jpeg_document(jpeg, &options.text.page_size))
                 .collect::<Result<Vec<_>>>()?;
             if documents.len() == 1 {
-                Ok(documents.pop().expect("one image document"))
+                documents.into_iter().next().ok_or_else(|| anyhow::anyhow!("no image documents"))
             } else {
                 pdf::merge_documents(documents)
             }

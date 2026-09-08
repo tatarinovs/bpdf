@@ -52,7 +52,7 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) ->
     }
 
     if documents.len() == 1 {
-        Ok(documents.pop().expect("one document"))
+        documents.into_iter().next().ok_or_else(|| anyhow::anyhow!("no documents"))
     } else {
         pdf::merge_documents(documents)
     }

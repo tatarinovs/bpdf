@@ -1,8 +1,8 @@
 [package]
 name = "bpdf"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.89"
 description = "Second-generation loss-conscious PDF and image processing toolkit"
 license = "MIT"
 repository = "https://github.com/tatarinovs/bpdf"
