@@ -101,6 +101,13 @@ pub fn strip_jpeg(input: &[u8], keep_icc: bool) -> Result<Vec<u8>> {
         if !drop {
             output.extend_from_slice(&[0xff, marker]);
             output.extend_from_slice(&input[position..segment_end]);
+        } else if marker == 0xe1
+            && let Some(orientation) =
+                exif_payload(&input[position + 2..segment_end]).and_then(exif_orientation)
+            && orientation != 1
+        {
+            // The orientation is display geometry, not private metadata.
+            output.extend_from_slice(&orientation_segment(orientation));
         }
         position = segment_end;
 
@@ -169,116 +176,152 @@ fn detect_png_dpi(bytes: &[u8]) -> Option<f64> {
 }
 
 fn detect_jpeg_dpi(bytes: &[u8]) -> Option<f64> {
-    let mut offset = 2;
-    while offset + 4 <= bytes.len() {
-        if bytes[offset] != 0xFF {
-            break;
-        }
-        let marker = bytes[offset + 1];
-        if marker == 0xDA || marker == 0xD9 {
-            break;
-        }
-        let length = u16::from_be_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) as usize;
-        if length < 2 || offset + 2 + length > bytes.len() {
-            break;
-        }
-        let segment_data = &bytes[offset + 4..offset + 2 + length];
-
-        if marker == 0xE0 && segment_data.starts_with(b"JFIF\0") && segment_data.len() >= 9 {
-            let units = segment_data[7];
-            let x_density = u16::from_be_bytes(segment_data[8..10].try_into().ok()?) as f64;
-            if x_density > 0.0 {
-                if units == 1 {
-                    return Some(x_density);
-                } else if units == 2 {
-                    return Some((x_density * 2.54).round());
-                }
+    for (marker, data) in jpeg_segments(bytes) {
+        if marker == 0xE0 && data.starts_with(b"JFIF\0") && data.len() >= 10 {
+            let units = data[7];
+            let density = f64::from(u16::from_be_bytes([data[8], data[9]]));
+            match units {
+                1 if density > 0.0 => return Some(density),
+                2 if density > 0.0 => return Some((density * 2.54).round()),
+                _ => {}
             }
         }
-
-        if marker == 0xE1 && segment_data.starts_with(b"Exif\0\0") && segment_data.len() >= 14 {
-            let exif = &segment_data[6..];
-            if let Some(dpi) = parse_exif_dpi(exif) {
-                return Some(dpi);
-            }
+        if marker == 0xE1
+            && let Some(dpi) = exif_payload(data).and_then(exif_dpi)
+        {
+            return Some(dpi);
         }
-
-        offset += 2 + length;
     }
     None
 }
 
-fn parse_exif_dpi(exif: &[u8]) -> Option<f64> {
-    if exif.len() < 8 {
-        return None;
-    }
-    let is_le = match &exif[0..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    let read_u16 = |buf: &[u8], pos: usize| -> Option<u16> {
-        let b = buf.get(pos..pos + 2)?;
-        Some(if is_le {
-            u16::from_le_bytes(b.try_into().ok()?)
-        } else {
-            u16::from_be_bytes(b.try_into().ok()?)
-        })
-    };
-    let read_u32 = |buf: &[u8], pos: usize| -> Option<u32> {
-        let b = buf.get(pos..pos + 4)?;
-        Some(if is_le {
-            u32::from_le_bytes(b.try_into().ok()?)
-        } else {
-            u32::from_be_bytes(b.try_into().ok()?)
-        })
-    };
+/// EXIF orientation (1-8) of a JPEG; 1 when absent or invalid.
+pub fn jpeg_orientation(bytes: &[u8]) -> u16 {
+    jpeg_segments(bytes)
+        .filter(|(marker, _)| *marker == 0xE1)
+        .find_map(|(_, data)| exif_payload(data).and_then(exif_orientation))
+        .filter(|orientation| (1..=8).contains(orientation))
+        .unwrap_or(1)
+}
 
-    let ifd0_offset = read_u32(exif, 4)? as usize;
-    if ifd0_offset + 2 > exif.len() {
-        return None;
-    }
-    let num_entries = read_u16(exif, ifd0_offset)? as usize;
-    let mut x_res: Option<f64> = None;
-    let mut unit: u16 = 2;
-
-    for i in 0..num_entries {
-        let entry_offset = ifd0_offset + 2 + i * 12;
-        if entry_offset + 12 > exif.len() {
-            break;
+/// Header segments (marker, payload) up to the start of scan data.
+fn jpeg_segments(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut offset = if bytes.starts_with(&[0xFF, 0xD8]) {
+        2
+    } else {
+        bytes.len()
+    };
+    std::iter::from_fn(move || {
+        let header = bytes.get(offset..offset + 4)?;
+        let marker = header[1];
+        if header[0] != 0xFF || marker == 0xDA || marker == 0xD9 {
+            return None;
         }
-        let tag = read_u16(exif, entry_offset)?;
-        let val_offset = read_u32(exif, entry_offset + 8)? as usize;
+        let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        let data = bytes.get(offset + 4..(offset + 2).checked_add(length)?)?;
+        offset += 2 + length;
+        Some((marker, data))
+    })
+}
 
+/// TIFF structure inside an APP1 `Exif` segment.
+fn exif_payload(segment: &[u8]) -> Option<&[u8]> {
+    segment.strip_prefix(b"Exif\0\0")
+}
+
+struct Exif<'a> {
+    data: &'a [u8],
+    little_endian: bool,
+}
+
+impl<'a> Exif<'a> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        let little_endian = match data.get(..2)? {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        Some(Self {
+            data,
+            little_endian,
+        })
+    }
+
+    fn u16_at(&self, position: usize) -> Option<u16> {
+        let bytes = self.data.get(position..position + 2)?.try_into().ok()?;
+        Some(if self.little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        })
+    }
+
+    fn u32_at(&self, position: usize) -> Option<u32> {
+        let bytes = self.data.get(position..position + 4)?.try_into().ok()?;
+        Some(if self.little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        })
+    }
+
+    /// IFD0 entries as (tag, offset of the entry's value field).
+    fn ifd0(&self) -> impl Iterator<Item = (u16, usize)> + '_ {
+        let start = self.u32_at(4).map(|offset| offset as usize);
+        let count = start.and_then(|start| self.u16_at(start)).unwrap_or(0);
+        (0..usize::from(count)).map_while(move |index| {
+            let entry = start? + 2 + index * 12;
+            Some((self.u16_at(entry)?, entry + 8))
+        })
+    }
+
+    fn rational_at(&self, offset: usize) -> Option<f64> {
+        let numerator = f64::from(self.u32_at(offset)?);
+        let denominator = f64::from(self.u32_at(offset + 4)?);
+        (denominator > 0.0).then(|| numerator / denominator)
+    }
+}
+
+fn exif_orientation(payload: &[u8]) -> Option<u16> {
+    let exif = Exif::parse(payload)?;
+    let value = exif
+        .ifd0()
+        .find(|(tag, _)| *tag == 0x0112)
+        .and_then(|(_, value)| exif.u16_at(value))?;
+    Some(value)
+}
+
+fn exif_dpi(payload: &[u8]) -> Option<f64> {
+    let exif = Exif::parse(payload)?;
+    let mut resolution = None;
+    let mut unit = 2;
+    for (tag, value) in exif.ifd0() {
         match tag {
             0x011A => {
-                if val_offset + 8 <= exif.len() {
-                    let num = read_u32(exif, val_offset)? as f64;
-                    let den = read_u32(exif, val_offset + 4)? as f64;
-                    if den > 0.0 {
-                        x_res = Some(num / den);
-                    }
-                }
+                resolution = exif
+                    .u32_at(value)
+                    .and_then(|offset| exif.rational_at(offset as usize));
             }
-            0x0128 => {
-                let u = read_u16(exif, entry_offset + 8)?;
-                unit = u;
-            }
+            0x0128 => unit = exif.u16_at(value)?,
             _ => {}
         }
     }
-
-    let res = x_res?;
-    if res <= 0.0 {
-        return None;
-    }
-    if unit == 2 {
-        Some(res.round())
-    } else if unit == 3 {
-        Some((res * 2.54).round())
+    let resolution = resolution.filter(|value| *value > 0.0)?;
+    Some(if unit == 3 {
+        (resolution * 2.54).round()
     } else {
-        Some(res.round())
-    }
+        resolution.round()
+    })
+}
+
+/// A minimal big-endian APP1 segment holding only the orientation tag.
+fn orientation_segment(orientation: u16) -> Vec<u8> {
+    let mut segment = vec![0xFF, 0xE1, 0x00, 0x22];
+    segment.extend_from_slice(b"Exif\0\0MM\0\x2A\0\0\0\x08\0\x01");
+    segment.extend_from_slice(&[0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01]);
+    segment.extend_from_slice(&orientation.to_be_bytes());
+    segment.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    segment
 }
 
 #[cfg(test)]
@@ -428,5 +471,42 @@ mod tests {
 
         let dummy_jpeg = b"\xFF\xD8\xFF\xD9";
         assert_eq!(image_dpi(dummy_jpeg), None);
+    }
+
+    fn jpeg_with_orientation(orientation: u16) -> (Vec<u8>, Vec<u8>) {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4, 2, Rgb([20, 40, 60])));
+        let mut original = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut original), ImageFormat::Jpeg)
+            .unwrap();
+        // Little-endian EXIF with a camera make plus the orientation tag.
+        let mut exif = b"Exif\0\0II\x2A\0\x08\0\0\0\x02\0".to_vec();
+        exif.extend_from_slice(&[0x0F, 0x01, 0x02, 0x00, 0x04, 0, 0, 0]);
+        exif.extend_from_slice(b"Cam\0");
+        exif.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0, 0, 0]);
+        exif.extend_from_slice(&orientation.to_le_bytes());
+        exif.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut tagged = original[..2].to_vec();
+        tagged.extend_from_slice(&[0xFF, 0xE1]);
+        tagged.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        tagged.extend_from_slice(&exif);
+        tagged.extend_from_slice(&original[2..]);
+        (original, tagged)
+    }
+
+    #[test]
+    fn strip_keeps_only_the_orientation_tag() {
+        let (_, tagged) = jpeg_with_orientation(6);
+        assert_eq!(jpeg_orientation(&tagged), 6);
+        let stripped = strip_jpeg(&tagged, false).unwrap();
+        assert_eq!(jpeg_orientation(&stripped), 6);
+        assert!(memchr::memmem::find(&stripped, b"Cam").is_none());
+        assert!(image::load_from_memory(&stripped).is_ok());
+    }
+
+    #[test]
+    fn strip_drops_neutral_orientation() {
+        let (original, tagged) = jpeg_with_orientation(1);
+        assert_eq!(strip_jpeg(&tagged, false).unwrap(), original);
     }
 }

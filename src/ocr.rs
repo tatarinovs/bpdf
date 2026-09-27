@@ -273,7 +273,15 @@ impl OcrEngine {
             }
             Some(format) if format.is_image() => {
                 reject_pages(&spec.path, spec.pages.as_deref())?;
-                let jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
+                let mut jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
+                // Word boxes refer to the pixels the engine sees, so a photo
+                // rotated only by its EXIF tag is made upright first.
+                if crate::metadata::jpeg_orientation(&jpeg) != 1 {
+                    jpeg = imageconv::encode_jpeg_on_white(
+                        &imageconv::decode_bytes(&jpeg)?,
+                        self.options.image.jpeg_quality,
+                    )?;
+                }
                 let info = pdf::jpeg_info(&jpeg)?;
                 let (width, height) = (u32::from(info.width), u32::from(info.height));
                 output::info(format!("OCR {} (searchable layer)...", spec.path.display()));

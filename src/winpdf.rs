@@ -4,9 +4,13 @@ use anyhow::Result;
 
 use crate::imageconv::ImageOptions;
 
-/// Render every page to JPEG with the Windows PDF renderer, in page order.
+/// Render the given 1-based pages to JPEG with the Windows PDF renderer.
 #[cfg(windows)]
-pub fn render_pdf_to_jpegs(input: &Path, image_options: &ImageOptions) -> Result<Vec<Vec<u8>>> {
+pub fn render_pdf_to_jpegs(
+    input: &Path,
+    pages: &[usize],
+    image_options: &ImageOptions,
+) -> Result<Vec<Vec<u8>>> {
     use anyhow::{Context, bail};
     use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
     use windows::Graphics::Imaging::BitmapEncoder;
@@ -25,16 +29,16 @@ pub fn render_pdf_to_jpegs(input: &Path, image_options: &ImageOptions) -> Result
         .join()
         .context("failed to load PDF document via Windows API")?;
 
-    let count = pdf.PageCount()?;
-    if count == 0 {
-        bail!("PDF has no pages");
+    let count = pdf.PageCount()? as usize;
+    if let Some(page) = pages.iter().find(|page| **page == 0 || **page > count) {
+        bail!("page {page} is outside 1-{count}");
     }
     let options = PdfPageRenderOptions::new()?;
     options.SetBitmapEncoderId(BitmapEncoder::JpegEncoderId()?)?;
 
-    let mut pages = Vec::with_capacity(count as usize);
-    for index in 0..count {
-        let page = pdf.GetPage(index)?;
+    let mut rendered = Vec::with_capacity(pages.len());
+    for &number in pages {
+        let page = pdf.GetPage((number - 1) as u32)?;
         if image_options.image_dpi > 0 {
             let size = page.Size()?;
             let scale = f64::from(image_options.image_dpi) / 72.0;
@@ -46,19 +50,23 @@ pub fn render_pdf_to_jpegs(input: &Path, image_options: &ImageOptions) -> Result
         let stream = InMemoryRandomAccessStream::new()?;
         page.RenderWithOptionsToStreamAsync(&stream, &options)?
             .join()
-            .with_context(|| format!("failed to render page {}", index + 1))?;
+            .with_context(|| format!("failed to render page {number}"))?;
 
         let size = u32::try_from(stream.Size()?).context("rendered page is too large")?;
         let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
         reader.LoadAsync(size)?.join()?;
         let mut bytes = vec![0u8; size as usize];
         reader.ReadBytes(&mut bytes)?;
-        pages.push(bytes);
+        rendered.push(bytes);
     }
-    Ok(pages)
+    Ok(rendered)
 }
 
 #[cfg(not(windows))]
-pub fn render_pdf_to_jpegs(_input: &Path, _image_options: &ImageOptions) -> Result<Vec<Vec<u8>>> {
+pub fn render_pdf_to_jpegs(
+    _input: &Path,
+    _pages: &[usize],
+    _image_options: &ImageOptions,
+) -> Result<Vec<Vec<u8>>> {
     anyhow::bail!("PDF rendering is only supported on Windows 8.1+")
 }

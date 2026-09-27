@@ -5,10 +5,12 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use super::common::{edit_pdf, same_path, suffixed_output, write_output};
-use crate::cli::{MetadataCommand, StampArgs};
+use crate::cli::{MetadataCommand, NumberArgs, StampArgs, WatermarkArgs};
+use crate::config::Config;
 use crate::output;
 use crate::pdf;
 use crate::pdf::transform::{self, StampMode, StampOptions};
+use crate::textpdf::{self, TextMarkStyle};
 
 pub fn split(input: &Path, output_dir: Option<&Path>) -> Result<()> {
     let directory = output_dir.map(Path::to_path_buf).unwrap_or_else(|| {
@@ -79,6 +81,54 @@ pub fn stamp(args: StampArgs) -> Result<()> {
                 blend_mode: transform::BlendMode::parse(&blend)?,
             },
         )
+    })
+}
+
+pub fn number(args: NumberArgs, config: &Config) -> Result<()> {
+    if !args.format.contains("{n}") && !args.format.contains("{total}") {
+        bail!("--format must contain {{n}} or {{total}}");
+    }
+    let style = TextMarkStyle {
+        font_size: args.size,
+        position: args.position,
+        angle: 0.0,
+        opacity: args.opacity,
+        color: args.color,
+        pages: args.pages,
+        under: false,
+    };
+    let offset = args.start - 1;
+    edit_pdf(&args.input, args.out, "numbered", |document| {
+        textpdf::add_text_marks(
+            document,
+            &style,
+            config.font_path.as_deref(),
+            |number, total| {
+                args.format
+                    .replace("{n}", &(number as i64 + offset).to_string())
+                    .replace("{total}", &(total as i64 + offset).to_string())
+            },
+        )
+    })
+}
+
+pub fn watermark(args: WatermarkArgs, config: &Config) -> Result<()> {
+    if args.text.trim().is_empty() {
+        bail!("watermark text is empty");
+    }
+    let style = TextMarkStyle {
+        font_size: args.size,
+        position: args.position,
+        angle: args.angle,
+        opacity: args.opacity,
+        color: args.color,
+        pages: args.pages,
+        under: args.under,
+    };
+    edit_pdf(&args.input, args.out, "watermarked", |document| {
+        textpdf::add_text_marks(document, &style, config.font_path.as_deref(), |_, _| {
+            args.text.clone()
+        })
     })
 }
 

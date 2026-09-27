@@ -103,6 +103,7 @@ fn extract_one(
     if rotation == 0
         && !stream.dict.has(b"Decode")
         && let Some(jpeg) = embedded_jpeg(stream)
+        && crate::metadata::jpeg_orientation(jpeg) == 1
         && let Ok(info) = super::jpeg_info(jpeg)
         && matches!(info.components, 1 | 3)
     {
@@ -113,11 +114,17 @@ fn extract_one(
             height: u32::from(info.height),
         });
     }
-    let image = match rotation {
-        90 => decode(document, stream)?.rotate90(),
-        180 => decode(document, stream)?.rotate180(),
-        270 => decode(document, stream)?.rotate270(),
-        _ => decode(document, stream)?,
+    // Extracted images are shown upright: EXIF orientation first, then the
+    // page rotation.
+    let mut image = match embedded_jpeg(stream) {
+        Some(jpeg) => imageconv::decode_bytes(jpeg)?,
+        None => decode(document, stream)?,
+    };
+    image = match rotation {
+        90 => image.rotate90(),
+        180 => image.rotate180(),
+        270 => image.rotate270(),
+        _ => image,
     };
     Ok(ExtractedImage {
         label,

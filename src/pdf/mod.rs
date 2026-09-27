@@ -434,7 +434,7 @@ pub(crate) fn select_pages(document: &mut Document, expression: &str) -> Result<
     Ok(())
 }
 
-fn parse_page_selection(expression: &str, page_count: usize) -> Result<BTreeSet<usize>> {
+pub(crate) fn parse_page_selection(expression: &str, page_count: usize) -> Result<BTreeSet<usize>> {
     let expression = expression.trim().to_ascii_lowercase();
     if expression == "all" {
         return Ok((1..=page_count).collect());
@@ -528,16 +528,42 @@ pub(crate) fn image_placement(
     })
 }
 
+/// Image-space matrix (`cm` operands) drawing a stored JPEG into `rect`
+/// upright according to its EXIF orientation (1-8). The pixels themselves are
+/// never rotated, so the embedded JPEG stays byte-identical.
+fn oriented_image_matrix(orientation: u16, rect: &ImagePlacement) -> [f64; 6] {
+    let ImagePlacement {
+        x,
+        y,
+        width: w,
+        height: h,
+        ..
+    } = *rect;
+    match orientation {
+        2 => [-w, 0.0, 0.0, h, x + w, y],
+        3 => [-w, 0.0, 0.0, -h, x + w, y + h],
+        4 => [w, 0.0, 0.0, -h, x, y + h],
+        5 => [0.0, -h, -w, 0.0, x + w, y + h],
+        6 => [0.0, -h, w, 0.0, x, y + h],
+        7 => [0.0, h, w, 0.0, x, y],
+        8 => [0.0, h, -w, 0.0, x + w, y],
+        _ => [w, 0.0, 0.0, h, x, y],
+    }
+}
+
 pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> {
     let info = jpeg_info(&jpeg)?;
-    let ImagePlacement {
-        page_width,
-        page_height,
-        x: offset_x,
-        y: offset_y,
-        width: image_width,
-        height: image_height,
-    } = image_placement(u32::from(info.width), u32::from(info.height), page_size)?;
+    let orientation = crate::metadata::jpeg_orientation(&jpeg);
+    let (display_width, display_height) = if orientation >= 5 {
+        (u32::from(info.height), u32::from(info.width))
+    } else {
+        (u32::from(info.width), u32::from(info.height))
+    };
+    let placement = image_placement(display_width, display_height, page_size)?;
+    let (page_width, page_height) = (placement.page_width, placement.page_height);
+    let matrix = oriented_image_matrix(orientation, &placement)
+        .map(|value| format!("{value:.6}"))
+        .join(" ");
 
     let mut document = Document::with_version("1.5");
     let pages_id = document.new_object_id();
@@ -573,9 +599,7 @@ pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> 
     }
     let image_id = document.add_object(Stream::new(image_dictionary, jpeg));
 
-    let content = format!(
-        "q\n{image_width:.6} 0 0 {image_height:.6} {offset_x:.6} {offset_y:.6} cm\n/Im0 Do\nQ\n"
-    );
+    let content = format!("q\n{matrix} cm\n/Im0 Do\nQ\n");
     let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
     let resources_id = document.add_object(dictionary! {
         "XObject" => dictionary! {

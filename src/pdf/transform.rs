@@ -144,7 +144,7 @@ impl PageGeometry {
 }
 
 /// Pages matching a selection expression, with their numbers and geometry.
-fn selected_pages(
+pub(crate) fn selected_pages(
     document: &Document,
     expression: &str,
 ) -> Result<Vec<(u32, ObjectId, PageGeometry)>> {
@@ -270,9 +270,6 @@ fn dominant_landscape(geometries: impl IntoIterator<Item = PageGeometry>) -> boo
 }
 
 pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()> {
-    const STAMP_RESOURCE: &[u8] = b"BpdfStamp";
-    const GSTATE_RESOURCE: &[u8] = b"BpdfExtGState";
-
     if !(0.0..=1.0).contains(&options.opacity) {
         bail!("stamp opacity must be between 0 and 1");
     }
@@ -327,16 +324,18 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             "BM" => Object::Name(options.blend_mode.to_pdf_name().to_vec()),
         })
     });
-    // Shared by every page: isolates the original page content state.
-    let push_id = document.add_object(Stream::new(dictionary! {}, b"q\n".to_vec()));
-    let pop_id = document.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec()));
+    let isolation = ContentIsolation::new(document);
+    let pages = selected_pages(document, &options.pages)?;
+    let page_ids = pages.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
+    let stamp_name = free_resource_name(document, &page_ids, b"XObject", "BpdfStamp");
+    let state_name = free_resource_name(document, &page_ids, b"ExtGState", "BpdfExtGState");
 
     let natural_width = f64::from(pixel_width) * 72.0 / dpi;
     let natural_height = f64::from(pixel_height) * 72.0 / dpi;
-    for (_, page_id, geometry) in selected_pages(document, &options.pages)? {
-        let mut resources = vec![(b"XObject".as_slice(), STAMP_RESOURCE, image_id)];
+    for (_, page_id, geometry) in pages {
+        let mut resources = vec![(b"XObject".as_slice(), stamp_name.as_bytes(), image_id)];
         if let Some(gstate_id) = gstate_id {
-            resources.push((b"ExtGState", GSTATE_RESOURCE, gstate_id));
+            resources.push((b"ExtGState", state_name.as_bytes(), gstate_id));
         }
         install_resources(document, page_id, &resources)?;
 
@@ -354,12 +353,13 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
         let (x, y) = stamp_position(&options.position, geometry, width, height)?;
 
         let gstate = if gstate_id.is_some() {
-            "/BpdfExtGState gs\n"
+            format!("/{state_name} gs\n")
         } else {
-            ""
+            String::new()
         };
-        let content =
-            format!("q\n{gstate}{width:.6} 0 0 {height:.6} {x:.6} {y:.6} cm\n/BpdfStamp Do\nQ\n");
+        let content = format!(
+            "q\n{gstate}{width:.6} 0 0 {height:.6} {x:.6} {y:.6} cm\n/{stamp_name} Do\nQ\n"
+        );
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
 
         let under = match options.mode {
@@ -369,6 +369,34 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
                 .get_page_fonts(page_id)
                 .is_ok_and(|fonts| !fonts.is_empty()),
         };
+        isolation.add_overlay(document, page_id, content_id, under)?;
+    }
+    Ok(())
+}
+
+/// Shared `q`/`Q` streams that fence the original page content, so overlays
+/// drawn before or after it start from the default graphics state.
+pub(crate) struct ContentIsolation {
+    push: ObjectId,
+    pop: ObjectId,
+}
+
+impl ContentIsolation {
+    pub(crate) fn new(document: &mut Document) -> Self {
+        Self {
+            push: document.add_object(Stream::new(dictionary! {}, b"q\n".to_vec())),
+            pop: document.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec())),
+        }
+    }
+
+    /// Draw `content_id` beneath (`under`) or above the page content.
+    pub(crate) fn add_overlay(
+        &self,
+        document: &mut Document,
+        page_id: ObjectId,
+        content_id: ObjectId,
+        under: bool,
+    ) -> Result<()> {
         let old = document
             .get_dictionary(page_id)?
             .get(b"Contents")
@@ -379,9 +407,9 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             contents.push(Object::Reference(content_id));
         }
         if old.is_some() {
-            contents.push(Object::Reference(push_id));
+            contents.push(Object::Reference(self.push));
             append_content_objects(document, &mut contents, old);
-            contents.push(Object::Reference(pop_id));
+            contents.push(Object::Reference(self.pop));
         }
         if !under {
             contents.push(Object::Reference(content_id));
@@ -390,12 +418,49 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             .get_object_mut(page_id)?
             .as_dict_mut()?
             .set("Contents", contents);
+        Ok(())
     }
-    Ok(())
 }
 
-pub fn optimize(document: &mut Document, image_dpi: u32, jpeg_quality: u8) -> OptimizeReport {
-    let mut report = downsample_images(document, image_dpi, jpeg_quality);
+impl PageGeometry {
+    /// The page as it is displayed: rotation applied, origin at bottom-left.
+    pub(crate) fn displayed(self) -> Self {
+        Self {
+            left: 0.0,
+            bottom: 0.0,
+            right: self.display_width(),
+            top: self.display_height(),
+            rotation: 0,
+        }
+    }
+
+    /// Map a point of the displayed page to page (user space) coordinates.
+    pub(crate) fn display_to_page(self, x: f64, y: f64) -> (f64, f64) {
+        let (width, height) = (self.raw_width(), self.raw_height());
+        let (raw_x, raw_y) = match self.rotation.rem_euclid(360) {
+            90 => (width - y, x),
+            180 => (width - x, height - y),
+            270 => (y, height - x),
+            _ => (x, y),
+        };
+        (
+            self.left.min(self.right) + raw_x,
+            self.bottom.min(self.top) + raw_y,
+        )
+    }
+}
+
+/// Downsample images above `image_dpi` (0 disables it) and tidy the object
+/// graph. With `recompress_all`, images already within the limit are
+/// re-encoded at `jpeg_quality` too. An image is replaced only when the new
+/// JPEG is smaller than its current stream.
+pub fn optimize(
+    document: &mut Document,
+    image_dpi: u32,
+    jpeg_quality: u8,
+    recompress_all: bool,
+) -> OptimizeReport {
+    let mut report = downsample_images(document, image_dpi, jpeg_quality, recompress_all);
     document.delete_zero_length_streams();
     document.prune_objects();
     document.renumber_objects();
@@ -404,13 +469,19 @@ pub fn optimize(document: &mut Document, image_dpi: u32, jpeg_quality: u8) -> Op
     report
 }
 
-fn downsample_images(document: &mut Document, image_dpi: u32, jpeg_quality: u8) -> OptimizeReport {
+fn downsample_images(
+    document: &mut Document,
+    image_dpi: u32,
+    jpeg_quality: u8,
+    recompress_all: bool,
+) -> OptimizeReport {
     let mut report = OptimizeReport::default();
-    if image_dpi == 0 {
+    if image_dpi == 0 && !recompress_all {
         return report;
     }
 
-    let candidates = collect_image_resizes(document, image_dpi, &mut report.warnings);
+    let candidates =
+        collect_image_resizes(document, image_dpi, recompress_all, &mut report.warnings);
     // Decoding, resampling and encoding are independent per image.
     let encoded = crate::parallel::map(&candidates, crate::parallel::cpu_jobs(), |candidate| {
         encode_downsampled(document, *candidate, jpeg_quality)
@@ -418,7 +489,8 @@ fn downsample_images(document: &mut Document, image_dpi: u32, jpeg_quality: u8) 
 
     for (candidate, result) in candidates.iter().zip(encoded) {
         match result.and_then(|jpeg| replace_image(document, *candidate, jpeg)) {
-            Ok(()) => report.resized_images += 1,
+            Ok(true) => report.resized_images += 1,
+            Ok(false) => {}
             Err(error) => {
                 report.skipped_images += 1;
                 report.warnings.push(format!(
@@ -434,6 +506,7 @@ fn downsample_images(document: &mut Document, image_dpi: u32, jpeg_quality: u8) 
 fn collect_image_resizes(
     document: &Document,
     image_dpi: u32,
+    recompress_all: bool,
     warnings: &mut Vec<String>,
 ) -> Vec<ImageResize> {
     let mut targets = BTreeMap::<ObjectId, (u32, u32)>::new();
@@ -473,7 +546,8 @@ fn collect_image_resizes(
                 page_width,
                 page_height,
                 image_dpi,
-            ) else {
+            )
+            .or(recompress_all.then_some((width, height))) else {
                 continue;
             };
             targets
@@ -511,12 +585,16 @@ fn encode_downsampled(
     )
 }
 
-fn replace_image(document: &mut Document, resize: ImageResize, jpeg: Vec<u8>) -> Result<()> {
+/// Returns false (and keeps the original) when the JPEG would not be smaller.
+fn replace_image(document: &mut Document, resize: ImageResize, jpeg: Vec<u8>) -> Result<bool> {
     let color_space = match super::jpeg_info(&jpeg)?.components {
         1 => "DeviceGray",
         _ => "DeviceRGB",
     };
     let stream = document.get_object_mut(resize.id)?.as_stream_mut()?;
+    if jpeg.len() >= stream.content.len() {
+        return Ok(false);
+    }
     stream.dict.set("Width", i64::from(resize.target_width));
     stream.dict.set("Height", i64::from(resize.target_height));
     stream.dict.set("ColorSpace", color_space);
@@ -525,7 +603,7 @@ fn replace_image(document: &mut Document, resize: ImageResize, jpeg: Vec<u8>) ->
     stream.dict.remove(b"DecodeParms");
     stream.dict.remove(b"Decode");
     stream.set_content(jpeg);
-    Ok(())
+    Ok(true)
 }
 
 fn reject_unsafe_image_features(stream: &Stream) -> Result<()> {
@@ -682,6 +760,38 @@ pub(crate) fn append_content_objects(
     }
 }
 
+/// A resource name, derived from `base`, that none of `pages` uses yet in
+/// `category`. Repeated runs (a second stamp or watermark) thereby never
+/// redirect content drawn by an earlier run.
+pub(crate) fn free_resource_name(
+    document: &Document,
+    pages: &[ObjectId],
+    category: &[u8],
+    base: &str,
+) -> String {
+    let used = pages
+        .iter()
+        .filter_map(|page_id| inherited_value(document, *page_id, b"Resources"))
+        .filter_map(|resources| resolve_dictionary(document, &resources))
+        .filter_map(|resources| {
+            resources
+                .get(category)
+                .ok()
+                .and_then(|group| resolve_dictionary(document, group))
+        })
+        .flat_map(|group| {
+            group
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    std::iter::once(base.to_owned())
+        .chain((1..).map(|index| format!("{base}{index}")))
+        .find(|name| !used.contains(name.as_bytes()))
+        .expect("an unused resource name exists")
+}
+
 /// Add named resources (category, name, object) to a page. The effective
 /// (possibly inherited or shared) Resources dictionary is copied once into a
 /// page-owned object so other pages are unaffected.
@@ -778,7 +888,12 @@ fn transform_annotation_rectangles(
     }
 }
 
-fn stamp_position(value: &str, page: PageGeometry, width: f64, height: f64) -> Result<(f64, f64)> {
+pub(crate) fn stamp_position(
+    value: &str,
+    page: PageGeometry,
+    width: f64,
+    height: f64,
+) -> Result<(f64, f64)> {
     const MM_TO_POINTS: f64 = 72.0 / 25.4;
     let margin = 10.0 * MM_TO_POINTS;
     let mut position = value.trim().to_ascii_lowercase();
@@ -1052,7 +1167,7 @@ mod tests {
     #[test]
     fn optimize_downsamples_image_to_page_dpi() {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
-        let report = optimize(&mut document, 36, 82);
+        let report = optimize(&mut document, 36, 82, false);
 
         assert_eq!(report.resized_images, 1);
         assert_eq!(report.skipped_images, 0);
@@ -1073,7 +1188,7 @@ mod tests {
     #[test]
     fn optimize_dpi_zero_keeps_image_dimensions() {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
-        let report = optimize(&mut document, 0, 82);
+        let report = optimize(&mut document, 0, 82, false);
 
         assert_eq!(report.resized_images, 0);
         assert_eq!(report.skipped_images, 0);
@@ -1085,7 +1200,7 @@ mod tests {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
         duplicate_first_page(&mut document);
 
-        let report = optimize(&mut document, 36, 82);
+        let report = optimize(&mut document, 36, 82, false);
 
         assert_eq!(report.resized_images, 1);
         assert_eq!(document.get_pages().len(), 2);
@@ -1101,8 +1216,15 @@ mod tests {
         let page_id = *document.get_pages().get(&1).unwrap();
         let image_id = document.get_page_images(page_id).unwrap().remove(0).id;
         let profile_id = document.add_object(Stream::new(dictionary! {"N" => 3}, Vec::new()));
-        // Solid orange, stored as raw Flate RGB with an ICC profile.
-        let pixels = [230u8, 120, 20].repeat(1200 * 600);
+        // Noisy orange (like a scan), stored as Flate RGB with an ICC profile.
+        let mut seed = 1u32;
+        let pixels = (0..1200 * 600)
+            .flat_map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let noise = (seed >> 16) as u8 % 16;
+                [222 + noise, 112 + noise, 12 + noise]
+            })
+            .collect::<Vec<_>>();
         let mut stream = Stream::new(
             dictionary! {
                 "Type" => "XObject",
@@ -1117,18 +1239,25 @@ mod tests {
         stream.compress().unwrap();
         document.objects.insert(image_id, Object::Stream(stream));
 
-        let report = optimize(&mut document, 36, 90);
+        let report = optimize(&mut document, 36, 90, false);
 
         assert_eq!(report.resized_images, 1, "{:?}", report.warnings);
         let embedded = document.get_page_images(page_id).unwrap().remove(0);
         let decoded = image::load_from_memory(embedded.content).unwrap().to_rgb8();
-        let pixel = decoded.get_pixel(100, 100).0;
+        let mean = |channel: usize| {
+            decoded
+                .pixels()
+                .map(|pixel| f64::from(pixel.0[channel]))
+                .sum::<f64>()
+                / f64::from(decoded.width() * decoded.height())
+        };
+        let means = [mean(0), mean(1), mean(2)];
         assert!(
-            pixel
+            means
                 .iter()
-                .zip([230u8, 120, 20])
-                .all(|(a, b)| a.abs_diff(b) <= 3),
-            "{pixel:?}"
+                .zip([229.5, 119.5, 19.5])
+                .all(|(actual, expected)| (actual - expected).abs() < 4.0),
+            "{means:?}"
         );
     }
 
@@ -1148,7 +1277,7 @@ mod tests {
                 vec![0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
             );
 
-        let report = optimize(&mut document, 100, 82);
+        let report = optimize(&mut document, 100, 82, false);
 
         assert_eq!(report.resized_images, 0);
         assert_eq!(report.skipped_images, 1);

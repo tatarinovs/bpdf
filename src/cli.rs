@@ -112,6 +112,10 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Apply a PNG stamp to an existing PDF.
     Stamp(StampArgs),
+    /// Add page numbers to a PDF.
+    Number(NumberArgs),
+    /// Add a text watermark to a PDF.
+    Watermark(WatermarkArgs),
     /// Optimize PDF structure and downsample oversized images.
     Optimize {
         /// Source PDF file.
@@ -119,6 +123,9 @@ pub enum Command {
         /// Destination PDF; may equal the input for an in-place update.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Largest acceptable file size, e.g. 10MB or 500KB; image DPI and JPEG quality are lowered until the PDF fits.
+        #[arg(long, value_parser = parse_size)]
+        max_size: Option<u64>,
     },
     /// Show or update PDF Info metadata.
     Metadata {
@@ -201,6 +208,68 @@ pub struct StampArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct NumberArgs {
+    /// Source PDF file.
+    pub input: PathBuf,
+    /// Destination PDF; may equal the input for an in-place update.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+    /// Label template: {n} is the page number, {total} the last number.
+    #[arg(long, default_value = "{n}")]
+    pub format: String,
+    /// Anchor (bc, br, bl, tc, tr, tl, c, l, r) or X,Y mm offset from bottom-right.
+    #[arg(long, default_value = "bc")]
+    pub position: String,
+    /// Font size in points.
+    #[arg(long, default_value_t = 10.0)]
+    pub size: f64,
+    /// Number given to the first page.
+    #[arg(long, default_value_t = 1)]
+    pub start: i64,
+    /// Pages to number, for example all, 2-10, even or odd.
+    #[arg(long, default_value = "all")]
+    pub pages: String,
+    /// Text colour: black, gray, red, blue, green, white or #RRGGBB.
+    #[arg(long, default_value = "black", value_parser = parse_color)]
+    pub color: [f64; 3],
+    /// Text opacity from 0 (transparent) to 1 (opaque).
+    #[arg(long, default_value_t = 1.0)]
+    pub opacity: f64,
+}
+
+#[derive(Debug, Args)]
+pub struct WatermarkArgs {
+    /// Source PDF file.
+    pub input: PathBuf,
+    /// Watermark text.
+    pub text: String,
+    /// Destination PDF; may equal the input for an in-place update.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+    /// Font size in points; 0 fits the text to the page.
+    #[arg(long, default_value_t = 0.0)]
+    pub size: f64,
+    /// Counter-clockwise angle in degrees.
+    #[arg(long, default_value_t = 45.0, allow_negative_numbers = true)]
+    pub angle: f64,
+    /// Anchor (c, tc, bc, ...) or X,Y mm offset from bottom-right.
+    #[arg(long, default_value = "c")]
+    pub position: String,
+    /// Text colour: black, gray, red, blue, green, white or #RRGGBB.
+    #[arg(long, default_value = "gray", value_parser = parse_color)]
+    pub color: [f64; 3],
+    /// Text opacity from 0 (transparent) to 1 (opaque).
+    #[arg(long, default_value_t = 0.3)]
+    pub opacity: f64,
+    /// Pages to mark, for example all, first, 1-5, even or odd.
+    #[arg(long, default_value = "all")]
+    pub pages: String,
+    /// Draw beneath the page content instead of over it.
+    #[arg(long)]
+    pub under: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct MergeArgs {
     /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
@@ -256,6 +325,9 @@ pub struct MergeArgs {
     /// Remove metadata from the resulting document.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub strip_meta: Option<bool>,
+    /// Largest acceptable PDF size, e.g. 10MB or 500KB; image DPI and JPEG quality are lowered until the PDF fits.
+    #[arg(long, value_parser = parse_size)]
+    pub max_size: Option<u64>,
 
     /// Add PDF outline bookmarks for each merged input file.
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -368,6 +440,55 @@ pub struct ConvertArgs {
     pub render: bool,
 }
 
+/// Parse a colour name or `#RRGGBB` into RGB components in 0..=1.
+pub fn parse_color(value: &str) -> Result<[f64; 3], String> {
+    let rgb = match value.trim().to_ascii_lowercase().as_str() {
+        "black" => [0, 0, 0],
+        "gray" | "grey" => [128, 128, 128],
+        "white" => [255, 255, 255],
+        "red" => [200, 0, 0],
+        "green" => [0, 140, 0],
+        "blue" => [0, 60, 200],
+        other => {
+            let hex = other.strip_prefix('#').unwrap_or(other);
+            let channel = |index: usize| {
+                hex.get(index..index + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+            };
+            match (hex.len(), channel(0), channel(2), channel(4)) {
+                (6, Some(red), Some(green), Some(blue)) => [red, green, blue],
+                _ => return Err(format!("unknown colour '{value}'; use a name or #RRGGBB")),
+            }
+        }
+    };
+    Ok(rgb.map(|channel| f64::from(channel) / 255.0))
+}
+
+/// Parse a size such as `10MB`, `1.5M`, `500 KB`, `750кб` or plain bytes
+/// (binary multiples).
+pub fn parse_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| format!("invalid size '{value}'"))?;
+    let multiplier = match unit.trim().to_lowercase().as_str() {
+        "" | "b" => 1u64,
+        "k" | "kb" | "kib" | "к" | "кб" => 1 << 10,
+        "m" | "mb" | "mib" | "м" | "мб" => 1 << 20,
+        "g" | "gb" | "gib" | "г" | "гб" => 1 << 30,
+        other => return Err(format!("unknown size unit '{other}'; use KB, MB or GB")),
+    };
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes < 1.0 {
+        return Err(format!("size '{value}' must be positive"));
+    }
+    Ok(bytes as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
@@ -386,6 +507,26 @@ mod tests {
             Cli::try_parse_from(["bpdf", "merge", "scan.pdf", "--no-rotate", "--auto-rotate",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_colours() {
+        assert_eq!(parse_color("black"), Ok([0.0, 0.0, 0.0]));
+        assert_eq!(parse_color("#FF0000"), Ok([1.0, 0.0, 0.0]));
+        assert_eq!(parse_color("00ff00"), Ok([0.0, 1.0, 0.0]));
+        assert!(parse_color("#12345").is_err());
+        assert!(parse_color("purple").is_err());
+    }
+
+    #[test]
+    fn parses_human_sizes() {
+        assert_eq!(parse_size("10MB"), Ok(10 << 20));
+        assert_eq!(parse_size("1.5 m"), Ok(3 << 19));
+        assert_eq!(parse_size("500кб"), Ok(500 << 10));
+        assert_eq!(parse_size("2048"), Ok(2048));
+        assert!(parse_size("ten MB").is_err());
+        assert!(parse_size("5 TB").is_err());
+        assert!(parse_size("0").is_err());
     }
 
     #[test]

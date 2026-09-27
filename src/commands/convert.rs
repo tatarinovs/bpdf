@@ -162,21 +162,21 @@ impl Converter<'_> {
         });
         if self.render || has_text {
             output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
-            if pages.is_some() {
-                output::warn(
-                    "Page selection is not yet supported for PDF rendering, rendering all pages.",
-                );
-            }
-            let rendered = crate::winpdf::render_pdf_to_jpegs(input, &self.image_options)?
-                .into_iter()
-                .enumerate()
-                .map(|(index, bytes)| {
-                    Ok((
-                        self.sibling_output(input, &format!("page_{}.jpg", index + 1))?,
-                        bytes,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let numbers =
+                pdf::parse_page_selection(pages.unwrap_or("all"), document.get_pages().len())?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            let rendered =
+                crate::winpdf::render_pdf_to_jpegs(input, &numbers, &self.image_options)?
+                    .into_iter()
+                    .zip(&numbers)
+                    .map(|(bytes, number)| {
+                        Ok((
+                            self.sibling_output(input, &format!("page_{number}.jpg"))?,
+                            bytes,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             return self.write_all(input, rendered, "Saving rendered page to");
         }
 

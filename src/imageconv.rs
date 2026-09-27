@@ -11,7 +11,10 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageFormat, ImageReader};
+use image::metadata::Orientation as ExifOrientation;
+use image::{
+    DynamicImage, ExtendedColorType, GenericImageView, ImageDecoder, ImageFormat, ImageReader,
+};
 use tempfile::Builder;
 
 use crate::formats::{self, Format};
@@ -150,12 +153,19 @@ fn jpeg_fast_path(
     metadata::strip_jpeg(bytes, options.keep_icc).ok()
 }
 
-fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
-    ImageReader::new(Cursor::new(bytes))
+/// Decode image bytes and apply their EXIF orientation to the pixels.
+pub(crate) fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
+    let mut decoder = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("failed to determine image format")?
-        .decode()
-        .context("failed to decode image")
+        .into_decoder()
+        .context("failed to decode image")?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(ExifOrientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder).context("failed to decode image")?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 #[cfg(windows)]
@@ -287,10 +297,13 @@ pub fn for_ocr(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
         return to_jpeg(path, options, None);
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    if matches!(
-        image::guess_format(&bytes),
-        Ok(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif)
-    ) {
+    let passthrough = match image::guess_format(&bytes) {
+        // OCR engines ignore EXIF orientation, so rotated photos are decoded.
+        Ok(ImageFormat::Jpeg) => metadata::jpeg_orientation(&bytes) == 1,
+        Ok(ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif) => true,
+        _ => false,
+    };
+    if passthrough {
         return Ok(bytes);
     }
     to_jpeg(path, options, None)
@@ -361,15 +374,24 @@ fn dpi_target_for_dimensions(
     fit_dimensions_for_dpi(width, height, page_width, page_height, image_dpi)
 }
 
-/// Encode as baseline JPEG. Grayscale stays single-channel; transparency is
-/// composited onto white.
+/// Encode as baseline JPEG. Grayscale stays single-channel and so do colour
+/// images that are gray in practice (scans of black-and-white documents);
+/// transparency is composited onto white.
 pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
     let (width, height) = image.dimensions();
-    let mut bytes = Vec::new();
-    let mut encode = |data: &[u8], color: ExtendedColorType| {
+    let encode = |data: &[u8], color: ExtendedColorType| {
+        let mut bytes = Vec::new();
         JpegEncoder::new_with_quality(&mut bytes, quality)
             .encode(data, width, height, color)
-            .context("failed to encode JPEG")
+            .context("failed to encode JPEG")?;
+        Ok(bytes)
+    };
+    let encode_rgb = |rgb: &[u8]| {
+        if is_effectively_gray(rgb) {
+            encode(&rgb_to_luma(rgb), ExtendedColorType::L8)
+        } else {
+            encode(rgb, ExtendedColorType::Rgb8)
+        }
     };
     let blend = |channel: u8, alpha: u8| -> u8 {
         let alpha = u16::from(alpha);
@@ -377,9 +399,9 @@ pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<
     };
 
     match image {
-        DynamicImage::ImageLuma8(gray) => encode(gray.as_raw(), ExtendedColorType::L8)?,
-        DynamicImage::ImageRgb8(rgb) => encode(rgb.as_raw(), ExtendedColorType::Rgb8)?,
-        DynamicImage::ImageLuma16(_) => encode(image.to_luma8().as_raw(), ExtendedColorType::L8)?,
+        DynamicImage::ImageLuma8(gray) => encode(gray.as_raw(), ExtendedColorType::L8),
+        DynamicImage::ImageRgb8(rgb) => encode_rgb(rgb.as_raw()),
+        DynamicImage::ImageLuma16(_) => encode(image.to_luma8().as_raw(), ExtendedColorType::L8),
         DynamicImage::ImageLumaA8(_) | DynamicImage::ImageLumaA16(_) => {
             let gray = image
                 .to_luma_alpha8()
@@ -387,11 +409,9 @@ pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<
                 .chunks_exact(2)
                 .map(|pixel| blend(pixel[0], pixel[1]))
                 .collect::<Vec<_>>();
-            encode(&gray, ExtendedColorType::L8)?
+            encode(&gray, ExtendedColorType::L8)
         }
-        _ if !image.color().has_alpha() => {
-            encode(image.to_rgb8().as_raw(), ExtendedColorType::Rgb8)?
-        }
+        _ if !image.color().has_alpha() => encode_rgb(image.to_rgb8().as_raw()),
         _ => {
             let rgb = image
                 .to_rgba8()
@@ -406,10 +426,40 @@ pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<
                     ]
                 })
                 .collect::<Vec<_>>();
-            encode(&rgb, ExtendedColorType::Rgb8)?
+            encode_rgb(&rgb)
         }
     }
-    Ok(bytes)
+}
+
+/// True when at most one pixel in 5000 has visibly different channels.
+/// The bound is strict on purpose: a small coloured stamp or signature keeps
+/// the image in colour, while scanner and JPEG chroma noise does not.
+fn is_effectively_gray(rgb: &[u8]) -> bool {
+    const MAX_CHANNEL_SPREAD: u8 = 24;
+    let allowed = rgb.len() / 3 / 5000;
+    let mut coloured = 0;
+    for pixel in rgb.chunks_exact(3) {
+        let max = pixel[0].max(pixel[1]).max(pixel[2]);
+        let min = pixel[0].min(pixel[1]).min(pixel[2]);
+        if max - min > MAX_CHANNEL_SPREAD {
+            coloured += 1;
+            if coloured > allowed {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// ITU-R BT.601 luma in 8-bit fixed point.
+fn rgb_to_luma(rgb: &[u8]) -> Vec<u8> {
+    rgb.chunks_exact(3)
+        .map(|pixel| {
+            let luma =
+                77 * u32::from(pixel[0]) + 150 * u32::from(pixel[1]) + 29 * u32::from(pixel[2]);
+            ((luma + 128) >> 8) as u8
+        })
+        .collect()
 }
 
 fn pixel_dimensions_for_dpi(width_points: f64, height_points: f64, dpi: u32) -> Option<(u32, u32)> {
@@ -566,6 +616,36 @@ mod tests {
         assert_eq!(
             image::load_from_memory(&jpeg).unwrap().color(),
             image::ColorType::L8
+        );
+    }
+
+    #[test]
+    fn gray_rgb_scan_is_encoded_as_grayscale() {
+        let scan = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 100, |x, _| {
+            let value = if x % 7 == 0 { 20 } else { 245 };
+            Rgb([value, value, value.saturating_sub(8)])
+        }));
+        let jpeg = encode_jpeg_on_white(&scan, 90).unwrap();
+        assert_eq!(
+            image::load_from_memory(&jpeg).unwrap().color(),
+            image::ColorType::L8
+        );
+    }
+
+    #[test]
+    fn small_colour_stamp_keeps_the_image_in_colour() {
+        // A 10x10 blue mark on a 200x100 page is 0.5% of the pixels.
+        let page = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 100, |x, y| {
+            if x < 10 && y < 10 {
+                Rgb([30, 60, 200])
+            } else {
+                Rgb([240, 240, 240])
+            }
+        }));
+        let jpeg = encode_jpeg_on_white(&page, 90).unwrap();
+        assert_eq!(
+            image::load_from_memory(&jpeg).unwrap().color(),
+            image::ColorType::Rgb8
         );
     }
 

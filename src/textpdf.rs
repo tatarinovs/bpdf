@@ -334,10 +334,15 @@ pub fn overlay_searchable_text(
     overlays: &[PageTextOverlay],
     font_path: Option<&Path>,
 ) -> Result<()> {
-    const FONT_RESOURCE: &[u8] = b"BpdfF0";
     if overlays.is_empty() {
         return Ok(());
     }
+    let page_ids = overlays
+        .iter()
+        .map(|overlay| overlay.page_id)
+        .collect::<Vec<_>>();
+    let font_name =
+        crate::pdf::transform::free_resource_name(document, &page_ids, b"Font", "BpdfF0");
     let font_data = load_font(font_path)?;
     let mut font = FontWriter::new(&font_data)?;
     let ascender = f64::from(font.face.ascender());
@@ -365,14 +370,14 @@ pub fn overlay_searchable_text(
                 };
                 let _ = write!(
                     content,
-                    "{horizontal_scale:.1} Tz\n/BpdfF0 {font_size:.3} Tf\n1 0 0 1 {:.3} {baseline:.3} Tm\n<{}> Tj\n",
+                    "{horizontal_scale:.1} Tz\n/{font_name} {font_size:.3} Tf\n1 0 0 1 {:.3} {baseline:.3} Tm\n<{}> Tj\n",
                     word.x,
                     font.encode(&text)
                 );
             }
         } else if let Some(fallback) = &overlay.fallback_text {
             let font_size = 10.0;
-            let _ = write!(content, "100 Tz\n/BpdfF0 {font_size:.3} Tf\n");
+            let _ = write!(content, "100 Tz\n/{font_name} {font_size:.3} Tf\n");
             let mut y = overlay.page_height - 20.0 - font_size;
             for line in font.wrap(fallback, font_size, overlay.page_width - 40.0) {
                 if !line.trim().is_empty() {
@@ -395,7 +400,7 @@ pub fn overlay_searchable_text(
         crate::pdf::transform::install_resources(
             document,
             page_id,
-            &[(b"Font", FONT_RESOURCE, font_id)],
+            &[(b"Font", font_name.as_bytes(), font_id)],
         )?;
         let old = document
             .get_dictionary(page_id)?
@@ -409,6 +414,119 @@ pub fn overlay_searchable_text(
             .get_object_mut(page_id)?
             .as_dict_mut()?
             .set("Contents", contents);
+    }
+    Ok(())
+}
+
+/// Appearance of text drawn onto existing pages (page numbers, watermarks).
+#[derive(Clone, Debug)]
+pub struct TextMarkStyle {
+    /// Font size in points; 0 fits the text to the page.
+    pub font_size: f64,
+    /// Anchor (br, bc, c, ...) or X,Y mm offset, as for stamps.
+    pub position: String,
+    /// Counter-clockwise angle relative to the displayed page, in degrees.
+    pub angle: f64,
+    pub opacity: f64,
+    pub color: [f64; 3],
+    pub pages: String,
+    pub under: bool,
+}
+
+/// Draw `text_for(page_number, page_count)` on the selected pages. Text stays
+/// horizontal relative to the displayed page whatever its /Rotate value.
+pub fn add_text_marks(
+    document: &mut Document,
+    style: &TextMarkStyle,
+    font_path: Option<&Path>,
+    text_for: impl Fn(usize, usize) -> String,
+) -> Result<()> {
+    use crate::pdf::transform::{self, ContentIsolation};
+
+    if !(0.0..=1.0).contains(&style.opacity) {
+        bail!("opacity must be between 0 and 1");
+    }
+    if style.font_size < 0.0 {
+        bail!("font size cannot be negative");
+    }
+    let page_count = document.get_pages().len();
+    let pages = transform::selected_pages(document, &style.pages)?;
+    let page_ids = pages.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
+    let font_name = transform::free_resource_name(document, &page_ids, b"Font", "BpdfMark");
+    let state_name = transform::free_resource_name(document, &page_ids, b"ExtGState", "BpdfMarkGS");
+    let font_data = load_font(font_path)?;
+    let mut font = FontWriter::new(&font_data)?;
+    let (sin, cos) = style.angle.to_radians().sin_cos();
+
+    let mut contents = Vec::with_capacity(pages.len());
+    for (number, page_id, geometry) in pages {
+        let text = text_for(number as usize, page_count);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let display = geometry.displayed();
+        let unit_width = font.text_width(&text, 1.0);
+        let font_size = if style.font_size > 0.0 {
+            style.font_size
+        } else if unit_width > 0.0 {
+            // Fit the text along its direction, never taller than a fifth of the page.
+            let span = if sin.abs() > 0.01 {
+                display.raw_width().hypot(display.raw_height()) * 0.6
+            } else {
+                display.raw_width() * 0.8
+            };
+            (span / unit_width).min(display.raw_height() * 0.2)
+        } else {
+            12.0
+        };
+        let (width, height) = (unit_width * font_size, font_size * 0.7);
+
+        // Centre of the text box on the displayed page, then the baseline
+        // start rotated around it.
+        let (left, bottom) = transform::stamp_position(&style.position, display, width, height)?;
+        let (center_x, center_y) = (left + width / 2.0, bottom + height / 2.0);
+        let (dx, dy) = (-width / 2.0, -height / 2.0);
+        let (origin_x, origin_y) = geometry.display_to_page(
+            center_x + dx * cos - dy * sin,
+            center_y + dx * sin + dy * cos,
+        );
+        let (page_sin, page_cos) = (style.angle + geometry.rotation as f64)
+            .to_radians()
+            .sin_cos();
+
+        let [red, green, blue] = style.color;
+        let mut content = String::from("q\n");
+        if style.opacity < 1.0 {
+            let _ = writeln!(content, "/{state_name} gs");
+        }
+        let _ = write!(
+            content,
+            "{red:.3} {green:.3} {blue:.3} rg\nBT\n/{font_name} {font_size:.3} Tf\n\
+             {page_cos:.6} {page_sin:.6} {:.6} {page_cos:.6} {origin_x:.3} {origin_y:.3} Tm\n\
+             <{}> Tj\nET\nQ\n",
+            -page_sin,
+            font.encode(&text)
+        );
+        contents.push((page_id, content));
+    }
+
+    let font_id = font.embed(document);
+    let state_id = (style.opacity < 1.0).then(|| {
+        document.add_object(dictionary! {
+            "Type" => "ExtGState",
+            "ca" => style.opacity,
+            "CA" => style.opacity,
+        })
+    });
+    let isolation = ContentIsolation::new(document);
+    for (page_id, content) in contents {
+        let mut resources = vec![(b"Font".as_slice(), font_name.as_bytes(), font_id)];
+        if let Some(state_id) = state_id {
+            resources.push((b"ExtGState", state_name.as_bytes(), state_id));
+        }
+        transform::install_resources(document, page_id, &resources)?;
+        let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        isolation.add_overlay(document, page_id, content_id, style.under)?;
     }
     Ok(())
 }
@@ -484,5 +602,64 @@ mod tests {
             assert!(extracted.contains("Header Line"));
             assert!(!extracted.contains('\u{feff}'));
         }
+    }
+
+    #[test]
+    fn page_numbers_are_upright_on_rotated_pages() {
+        let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
+        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        crate::pdf::transform::rotate_pages(&mut document, "all", 90).unwrap();
+        let style = TextMarkStyle {
+            font_size: 10.0,
+            position: "bc".to_owned(),
+            angle: 0.0,
+            opacity: 1.0,
+            color: [0.0, 0.0, 0.0],
+            pages: "all".to_owned(),
+            under: false,
+        };
+        if add_text_marks(&mut document, &style, None, |number, total| {
+            format!("Стр. {number} из {total}")
+        })
+        .is_err()
+        {
+            return;
+        }
+        let bytes = crate::pdf::save_to_bytes(&mut document).unwrap();
+        let parsed = Document::load_mem(&bytes).unwrap();
+        assert!(parsed.extract_text(&[1]).unwrap().contains("Стр. 1 из 1"));
+
+        // Rotated 90 degrees in page space so it reads horizontally on screen.
+        let contents = parsed.get_page_content(*parsed.get_pages().get(&1).unwrap());
+        let text = String::from_utf8_lossy(&contents);
+        assert!(
+            text.contains("0.000000 1.000000 -1.000000 0.000000"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_second_mark_run_keeps_the_first_visible() {
+        let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
+        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let style = TextMarkStyle {
+            font_size: 10.0,
+            position: "bc".to_owned(),
+            angle: 0.0,
+            opacity: 1.0,
+            color: [0.0, 0.0, 0.0],
+            pages: "all".to_owned(),
+            under: false,
+        };
+        if add_text_marks(&mut document, &style, None, |_, _| "Первый".to_owned()).is_err() {
+            return;
+        }
+        add_text_marks(&mut document, &style, None, |_, _| "Второй".to_owned()).unwrap();
+
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let fonts = document.get_page_fonts(page_id).unwrap();
+        assert_eq!(fonts.len(), 2, "each run keeps its own font resource");
+        let text = document.extract_text(&[1]).unwrap();
+        assert!(text.contains("Первый") && text.contains("Второй"), "{text}");
     }
 }

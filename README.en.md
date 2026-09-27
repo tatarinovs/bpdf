@@ -113,6 +113,7 @@ bpdf merge <INPUTS>... [OPTIONS]
 - `--keep-icc[=true|false]` — Preserve ICC color profiles in embedded images (default `false` to save space).
 - `--optimize[=true|false]` — Optimize PDF structure and downsample oversized images to `image_dpi`.
 - `--strip-meta[=true|false]` — Strip metadata from generated PDF.
+- `--max-size <SIZE>` — Largest acceptable PDF size (`10MB`, `500KB`). Image resolution and JPEG quality are lowered step by step until the file fits; otherwise an error reports the smallest achievable size and nothing is written.
 - `--bookmarks[=true|false]` — Generate PDF Outlines (table of contents) for each merged file.
 - `--author <STRING>` — Set Author metadata property.
 - `--creator <STRING>` — Set Creator metadata property.
@@ -234,11 +235,13 @@ bpdf stamp invoice.pdf stamp.png --position br --blend multiply -o invoice.pdf
 ---
 
 ### 11. `bpdf optimize`
-Performs structural cleanup (removes dead objects, compresses streams) and resamples oversized embedded images to target `image_dpi`.
+Performs structural cleanup (removes dead objects, compresses streams) and resamples oversized embedded images to target `image_dpi`. Images that are effectively gray (scanned black-and-white documents stored as RGB) are encoded as single-channel `DeviceGray`; a coloured stamp or signature keeps an image in colour.
 
 ```powershell
-bpdf optimize <INPUT> [-o <OUT>]
+bpdf optimize <INPUT> [-o <OUT>] [--max-size <SIZE>]
 ```
+
+`--max-size` lowers resolution and JPEG quality in steps (300 DPI / 85 down to 72 DPI / 35) until the PDF fits; an image is only replaced when the new JPEG is smaller.
 
 ---
 
@@ -270,6 +273,28 @@ Validates runtime environment, configuration file, helper binaries (`ffmpeg`, `p
 ```powershell
 bpdf doctor
 ```
+
+---
+
+### 15. `bpdf number`
+Adds page numbers that stay horizontal on the displayed page, including pages with `/Rotate`.
+
+```powershell
+bpdf number report.pdf --format "Page {n} of {total}" --position bc --size 10 --start 1 -o report.pdf
+```
+
+Options: `--format` (`{n}`, `{total}`), `--position`, `--size`, `--start`, `--pages`, `--color` (name or `#RRGGBB`), `--opacity`.
+
+---
+
+### 16. `bpdf watermark`
+Draws a text watermark, fitted to the page when `--size 0` (default).
+
+```powershell
+bpdf watermark contract.pdf "COPY" --angle 45 --color red --opacity 0.25 -o contract_copy.pdf
+```
+
+Options: `--size`, `--angle`, `--position`, `--color`, `--opacity`, `--pages`, `--under`.
 
 ---
 

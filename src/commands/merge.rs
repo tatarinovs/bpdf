@@ -135,7 +135,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         args.creator.as_deref().unwrap_or(&config.creator),
     )?;
 
-    write_output(&output, &pdf::save_to_bytes(&mut document)?)?;
+    write_output(&output, &super::pdf_bytes(document, config, args.max_size)?)?;
     finish_batch("merge", specs.len(), failures, 1)
 }
 
