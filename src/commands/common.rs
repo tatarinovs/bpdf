@@ -7,8 +7,10 @@ use lopdf::Document;
 use serde_json::json;
 
 use crate::atomic::write_atomic;
-use crate::fileset::InputSpec;
-use crate::{output, pdf};
+use crate::fileset::{InputSpec, expand};
+use crate::formats::{self, Format, InputFormatSet};
+use crate::imageconv::{self, ImageOptions};
+use crate::{output, parallel, pdf};
 
 pub const DOCUMENT_SEPARATOR: &str = "\n\n---\n\n";
 
@@ -29,6 +31,26 @@ pub fn finish_batch(operation: &str, total: usize, failed: usize, outputs: usize
         bail!("{failed} of {total} files failed");
     }
     Ok(())
+}
+
+/// Run `work` for every item. Independent items are processed in parallel;
+/// with `fail_fast` they run sequentially and lazily, so nothing after the
+/// first failure is touched.
+pub fn batch<'a, T, R, F>(
+    items: &'a [T],
+    fail_fast: bool,
+    work: F,
+) -> Box<dyn Iterator<Item = R> + 'a>
+where
+    T: Sync,
+    R: Send + 'a,
+    F: Fn(&'a T) -> R + Sync + 'a,
+{
+    if fail_fast {
+        Box::new(items.iter().map(work))
+    } else {
+        Box::new(parallel::map(items, parallel::cpu_jobs(), work).into_iter())
+    }
 }
 
 pub fn handle_results<T, P>(
@@ -162,6 +184,63 @@ pub fn resolve_in_place_output(input: &Path, explicit_out: Option<&Path>, verb: 
     }
 
     output_path
+}
+
+/// Shared driver for commands that edit PDFs page-wise and JPEGs pixel-wise
+/// (`rotate`, `resize`), writing in place or to `--out`.
+pub struct PdfOrJpegEdit<'a, F> {
+    pub operation: &'a str,
+    pub verb: &'a str,
+    pub formats: InputFormatSet,
+    pub pages: &'a str,
+    pub out: Option<&'a Path>,
+    pub image_options: ImageOptions,
+    /// Page size used to fit JPEGs, if any.
+    pub jpeg_page_size: Option<&'a str>,
+    pub edit_pdf: F,
+}
+
+impl<F> PdfOrJpegEdit<'_, F>
+where
+    F: Fn(&mut Document, &str) -> Result<()> + Sync,
+{
+    pub fn run(&self, inputs: &[String], fail_fast: bool) -> Result<()> {
+        let specs = expand(inputs, self.formats)?;
+        validate_single_out(self.out, specs.len())?;
+        let results = batch(&specs, fail_fast, |spec| (&spec.path, self.edit_one(spec)));
+        let failures = handle_results(
+            results,
+            fail_fast,
+            "failed to process",
+            "error processing",
+            drop,
+        )?;
+        finish_batch(
+            self.operation,
+            specs.len(),
+            failures,
+            specs.len() - failures,
+        )
+    }
+
+    fn edit_one(&self, spec: &InputSpec) -> Result<()> {
+        let input = &spec.path;
+        let output_path = resolve_in_place_output(input, self.out, self.verb);
+        let bytes = match formats::detect(input) {
+            Some(Format::Pdf) => {
+                let pages = spec.pages.as_deref().unwrap_or(self.pages);
+                pdf::transform_file(input, |document| (self.edit_pdf)(document, pages))?
+            }
+            Some(Format::Jpeg) => {
+                if spec.pages.is_some() || self.pages != "all" {
+                    return Err(err_pdf_only_page_ranges(input));
+                }
+                imageconv::to_jpeg(input, &self.image_options, self.jpeg_page_size)?
+            }
+            _ => bail!("unsupported input: {}", input.display()),
+        };
+        write_output(&output_path, &bytes)
+    }
 }
 
 pub fn err_pdf_only_page_ranges(input: &Path) -> anyhow::Error {

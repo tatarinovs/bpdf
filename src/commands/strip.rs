@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use super::common::{
-    finish_batch, handle_results, resolve_in_place_output, validate_single_out, write_output,
+    batch, finish_batch, handle_results, resolve_in_place_output, validate_single_out, write_output,
 };
 use crate::cli::StripArgs;
 use crate::config::Config;
@@ -18,9 +18,9 @@ pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
     validate_single_out(args.out.as_deref(), specs.len())?;
     let options = config.image_options(args.keep_icc, args.ffmpeg);
     let mut outputs = 0usize;
-    let results = specs
-        .iter()
-        .map(|spec| (&spec.path, strip_one(spec, args.out.as_deref(), &options)));
+    let results = batch(&specs, fail_fast, |spec| {
+        (&spec.path, strip_one(spec, args.out.as_deref(), &options))
+    });
     let failures = handle_results(
         results,
         fail_fast,

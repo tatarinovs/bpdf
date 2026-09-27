@@ -1,6 +1,10 @@
-use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
+/// A recognised word; coordinates are image pixels from the top-left corner.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OcrWordBox {
     pub text: String,
     pub x: f64,
@@ -11,12 +15,27 @@ pub struct OcrWordBox {
     pub line_height: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OcrPageResult {
     pub text: String,
+    #[serde(default)]
     pub words: Vec<OcrWordBox>,
+    #[serde(default, rename = "width")]
     pub image_width: u32,
+    #[serde(default, rename = "height")]
     pub image_height: u32,
+}
+
+impl OcrPageResult {
+    /// Plain recognised text without word geometry (vision OCR).
+    pub fn text_only(text: String) -> Self {
+        Self {
+            text,
+            words: Vec::new(),
+            image_width: 0,
+            image_height: 0,
+        }
+    }
 }
 
 pub fn is_available() -> bool {
@@ -222,31 +241,6 @@ mod tests {
         if cfg!(windows) {
             let languages = available_languages().unwrap();
             assert!(!languages.is_empty());
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn test_extract_words() {
-        use crate::imageconv;
-        use crate::pdf;
-        let doc = lopdf::Document::load("d:\\PROJECT\\bpdf\\Акты подписанные.PDF").unwrap();
-        let page_id = doc.get_pages().values().next().cloned().unwrap();
-        let images = doc.get_page_images(page_id).unwrap();
-        for (index, image_info) in images.iter().enumerate() {
-            let stream = doc.get_object(image_info.id).unwrap().as_stream().unwrap();
-            let image = pdf::image::decode(stream).unwrap();
-            let bytes = imageconv::encode_jpeg_on_white(&image, 90).unwrap();
-            let area = image.width().saturating_mul(image.height());
-            println!("Image {} area: {}, bytes: {}", index, area, bytes.len());
-            std::fs::write(
-                format!("d:\\PROJECT\\bpdf\\scratch_image_{}.jpg", index),
-                &bytes,
-            )
-            .unwrap();
-
-            let result = super::recognize_image_bytes(&bytes, Some("ru")).unwrap();
-            println!("Image {} WORDS: {}", index, result.words.len());
         }
     }
 }

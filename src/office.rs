@@ -1,16 +1,20 @@
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use tempfile::Builder;
-
-use crate::encoding::powershell_encoded_command;
-use crate::formats::{self, Format};
-use crate::process;
+use anyhow::{Result, bail};
+#[cfg(windows)]
+use {
+    crate::encoding::powershell_encoded_command,
+    crate::formats::{self, Format},
+    crate::process,
+    anyhow::Context,
+    std::fs,
+    std::process::Command,
+    tempfile::Builder,
+};
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct OfficeOptions {
     pub powershell: PathBuf,
     pub timeout: Duration,
@@ -23,57 +27,55 @@ pub struct OfficeAvailability {
     pub powerpoint: bool,
 }
 
-pub fn convert_to_pdf(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
-    #[cfg(not(windows))]
-    {
-        let _ = options;
-        bail!("Office conversion is only available on Windows");
-    }
-
-    #[cfg(windows)]
-    {
-        convert_to_pdf_windows(path, options)
-    }
+#[cfg(not(windows))]
+pub fn convert_to_pdf(_path: &Path, _options: &OfficeOptions) -> Result<Vec<u8>> {
+    bail!("Office conversion is only available on Windows");
 }
 
-pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
-    #[cfg(not(windows))]
-    {
-        let _ = options;
-        return Ok(OfficeAvailability {
-            word: false,
-            excel: false,
-            powerpoint: false,
-        });
-    }
+#[cfg(windows)]
+pub fn convert_to_pdf(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
+    // Office COM servers misbehave with concurrent automation sessions, so
+    // conversions are serialised even when inputs load in parallel.
+    static OFFICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _session = OFFICE.lock().unwrap_or_else(|error| error.into_inner());
+    convert_to_pdf_windows(path, options)
+}
 
-    #[cfg(windows)]
-    {
-        let mut command = Command::new(&options.powershell);
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-OutputFormat",
-            "Text",
-            "-EncodedCommand",
-            &powershell_encoded_command(OFFICE_PROBE_SCRIPT),
-        ]);
-        let output = process::require_success(
-            process::run(
-                command,
-                options.timeout.min(Duration::from_secs(20)),
-                "Office probe",
-            )?,
+#[cfg(not(windows))]
+pub fn probe(_options: &OfficeOptions) -> Result<OfficeAvailability> {
+    Ok(OfficeAvailability {
+        word: false,
+        excel: false,
+        powerpoint: false,
+    })
+}
+
+#[cfg(windows)]
+pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
+    let mut command = Command::new(&options.powershell);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-OutputFormat",
+        "Text",
+        "-EncodedCommand",
+        &powershell_encoded_command(OFFICE_PROBE_SCRIPT),
+    ]);
+    let output = process::require_success(
+        process::run(
+            command,
+            options.timeout.min(Duration::from_secs(20)),
             "Office probe",
-        )?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        Ok(OfficeAvailability {
-            word: text.lines().any(|line| line.trim() == "word=true"),
-            excel: text.lines().any(|line| line.trim() == "excel=true"),
-            powerpoint: text.lines().any(|line| line.trim() == "powerpoint=true"),
-        })
-    }
+        )?,
+        "Office probe",
+    )?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(OfficeAvailability {
+        word: text.lines().any(|line| line.trim() == "word=true"),
+        excel: text.lines().any(|line| line.trim() == "excel=true"),
+        powerpoint: text.lines().any(|line| line.trim() == "powerpoint=true"),
+    })
 }
 
 #[cfg(windows)]

@@ -88,13 +88,8 @@ fn clean_powershell_xml(value: &str) -> String {
         let Some(end) = remaining.find("</S>") else {
             break;
         };
-        let message = remaining[..end]
-            .replace("_x000D__x000A_", "\n")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&");
+        let message =
+            crate::xml::decode_entities(&remaining[..end].replace("_x000D__x000A_", "\n"));
         messages.push(message);
         remaining = &remaining[end + "</S>".len()..];
     }

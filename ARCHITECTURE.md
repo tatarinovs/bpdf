@@ -10,7 +10,7 @@ main.rs
   -> lib.rs (process entry point)
     -> commands/* (use cases and output policy)
       -> pdf, imageconv, ocr, office, textpdf, raw, ebook, archive (domain services/adapters)
-        -> atomic, process, encoding, hash, winocr, winpdf, wic (infrastructure)
+        -> atomic, process, parallel, encoding, hash, font_subset, winocr, winpdf, wic (infrastructure)
 ```
 
 The lower layers do not call command modules. Commands own CLI-specific policy
@@ -41,22 +41,39 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   platforms; full sensor demosaicing via Windows Imaging Component (WIC) and
   the Microsoft Raw Image Extension is supported on Windows as an opt-in mode
   or fallback.
-- JPEG XR/HD Photo and ICO reuse the same WIC adapter. Multi-page TIFF also
-  iterates WIC frames instead of introducing a separate TIFF implementation.
+- JPEG XR/HD Photo, ICO and (on Windows) all TIFF files reuse the same WIC
+  adapter; the Rust TIFF decoder is compiled only for other platforms.
 - GIF, APNG, and animated WebP frames share one animation-to-JPEG iterator in
   `imageconv.rs`; `input.rs` turns the resulting frames into the normal PDF
   documents and reuses the standard page-tree merger.
 - Word, Excel, and PowerPoint share the same isolated temporary-copy and Office
   process boundary in `office.rs`; only their COM export scripts differ.
-- PDF image decoding is implemented once in `pdf/image.rs` and is shared by
-  optimize, OCR, and image extraction.
+- PDF image decoding and page-image extraction are implemented once in
+  `pdf/image.rs` and are shared by optimize, OCR, and convert. Colour spaces
+  are resolved through ICC profiles, Indexed palettes and Separation; stream
+  filters, predictors and decompression limits come from lopdf.
+- Embedded text fonts (`textpdf.rs`) are written by one `FontWriter` and
+  subset by `font_subset.rs`, keeping glyph ids so `CIDToGIDMap /Identity`
+  stays valid.
+- `rotate` and `resize` share `commands::common::PdfOrJpegEdit`.
+- Batch commands run independent inputs through `commands::common::batch`,
+  which uses `parallel::map` unless `--fail-fast` requires sequential,
+  lazy processing. Office conversions are serialised by a process-wide lock.
 - PDF loading and bounded text extraction are implemented once in `pdf/mod.rs`.
 - All material writes use `atomic::write_atomic`.
 
-## Efficiency changes from v1
+## Efficiency notes
 
-- `split` parses a PDF once and clones the owned object graph for each page,
-  instead of parsing the same bytes once per output page.
+- Pixel codecs (`image`, `zune-jpeg`, `png`, inflate) are built with
+  `opt-level = 3`; the rest of the release binary stays size-optimised.
+- Strong image reductions first average pixel blocks down to twice the
+  target and only then apply the Lanczos filter.
+- `split` parses a PDF once and copies, per page, only the objects that page
+  reaches (other pages are cut off), writing pages in parallel.
+- `optimize` decodes, resamples and encodes images in parallel; grayscale
+  images stay single-channel `DeviceGray` JPEGs.
+- Upright RGB/grayscale DCT images are extracted from PDFs without
+  recompression.
 - PDF optimization decodes an image through an immutable borrow and does not
   clone the complete compressed stream.
 - RGB JPEG encoding writes the existing RGB buffer directly and avoids

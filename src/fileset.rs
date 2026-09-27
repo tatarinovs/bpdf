@@ -98,14 +98,31 @@ fn is_office_lock_file(path: &Path) -> bool {
 }
 
 fn natural_sort(paths: &mut [PathBuf]) {
-    paths.sort_by(|left, right| natural_compare(&left.to_string_lossy(), &right.to_string_lossy()));
+    paths.sort_by_cached_key(|path| NaturalKey(path.to_string_lossy().to_lowercase()));
 }
 
-pub fn natural_compare(left: &str, right: &str) -> Ordering {
-    let left_folded = left.to_lowercase();
-    let right_folded = right.to_lowercase();
-    let left = left_folded.as_bytes();
-    let right = right_folded.as_bytes();
+/// Case-folded string ordered with [`natural_compare_folded`].
+#[derive(Eq, PartialEq)]
+struct NaturalKey(String);
+
+impl Ord for NaturalKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        natural_compare_folded(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+impl PartialOrd for NaturalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Sort names case-insensitively with digit runs compared numerically.
+pub fn natural_sort_names(names: &mut [String]) {
+    names.sort_by_cached_key(|name| NaturalKey(name.to_lowercase()));
+}
+
+fn natural_compare_folded(left: &[u8], right: &[u8]) -> Ordering {
     let (mut l, mut r) = (0usize, 0usize);
 
     while l < left.len() && r < right.len() {

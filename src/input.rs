@@ -1,5 +1,3 @@
-use std::fs;
-
 use anyhow::{Context, Result, bail};
 use lopdf::Document;
 
@@ -33,11 +31,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
                 .into_iter()
                 .map(|jpeg| pdf::jpeg_document(jpeg, &options.text.page_size))
                 .collect::<Result<Vec<_>>>()?;
-            if documents.len() == 1 {
-                documents.into_iter().next().ok_or_else(|| anyhow::anyhow!("no image documents"))
-            } else {
-                pdf::merge_documents(documents)
-            }
+            pdf::merge_documents(documents)
         }
         Some(Format::Pdf) => {
             let mut document = pdf::load(&spec.path)?;
@@ -71,13 +65,11 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
         }
         Some(Format::Text) => {
             reject_pages(spec)?;
-            let text = fs::read_to_string(&spec.path)
-                .with_context(|| format!("failed to read text file {}", spec.path.display()))?;
-            textpdf::render(text.trim_start_matches('\u{feff}'), &options.text)
+            textpdf::render(&crate::encoding::read_text(&spec.path)?, &options.text)
         }
         Some(format) if format.is_ebook() => {
             reject_pages(spec)?;
-            let text = crate::ebook::load(&spec.path)?;
+            let text = crate::ebook::load(&spec.path, format)?;
             textpdf::render(&text, &options.text)
         }
         _ => bail!("unsupported merge format: {}", spec.path.display()),

@@ -3,12 +3,14 @@ pub mod config;
 
 mod archive;
 mod atomic;
+#[cfg(windows)]
 mod com;
 mod commands;
 mod doctor;
 mod ebook;
 mod encoding;
 mod fileset;
+mod font_subset;
 mod formats;
 mod hash;
 mod imageconv;
@@ -18,6 +20,7 @@ mod ocr;
 mod office;
 mod office_fallback;
 mod output;
+mod parallel;
 mod pdf;
 mod process;
 mod raw;

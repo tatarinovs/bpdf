@@ -34,7 +34,8 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 
 | Feature / Format | Windows | Linux / macOS | Notes |
 | :--- | :--- | :--- | :--- |
-| **Core (PDF, JPEG, PNG, BMP, GIF, TIFF, WebP, APNG)** | Native Pure Rust | Native Pure Rust | No external dependencies required. |
+| **Core (PDF, JPEG, PNG, BMP, GIF, WebP, APNG)** | Native Pure Rust | Native Pure Rust | No external dependencies required. |
+| **TIFF (single and multi-page)** | Native WIC | Native Pure Rust | Windows decodes TIFF through Windows Imaging Component. |
 | **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Native Pure Rust | Native Pure Rust | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
 | **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | Via FFmpeg | Uses Windows Imaging Component. |
 | **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or `--ffmpeg path/to/ffmpeg`. |

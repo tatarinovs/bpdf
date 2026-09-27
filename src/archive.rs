@@ -6,9 +6,9 @@ use anyhow::{Context, Result, bail};
 use lopdf::Document;
 use zip::ZipArchive;
 
-use crate::fileset;
+use crate::formats::{self, Format};
 use crate::imageconv::{self, ImageOptions};
-use crate::pdf;
+use crate::{fileset, parallel, pdf};
 
 /// Loads a `.cbz` archive (or image-containing ZIP), extracts image entries in natural sort order,
 /// converts each page into JPEG format, and merges them into a PDF `Document`.
@@ -18,44 +18,36 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) ->
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to parse ZIP archive {}", path.display()))?;
 
-    let mut image_names = Vec::new();
-    for i in 0..archive.len() {
-        let entry = archive
-            .by_index(i)
-            .with_context(|| format!("failed to read ZIP entry index {i}"))?;
-        let name = entry.name();
-        if crate::formats::detect(Path::new(name)).is_some_and(|f| f.is_image()) {
-            image_names.push(name.to_owned());
-        }
-    }
-
+    let mut image_names = (0..archive.len())
+        .filter_map(|index| archive.name_for_index(index).map(str::to_owned))
+        .filter(|name| formats::detect_by_extension(Path::new(name)).is_some_and(Format::is_image))
+        .collect::<Vec<_>>();
     if image_names.is_empty() {
         bail!("no images found in CBZ archive {}", path.display());
     }
+    fileset::natural_sort_names(&mut image_names);
 
-    image_names.sort_by(|a, b| fileset::natural_compare(a, b));
-
-    let mut documents = Vec::new();
-    for name in image_names {
-        let mut entry = archive
-            .by_name(&name)
-            .with_context(|| format!("failed to read archive entry {name}"))?;
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to extract image {name}"))?;
-
-        let jpeg = imageconv::bytes_to_jpeg(&bytes, options, page_size)
+    // Reading the archive is sequential; decoding and encoding run in parallel.
+    let pages = image_names
+        .into_iter()
+        .map(|name| {
+            let mut bytes = Vec::new();
+            archive
+                .by_name(&name)
+                .with_context(|| format!("failed to read archive entry {name}"))?
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("failed to extract image {name}"))?;
+            Ok((name, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let documents = parallel::map(&pages, parallel::cpu_jobs(), |(name, bytes)| {
+        let jpeg = imageconv::bytes_to_jpeg(bytes, options, page_size)
             .with_context(|| format!("failed to convert image {name} to JPEG"))?;
-        let doc = pdf::jpeg_document(jpeg, page_size.unwrap_or("A4"))?;
-        documents.push(doc);
-    }
-
-    if documents.len() == 1 {
-        documents.into_iter().next().ok_or_else(|| anyhow::anyhow!("no documents"))
-    } else {
-        pdf::merge_documents(documents)
-    }
+        pdf::jpeg_document(jpeg, page_size.unwrap_or("A4"))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    pdf::merge_documents(documents)
 }
 
 #[cfg(test)]
@@ -90,16 +82,10 @@ mod tests {
         zip.finish().unwrap();
 
         let image_opts = ImageOptions {
-            keep_icc: false,
             ffmpeg: std::path::PathBuf::from("missing-ffmpeg"),
             jpeg_quality: 75,
             image_dpi: 0,
-            force_reencode: false,
-            long_edge: None,
-            short_edge: None,
-            orient: None,
-            rotation_degrees: None,
-            raw_develop: false,
+            ..ImageOptions::default()
         };
 
         let doc = load_cbz(temp_file.path(), &image_opts, Some("A4")).unwrap();

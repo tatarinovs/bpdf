@@ -6,6 +6,9 @@ use zip::ZipArchive;
 
 /// Decode the five standard XML character entities plus `&nbsp;`.
 pub fn decode_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_owned();
+    }
     text.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -34,13 +37,13 @@ pub fn strip_tags(input: &str) -> String {
 /// Normalises backslash paths and falls back to the original name.
 pub fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<String> {
     let normalized = name.replace('\\', "/");
-    let lookup = if archive.by_name(&normalized).is_ok() {
-        normalized
+    let lookup = if archive.index_for_name(&normalized).is_some() {
+        normalized.as_str()
     } else {
-        name.to_owned()
+        name
     };
     let mut entry = archive
-        .by_name(&lookup)
+        .by_name(lookup)
         .with_context(|| format!("entry {name} not found in ZIP archive"))?;
     let mut content = String::new();
     entry.read_to_string(&mut content)?;
@@ -87,6 +90,6 @@ pub fn collect_sorted_entries(
             }
         }
     }
-    names.sort_by(|a, b| crate::fileset::natural_compare(a, b));
+    crate::fileset::natural_sort_names(&mut names);
     names
 }

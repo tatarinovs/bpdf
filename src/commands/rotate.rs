@@ -2,21 +2,11 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{
-    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output,
-    validate_single_out, write_output,
-};
+use super::common::PdfOrJpegEdit;
 use crate::config::Config;
-use crate::fileset::{InputSpec, expand};
-use crate::formats::{self, Format, InputFormatSet};
-use crate::imageconv::{self, ImageOptions};
-use crate::pdf::{self, transform};
-
-#[derive(Debug, Clone, Copy)]
-pub enum RotationMode<'a> {
-    Degrees(i64),
-    Orient(&'a str),
-}
+use crate::formats::InputFormatSet;
+use crate::imageconv::Orientation;
+use crate::pdf::transform;
 
 pub fn run(
     inputs: &[String],
@@ -27,84 +17,46 @@ pub fn run(
     config: &Config,
     fail_fast: bool,
 ) -> Result<()> {
-    let mode = match (degrees, orient) {
-        (Some(deg), None) => {
-            if deg % 90 != 0 {
+    let mut image_options = config.image_options(None, None);
+    image_options.force_reencode = true;
+    let orientation = match (degrees, orient) {
+        (Some(degrees), None) => {
+            if degrees % 90 != 0 {
                 bail!("rotation must be a multiple of 90 degrees");
             }
-            RotationMode::Degrees(deg)
+            image_options.rotation_degrees = Some(degrees);
+            None
         }
-        (None, Some(orient)) => match orient.to_lowercase().as_str() {
-            "portrait" | "landscape" => RotationMode::Orient(orient),
-            _ => bail!("invalid orientation '{orient}': expected 'portrait' or 'landscape'"),
-        },
+        (None, Some(orient)) => {
+            let orientation = Orientation::parse(orient)?;
+            image_options.orient = Some(orientation);
+            Some(orientation)
+        }
         (Some(_), Some(_)) => bail!("cannot specify both degrees and --orient"),
         (None, None) => bail!("either degrees or --orient must be specified"),
     };
 
-    let specs = expand(inputs, InputFormatSet::Rotate)?;
-    validate_single_out(out, specs.len())?;
-
-    let mut image_options = config.image_options(None, None);
-    match mode {
-        RotationMode::Degrees(deg) => image_options.rotation_degrees = Some(deg),
-        RotationMode::Orient(orient) => image_options.orient = Some(orient.to_string()),
+    PdfOrJpegEdit {
+        operation: "rotate",
+        verb: "Rotating",
+        formats: InputFormatSet::Rotate,
+        pages,
+        out,
+        image_options,
+        jpeg_page_size: None,
+        edit_pdf: |document: &mut lopdf::Document, pages: &str| match orientation {
+            Some(orientation) => transform::orient_pages(document, pages, orientation),
+            None => transform::rotate_pages(document, pages, degrees.unwrap_or(0)),
+        },
     }
-    image_options.force_reencode = true;
-
-    let results = specs.iter().map(|spec| {
-        (
-            &spec.path,
-            rotate_one(spec, mode, pages, out, &image_options),
-        )
-    });
-    let failures = handle_results(
-        results,
-        fail_fast,
-        "failed to process",
-        "error processing",
-        drop,
-    )?;
-    finish_batch("rotate", specs.len(), failures, specs.len() - failures)
-}
-
-fn rotate_one(
-    spec: &InputSpec,
-    mode: RotationMode<'_>,
-    pages: &str,
-    explicit_out: Option<&Path>,
-    image_options: &ImageOptions,
-) -> Result<()> {
-    let input = &spec.path;
-    let format = formats::detect(input);
-    let output_path = resolve_in_place_output(input, explicit_out, "Rotating");
-
-    match format {
-        Some(Format::Pdf) => {
-            let pages = spec.pages.as_deref().unwrap_or(pages);
-            let bytes = pdf::transform_file(input, |document| match mode {
-                RotationMode::Degrees(deg) => transform::rotate_pages(document, pages, deg),
-                RotationMode::Orient(orient) => transform::orient_pages(document, pages, orient),
-            })?;
-            write_output(&output_path, &bytes)?;
-        }
-        Some(Format::Jpeg) => {
-            if spec.pages.is_some() || pages != "all" {
-                return Err(err_pdf_only_page_ranges(input));
-            }
-
-            let bytes = imageconv::to_jpeg(input, image_options, None)?;
-            write_output(&output_path, &bytes)?;
-        }
-        _ => bail!("unsupported input: {}", input.display()),
-    }
-    Ok(())
+    .run(inputs, fail_fast)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::common::test_utils::*;
+    use crate::pdf;
     use image::GenericImageView;
     use std::fs;
 

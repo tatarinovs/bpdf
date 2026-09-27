@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -37,8 +37,8 @@ pub fn extract_text(document: &Document) -> Result<String> {
 /// Merge without flattening leaf pages. Each source Pages root becomes a child
 /// of a new Pages root, preserving inherited resources, boxes and rotation.
 pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
-    if documents.is_empty() {
-        bail!("no PDF documents to merge");
+    if documents.len() <= 1 {
+        return documents.pop().context("no PDF documents to merge");
     }
 
     let pages_id: ObjectId = (1, 0);
@@ -197,29 +197,162 @@ pub fn metadata_report(path: &Path) -> Result<Value> {
 
 pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
     let document = load(path)?;
-    let page_count = document.get_pages().len();
-    if page_count == 0 {
+    let pages = document.get_pages().into_values().collect::<Vec<_>>();
+    if pages.is_empty() {
         bail!("PDF contains no pages");
     }
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("page");
-    let width = page_count.to_string().len().max(1);
-    let mut outputs = Vec::with_capacity(page_count);
+    let width = pages.len().to_string().len();
+    let numbered = pages.into_iter().enumerate().collect::<Vec<_>>();
 
-    for page in 1..=page_count {
-        // lopdf::Document owns its complete object graph, so Clone gives each
-        // output an isolated page tree without parsing the source N times.
-        let mut one_page = document.clone();
-        select_pages(&mut one_page, &page.to_string())?;
-        let bytes = save_to_bytes(&mut one_page)?;
-        let output = output_dir.join(format!("{stem}_{page:0width$}.pdf"));
-        write_atomic(&output, &bytes)?;
-        outputs.push(output);
+    crate::parallel::map(
+        &numbered,
+        crate::parallel::cpu_jobs(),
+        |(index, page_id)| {
+            let mut one_page = page_document(&document, *page_id)?;
+            let output = output_dir.join(format!("{stem}_{:0width$}.pdf", index + 1));
+            write_atomic(&output, &save_to_bytes(&mut one_page)?)?;
+            Ok(output)
+        },
+    )
+    .into_iter()
+    .collect()
+}
+
+/// Build a standalone document from one page, copying only the objects that
+/// page can reach. Other pages and page-tree nodes are cut off (replaced by
+/// null) so a link to another page does not drag the whole document along.
+fn page_document(source: &Document, page_id: ObjectId) -> Result<Document> {
+    const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
+    const CATALOG_SKIP: [&[u8]; 8] = [
+        b"Type",
+        b"Pages",
+        b"Outlines",
+        b"StructTreeRoot",
+        b"PageLabels",
+        b"Names",
+        b"Dests",
+        b"OpenAction",
+    ];
+
+    let mut page = source.get_dictionary(page_id)?.clone();
+    page.remove(b"Parent");
+    for key in INHERITABLE {
+        if page.get(key).is_err()
+            && let Some(value) = transform::inherited_value(source, page_id, key)
+        {
+            page.set(key, value);
+        }
     }
 
-    Ok(outputs)
+    let mut target = Document::with_version(source.version.as_str());
+    let pages_id: ObjectId = (1, 0);
+    let new_page_id: ObjectId = (2, 0);
+    let mut copier = ObjectCopier {
+        source,
+        ids: HashMap::from([(page_id, new_page_id)]),
+        queue: Vec::new(),
+        next_id: 3,
+    };
+
+    let mut page = Object::Dictionary(page);
+    copier.remap(&mut page);
+    let mut page = page.as_dict()?.clone();
+    page.set("Parent", pages_id);
+    target.objects.insert(new_page_id, Object::Dictionary(page));
+    target.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(new_page_id)],
+            "Count" => 1,
+        }),
+    );
+
+    let mut catalog = dictionary! { "Type" => "Catalog", "Pages" => pages_id };
+    if let Ok(source_catalog) = source.catalog() {
+        for (key, value) in source_catalog.iter() {
+            if !CATALOG_SKIP.contains(&key.as_slice()) {
+                let mut value = value.clone();
+                copier.remap(&mut value);
+                catalog.set(key.clone(), value);
+            }
+        }
+    }
+    let mut info = source.trailer.get(b"Info").ok().cloned();
+    if let Some(info) = &mut info {
+        copier.remap(info);
+    }
+
+    while let Some((old_id, new_id)) = copier.queue.pop() {
+        let mut object = source.get_object(old_id)?.clone();
+        copier.remap(&mut object);
+        target.objects.insert(new_id, object);
+    }
+
+    let catalog_id = (copier.next_id, 0);
+    target
+        .objects
+        .insert(catalog_id, Object::Dictionary(catalog));
+    target.trailer.set("Root", catalog_id);
+    if let Some(info) = info {
+        target.trailer.set("Info", info);
+    }
+    target.max_id = copier.next_id;
+    Ok(target)
+}
+
+struct ObjectCopier<'a> {
+    source: &'a Document,
+    ids: HashMap<ObjectId, ObjectId>,
+    queue: Vec<(ObjectId, ObjectId)>,
+    next_id: u32,
+}
+
+impl ObjectCopier<'_> {
+    /// Rewrite references inside `object` to target ids, scheduling newly
+    /// reached objects for copying.
+    fn remap(&mut self, object: &mut Object) {
+        match object {
+            Object::Reference(id) => *object = self.target_reference(*id),
+            Object::Array(items) => items.iter_mut().for_each(|item| self.remap(item)),
+            Object::Dictionary(dictionary) => {
+                dictionary
+                    .iter_mut()
+                    .for_each(|(_, value)| self.remap(value));
+            }
+            Object::Stream(stream) => {
+                stream
+                    .dict
+                    .iter_mut()
+                    .for_each(|(_, value)| self.remap(value));
+            }
+            _ => {}
+        }
+    }
+
+    fn target_reference(&mut self, id: ObjectId) -> Object {
+        if let Some(new_id) = self.ids.get(&id) {
+            return Object::Reference(*new_id);
+        }
+        let is_page_node = self
+            .source
+            .get_dictionary(id)
+            .ok()
+            .and_then(|dictionary| dictionary.get(b"Type").ok())
+            .is_some_and(|kind| matches!(kind.as_name(), Ok(b"Page" | b"Pages")));
+        if is_page_node || self.source.get_object(id).is_err() {
+            return Object::Null;
+        }
+        let new_id = (self.next_id, 0);
+        self.next_id += 1;
+        self.ids.insert(id, new_id);
+        self.queue.push((id, new_id));
+        Object::Reference(new_id)
+    }
 }
 
 pub fn strip_document_metadata(document: &mut Document) {
@@ -361,18 +494,50 @@ fn parse_page_number(value: &str, page_count: usize) -> Result<usize> {
     Ok(page)
 }
 
-pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> {
-    let info = jpeg_info(&jpeg)?;
+/// Where an image is drawn on its page: the page follows the image
+/// orientation and the image is fitted and centred.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImagePlacement {
+    pub page_width: f64,
+    pub page_height: f64,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+pub(crate) fn image_placement(
+    pixel_width: u32,
+    pixel_height: u32,
+    page_size: &str,
+) -> Result<ImagePlacement> {
     let (mut page_width, mut page_height) = paper_size(page_size)?;
-    if (info.width > info.height) != (page_width > page_height) {
+    if (pixel_width > pixel_height) != (page_width > page_height) {
         std::mem::swap(&mut page_width, &mut page_height);
     }
+    let scale = (page_width / f64::from(pixel_width)).min(page_height / f64::from(pixel_height));
+    let width = f64::from(pixel_width) * scale;
+    let height = f64::from(pixel_height) * scale;
+    Ok(ImagePlacement {
+        page_width,
+        page_height,
+        x: (page_width - width) / 2.0,
+        y: (page_height - height) / 2.0,
+        width,
+        height,
+    })
+}
 
-    let scale = (page_width / f64::from(info.width)).min(page_height / f64::from(info.height));
-    let image_width = f64::from(info.width) * scale;
-    let image_height = f64::from(info.height) * scale;
-    let offset_x = (page_width - image_width) / 2.0;
-    let offset_y = (page_height - image_height) / 2.0;
+pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> {
+    let info = jpeg_info(&jpeg)?;
+    let ImagePlacement {
+        page_width,
+        page_height,
+        x: offset_x,
+        y: offset_y,
+        width: image_width,
+        height: image_height,
+    } = image_placement(u32::from(info.width), u32::from(info.height), page_size)?;
 
     let mut document = Document::with_version("1.5");
     let pages_id = document.new_object_id();
@@ -458,13 +623,13 @@ pub(super) fn object_number(object: &Object) -> Result<f64> {
 }
 
 #[derive(Debug)]
-struct JpegInfo {
-    width: u16,
-    height: u16,
-    components: u8,
+pub(crate) struct JpegInfo {
+    pub width: u16,
+    pub height: u16,
+    pub components: u8,
 }
 
-fn jpeg_info(bytes: &[u8]) -> Result<JpegInfo> {
+pub(crate) fn jpeg_info(bytes: &[u8]) -> Result<JpegInfo> {
     let decoder = JpegDecoder::new(Cursor::new(bytes)).context("not a valid JPEG file")?;
     let (width, height) = decoder.dimensions();
     let components = match decoder.original_color_type() {

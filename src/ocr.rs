@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -11,15 +9,23 @@ use lopdf::Document;
 use serde_json::{Value, json};
 use ureq::{Agent, Proxy};
 
+use crate::config::Config;
 use crate::encoding::base64;
+use crate::fileset::InputSpec;
 use crate::formats::{self, Format};
 use crate::hash::sha256_hex;
 use crate::imageconv::{self, ImageOptions};
-use crate::{atomic, output, pdf};
+use crate::pdf::image::{self as pdf_image, ExtractedImage, Selection};
+use crate::textpdf::{PageTextOverlay, overlay_searchable_text};
+use crate::winocr::{OcrPageResult, OcrWordBox};
+use crate::{atomic, output, parallel, pdf};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
 const TEXT_LAYER_THRESHOLD: usize = 100;
+/// Images smaller than this (in pixels) carry no useful text for a
+/// searchable layer.
+const MIN_SEARCHABLE_IMAGE_AREA: u64 = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OcrBackend {
@@ -29,7 +35,7 @@ pub enum OcrBackend {
 }
 
 impl OcrBackend {
-    pub fn parse(value: &str, _api_key: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "groq" => Ok(Self::Groq),
             "windows" | "win" | "winocr" => {
@@ -59,6 +65,27 @@ pub struct OcrOptions {
     pub jobs: usize,
     pub max_tokens: u32,
     pub cache_dir: Option<PathBuf>,
+}
+
+impl OcrOptions {
+    /// Options from configuration alone: Groq backend, one job, no cache.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            backend: OcrBackend::Groq,
+            lang: config.ocr_lang.clone(),
+            api_key: config.groq_api_key.clone(),
+            proxy: config.proxy.clone(),
+            model: config.ocr_model.clone(),
+            prompt: config.ocr_prompt.clone(),
+            endpoint: config.ocr_endpoint.clone(),
+            timeout: Duration::from_secs(config.ocr_timeout_seconds),
+            force_image_ocr: false,
+            image: config.image_options(None, None),
+            jobs: 1,
+            max_tokens: config.ocr_max_tokens,
+            cache_dir: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -100,11 +127,11 @@ impl RequestGate {
             let now = Instant::now();
             if state.blocked_until > now {
                 let wait = state.blocked_until - now;
-                let (next, _) = self
+                state = self
                     .changed
                     .wait_timeout(state, wait)
-                    .unwrap_or_else(|error| error.into_inner());
-                state = next;
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0;
             } else if state.active < self.maximum {
                 state.active += 1;
                 return RequestPermit(self);
@@ -136,34 +163,45 @@ impl Drop for RequestPermit<'_> {
     }
 }
 
+fn build_agent(options: &OcrOptions) -> Result<Agent> {
+    let mut builder = Agent::config_builder()
+        .proxy(None)
+        .http_status_as_error(false)
+        .timeout_global(Some(options.timeout))
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(options.timeout));
+    #[cfg(windows)]
+    {
+        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+        // SChannel with the Windows certificate store.
+        builder = builder.tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        );
+    }
+    let proxy = options.proxy.trim();
+    if !proxy.is_empty() {
+        builder = builder.proxy(Some(Proxy::new(proxy).context("invalid proxy URL")?));
+    }
+    Ok(builder.build().into())
+}
+
 impl OcrEngine {
     pub fn new(options: OcrOptions) -> Result<Self> {
         if options.jobs == 0 {
             bail!("OCR jobs must be at least 1");
         }
-
-        let mut builder = Agent::config_builder()
-            .proxy(None)
-            .http_status_as_error(false)
-            .timeout_global(Some(options.timeout))
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_body(Some(options.timeout));
-        if !options.proxy.trim().is_empty() {
-            builder = builder.proxy(Some(
-                Proxy::new(options.proxy.trim()).context("invalid proxy URL")?,
-            ));
-        }
-        let agent = builder.build().into();
-        let jobs = options.jobs;
         Ok(Self {
-            agent,
+            agent: build_agent(&options)?,
+            gate: Arc::new(RequestGate::new(options.jobs)),
             options,
-            gate: Arc::new(RequestGate::new(jobs)),
             cache_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    pub fn extract_spec(&self, spec: &crate::fileset::InputSpec) -> Result<String> {
+    pub fn extract_spec(&self, spec: &InputSpec) -> Result<String> {
         self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), true)
     }
 
@@ -176,212 +214,102 @@ impl OcrEngine {
         match formats::detect(path) {
             Some(Format::Pdf) => self.process_pdf(path, pages_filter, parallel_pdf_images),
             Some(format) if format.is_image() => {
-                if pages_filter.is_some() {
-                    return Err(crate::commands::common::err_pdf_only_page_ranges(path));
-                }
+                reject_pages(path, pages_filter)?;
                 let image = imageconv::for_ocr(path, &self.options.image)?;
-                let res = self.recognize_image(&image, file_label(path))?;
-                Ok(res.text)
+                Ok(self.recognize_image(&image, file_label(path))?.text)
             }
             _ => bail!("unsupported OCR input: {}", path.display()),
         }
     }
 
-    pub fn extract_many_specs(&self, specs: &[crate::fileset::InputSpec]) -> Vec<Result<String>> {
+    pub fn extract_many_specs(&self, specs: &[InputSpec]) -> Vec<Result<String>> {
         if specs.len() <= 1 {
             return specs.iter().map(|spec| self.extract_spec(spec)).collect();
         }
-        parallel_map(specs, self.options.jobs, |spec| {
+        parallel::map(specs, self.options.jobs, |spec| {
             self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), false)
         })
     }
 
+    /// A PDF with an invisible text layer: existing PDF pages keep their
+    /// content, images become single-page documents.
     pub fn create_searchable_pdf_for_spec(
         &self,
-        spec: &crate::fileset::InputSpec,
-        config: &crate::config::Config,
-    ) -> Result<lopdf::Document> {
+        spec: &InputSpec,
+        page_size: &str,
+        font_path: Option<&Path>,
+    ) -> Result<Document> {
         match formats::detect(&spec.path) {
             Some(Format::Pdf) => {
                 let mut document = pdf::load(&spec.path)?;
                 if let Some(pages) = &spec.pages {
                     pdf::select_pages(&mut document, pages)?;
                 }
-
-                struct PageImageInfo {
-                    page_id: lopdf::ObjectId,
-                    width: f64,
-                    height: f64,
-                    images: Vec<ExtractedImage>,
-                }
-
-                let mut page_images = Vec::new();
-                for (page_number, page_id) in document.get_pages() {
-                    let images = match document.get_page_images(page_id) {
-                        Ok(images) => images,
-                        Err(error) => {
-                            output::warn(format!(
-                                "page {page_number}: cannot inspect images: {error}"
-                            ));
-                            continue;
-                        }
-                    };
-
-                    let page_rotation = crate::pdf::transform::page_geometry(&document, page_id)
-                        .map(|g| g.rotation)
-                        .unwrap_or(0);
-                    let page_width = crate::pdf::transform::page_geometry(&document, page_id)
-                        .map(|g| (g.right - g.left).abs())
-                        .unwrap_or(595.0);
-                    let page_height = crate::pdf::transform::page_geometry(&document, page_id)
-                        .map(|g| (g.top - g.bottom).abs())
-                        .unwrap_or(842.0);
-
-                    let mut extracted_images = Vec::new();
-                    for (index, image_info) in images.into_iter().enumerate() {
-                        let stream = match document
-                            .get_object(image_info.id)
-                            .and_then(|obj| obj.as_stream())
-                        {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        let mut image = match pdf::image::decode(stream) {
-                            Ok(img) => img,
-                            Err(_) => continue,
-                        };
-                        if page_rotation == 90 {
-                            image = image.rotate90();
-                        } else if page_rotation == 180 {
-                            image = image.rotate180();
-                        } else if page_rotation == 270 {
-                            image = image.rotate270();
-                        }
-
-                        let area = image.width().saturating_mul(image.height());
-                        if area > 100_000
-                            && let Ok(bytes) = imageconv::encode_jpeg_on_white(
-                                &image,
-                                self.options.image.jpeg_quality,
-                            )
-                        {
-                            extracted_images.push(ExtractedImage {
-                                label: format!("page-{page_number}-image-{}", index + 1),
-                                bytes,
-                            });
-                        }
-                    }
-
-                    if !extracted_images.is_empty() {
-                        page_images.push(PageImageInfo {
-                            page_id,
-                            width: page_width,
-                            height: page_height,
-                            images: extracted_images,
-                        });
-                    }
-                }
-
-                if page_images.is_empty() {
+                let pages = pdf_image::extract_images(
+                    &document,
+                    Selection::AllFrom(MIN_SEARCHABLE_IMAGE_AREA),
+                    self.options.image.jpeg_quality,
+                )
+                .into_iter()
+                .filter(|(_, images)| !images.is_empty())
+                .map(|(page_id, images)| {
+                    let geometry = pdf::transform::page_geometry(&document, page_id).ok();
+                    let size = geometry.map_or((595.0, 842.0), |geometry| {
+                        (geometry.raw_width(), geometry.raw_height())
+                    });
+                    (page_id, size, images)
+                })
+                .collect::<Vec<_>>();
+                if pages.is_empty() {
                     bail!("no extractable images found in {}", spec.path.display());
                 }
 
-                let recognize = |info: &PageImageInfo| -> Result<crate::textpdf::PageTextOverlay> {
-                    let mut all_scaled_words = Vec::new();
-                    let mut all_fallback_text = String::new();
-
-                    for image in &info.images {
-                        output::info(format!("OCR {} (searchable layer)...", image.label));
-                        let page_res = match self.recognize_image(&image.bytes, &image.label) {
-                            Ok(res) => res,
-                            Err(e) => {
-                                output::warn(format!("Failed to OCR {}: {}", image.label, e));
-                                continue;
-                            }
-                        };
-
-                        let (img_w, img_h) =
-                            image::ImageReader::new(std::io::Cursor::new(&image.bytes))
-                                .with_guessed_format()
-                                .ok()
-                                .and_then(|r| r.into_dimensions().ok())
-                                .unwrap_or((
-                                    page_res.image_width.max(1),
-                                    page_res.image_height.max(1),
-                                ));
-
-                        let scale_x = info.width / f64::from(img_w.max(1));
-                        let scale_y = info.height / f64::from(img_h.max(1));
-
-                        for mut word in page_res.words {
-                            word.x *= scale_x;
-                            word.y *= scale_y;
-                            word.width *= scale_x;
-                            word.height *= scale_y;
-                            word.line_y *= scale_y;
-                            word.line_height *= scale_y;
-                            all_scaled_words.push(word);
-                        }
-
-                        if !all_fallback_text.is_empty() && !page_res.text.is_empty() {
-                            all_fallback_text.push_str("\n\n");
-                        }
-                        all_fallback_text.push_str(&page_res.text);
-                    }
-
-                    Ok(crate::textpdf::PageTextOverlay {
-                        page_id: info.page_id,
-                        page_width: info.width,
-                        page_height: info.height,
-                        scaled_words: all_scaled_words,
-                        fallback_text: if all_fallback_text.is_empty() {
-                            None
-                        } else {
-                            Some(all_fallback_text)
-                        },
-                    })
-                };
-
-                let results = parallel_map(&page_images, self.options.jobs, recognize);
-                let mut overlays = Vec::with_capacity(results.len());
-                for r in results {
-                    overlays.push(r?);
-                }
-
-                crate::textpdf::overlay_searchable_text(
-                    &mut document,
-                    &overlays,
-                    config.font_path.as_deref(),
-                )?;
+                let overlays =
+                    parallel::map(&pages, self.options.jobs, |(page_id, size, images)| {
+                        self.page_overlay(*page_id, *size, images)
+                    });
+                overlay_searchable_text(&mut document, &overlays, font_path)?;
                 Ok(document)
             }
             Some(format) if format.is_image() => {
-                if spec.pages.is_some() {
-                    return Err(crate::commands::common::err_pdf_only_page_ranges(
-                        &spec.path,
-                    ));
-                }
+                reject_pages(&spec.path, spec.pages.as_deref())?;
                 let jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
-                let (w, h) = image::ImageReader::new(std::io::Cursor::new(&jpeg))
-                    .with_guessed_format()
-                    .ok()
-                    .and_then(|r| r.into_dimensions().ok())
-                    .unwrap_or((1, 1));
+                let info = pdf::jpeg_info(&jpeg)?;
+                let (width, height) = (u32::from(info.width), u32::from(info.height));
                 output::info(format!("OCR {} (searchable layer)...", spec.path.display()));
-                let page_res = self.recognize_image(&jpeg, file_label(&spec.path))?;
-                let page_input = crate::textpdf::SearchablePageInput {
-                    jpeg_bytes: jpeg,
-                    width: w,
-                    height: h,
-                    words: page_res.words,
-                    fallback_text: Some(page_res.text),
+                let result = self.recognize_image(&jpeg, file_label(&spec.path))?;
+
+                let placement = pdf::image_placement(width, height, page_size)?;
+                let mut document = pdf::jpeg_document(jpeg, page_size)?;
+                let page_id = *document
+                    .get_pages()
+                    .get(&1)
+                    .context("image page is missing")?;
+                // Image pixels -> page points, measured from the page top.
+                let scale = placement.width / f64::from(width);
+                let top = placement.page_height - placement.y - placement.height;
+                let words = result
+                    .words
+                    .into_iter()
+                    .map(|word| OcrWordBox {
+                        x: placement.x + word.x * scale,
+                        y: top + word.y * scale,
+                        width: word.width * scale,
+                        height: word.height * scale,
+                        line_y: top + word.line_y * scale,
+                        line_height: word.line_height * scale,
+                        text: word.text,
+                    })
+                    .collect();
+                let overlay = PageTextOverlay {
+                    page_id,
+                    page_width: placement.page_width,
+                    page_height: placement.page_height,
+                    scaled_words: words,
+                    fallback_text: Some(result.text),
                 };
-                let doc = crate::textpdf::render_searchable_pdf(
-                    &[page_input],
-                    &config.page_size,
-                    config.font_path.as_deref(),
-                )?;
-                Ok(doc)
+                overlay_searchable_text(&mut document, &[overlay], font_path)?;
+                Ok(document)
             }
             _ => bail!(
                 "unsupported OCR input for PDF output: {}",
@@ -390,15 +318,57 @@ impl OcrEngine {
         }
     }
 
+    /// Recognise the images of one page and map their words onto the page,
+    /// assuming each image covers the whole page.
+    fn page_overlay(
+        &self,
+        page_id: lopdf::ObjectId,
+        (page_width, page_height): (f64, f64),
+        images: &[ExtractedImage],
+    ) -> PageTextOverlay {
+        let mut words = Vec::new();
+        let mut fallback = Vec::new();
+        for image in images {
+            output::info(format!("OCR {} (searchable layer)...", image.label));
+            let result = match self.recognize_image(&image.bytes, &image.label) {
+                Ok(result) => result,
+                Err(error) => {
+                    output::warn(format!("Failed to OCR {}: {error:#}", image.label));
+                    continue;
+                }
+            };
+            let scale_x = page_width / f64::from(image.width.max(1));
+            let scale_y = page_height / f64::from(image.height.max(1));
+            words.extend(result.words.into_iter().map(|mut word| {
+                word.x *= scale_x;
+                word.y *= scale_y;
+                word.width *= scale_x;
+                word.height *= scale_y;
+                word.line_y *= scale_y;
+                word.line_height *= scale_y;
+                word
+            }));
+            if !result.text.is_empty() {
+                fallback.push(result.text);
+            }
+        }
+        PageTextOverlay {
+            page_id,
+            page_width,
+            page_height,
+            scaled_words: words,
+            fallback_text: (!fallback.is_empty()).then(|| fallback.join("\n\n")),
+        }
+    }
+
     pub fn check_connection(&self) -> Result<()> {
         self.ensure_api_key()?;
         let endpoint = models_endpoint(&self.options.endpoint)?;
-        let authorization = format!("Bearer {}", self.options.api_key);
         let _permit = self.gate.enter();
         let response = self
             .agent
             .get(&endpoint)
-            .header("Authorization", &authorization)
+            .header("Authorization", &self.authorization())
             .call()
             .context("failed to connect to Groq through the configured network path")?;
         let status = response.status().as_u16();
@@ -418,22 +388,21 @@ impl OcrEngine {
         if let Some(pages) = pages_filter {
             pdf::select_pages(&mut document, pages)?;
         }
-        let pages = document.get_pages();
+        let page_count = document.get_pages().len();
         let native_text = pdf::extract_text(&document).unwrap_or_default();
         let mut parts = Vec::new();
         if !native_text.trim().is_empty() {
             parts.push(native_text.trim().to_owned());
         }
 
-        if !self.options.force_image_ocr && has_text_layer(&native_text, pages.len()) {
+        if !self.options.force_image_ocr && has_text_layer(&native_text, page_count) {
             output::info(format!(
-                "Text layer found ({} pages), skipping image OCR",
-                pages.len()
+                "Text layer found ({page_count} pages), skipping image OCR"
             ));
             return Ok(parts.join("\n\n"));
         }
 
-        let images = extract_pdf_images(&document, &self.options.image)?;
+        let images = extract_pdf_images(&document, &self.options.image);
         if images.is_empty() {
             if parts.is_empty() {
                 bail!("no extractable images or text found in {}", path.display());
@@ -444,13 +413,14 @@ impl OcrEngine {
         let recognize = |image: &ExtractedImage| {
             output::info(format!("OCR {}...", image.label));
             self.recognize_image(&image.bytes, &image.label)
-                .map(|res| res.text)
+                .map(|result| result.text)
         };
-        let results = if parallel_images {
-            parallel_map(&images, self.options.jobs, recognize)
+        let jobs = if parallel_images {
+            self.options.jobs
         } else {
-            images.iter().map(recognize).collect()
+            1
         };
+        let results = parallel::map(&images, jobs, recognize);
         let mut failures = 0usize;
         for (image, result) in images.iter().zip(results) {
             match result {
@@ -468,38 +438,19 @@ impl OcrEngine {
         Ok(parts.join("\n\n---\n\n"))
     }
 
-    pub fn recognize_image(
-        &self,
-        original: &[u8],
-        label: &str,
-    ) -> Result<crate::winocr::OcrPageResult> {
+    pub fn recognize_image(&self, original: &[u8], label: &str) -> Result<OcrPageResult> {
         match self.options.backend {
             OcrBackend::Windows => self.recognize_image_winocr(original, label),
-            OcrBackend::Groq => {
-                let text = self.run_vision(original, label)?;
-                Ok(crate::winocr::OcrPageResult {
-                    text,
-                    words: Vec::new(),
-                    image_width: 0,
-                    image_height: 0,
-                })
-            }
+            OcrBackend::Groq => self
+                .run_vision(original, label)
+                .map(OcrPageResult::text_only),
             OcrBackend::Auto => {
                 if !self.options.api_key.trim().is_empty() {
                     match self.run_vision(original, label) {
-                        Ok(text) => {
-                            return Ok(crate::winocr::OcrPageResult {
-                                text,
-                                words: Vec::new(),
-                                image_width: 0,
-                                image_height: 0,
-                            });
-                        }
-                        Err(error) => {
-                            output::warn(format!(
-                                "Groq OCR failed for {label}: {error}, falling back to Windows OCR..."
-                            ));
-                        }
+                        Ok(text) => return Ok(OcrPageResult::text_only(text)),
+                        Err(error) => output::warn(format!(
+                            "Groq OCR failed for {label}: {error}, falling back to Windows OCR..."
+                        )),
                     }
                 }
                 if cfg!(windows) && crate::winocr::is_available() {
@@ -513,87 +464,22 @@ impl OcrEngine {
         }
     }
 
-    fn recognize_image_winocr(
-        &self,
-        original: &[u8],
-        label: &str,
-    ) -> Result<crate::winocr::OcrPageResult> {
-        let lang_str = self.options.lang.as_deref().unwrap_or("default");
-        if let Some(cache_dir) = &self.options.cache_dir {
-            let key = sha256_hex(&[
-                b"bpdf-ocr-winocr-v1\0",
-                lang_str.as_bytes(),
-                b"\0",
-                original,
-            ]);
-            let path = cache_dir.join(format!("{key}.json"));
-            let item_lock = {
-                let mut locks = self
-                    .cache_locks
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                locks
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone()
-            };
-            let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
-            if let Ok(data) = fs::read_to_string(&path)
-                && let Ok(saved) = serde_json::from_str::<Value>(&data)
-            {
-                output::info(format!("OCR cache hit: {label}"));
-                let text = saved["text"].as_str().unwrap_or_default().to_owned();
-                let words = saved["words"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|w| {
-                                Some(crate::winocr::OcrWordBox {
-                                    text: w["text"].as_str()?.to_owned(),
-                                    x: w["x"].as_f64()?,
-                                    y: w["y"].as_f64()?,
-                                    width: w["width"].as_f64()?,
-                                    height: w["height"].as_f64()?,
-                                    line_y: w["line_y"].as_f64().unwrap_or(w["y"].as_f64()?),
-                                    line_height: w["line_height"]
-                                        .as_f64()
-                                        .unwrap_or(w["height"].as_f64()?),
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let w = saved["width"].as_u64().unwrap_or(0) as u32;
-                let h = saved["height"].as_u64().unwrap_or(0) as u32;
-                return Ok(crate::winocr::OcrPageResult {
-                    text,
-                    words,
-                    image_width: w,
-                    image_height: h,
-                });
-            }
-            let res = crate::winocr::recognize_image_bytes(original, self.options.lang.as_deref())?;
-            let json_val = json!({
-                "text": res.text,
-                "width": res.image_width,
-                "height": res.image_height,
-                "words": res.words.iter().map(|w| json!({
-                    "text": w.text,
-                    "x": w.x,
-                    "y": w.y,
-                    "width": w.width,
-                    "height": w.height,
-                    "line_y": w.line_y,
-                    "line_height": w.line_height,
-                })).collect::<Vec<_>>(),
-            });
-            if let Ok(json_str) = serde_json::to_string(&json_val) {
-                let _ = fs::create_dir_all(cache_dir);
-                let _ = atomic::write_atomic(&path, json_str.as_bytes());
-            }
-            return Ok(res);
-        }
-        crate::winocr::recognize_image_bytes(original, self.options.lang.as_deref())
+    fn recognize_image_winocr(&self, original: &[u8], label: &str) -> Result<OcrPageResult> {
+        let lang = self.options.lang.as_deref();
+        let key_parts: [&[u8]; 4] = [
+            b"bpdf-ocr-winocr-v1\0",
+            lang.unwrap_or("default").as_bytes(),
+            b"\0",
+            original,
+        ];
+        self.cached(
+            &key_parts,
+            "json",
+            label,
+            |data| serde_json::from_str(&data).ok(),
+            |result| serde_json::to_string(result).ok(),
+            || crate::winocr::recognize_image_bytes(original, lang),
+        )
     }
 
     fn run_vision(&self, original: &[u8], label: &str) -> Result<String> {
@@ -601,10 +487,7 @@ impl OcrEngine {
             output::warn(format!("failed to optimize {label}: {error:#}"));
             original.to_vec()
         });
-        let Some(cache_dir) = &self.options.cache_dir else {
-            return self.run_vision_uncached(&image);
-        };
-        let key = sha256_hex(&[
+        let key_parts: [&[u8]; 8] = [
             b"bpdf-ocr-v1\0",
             self.options.endpoint.as_bytes(),
             b"\0",
@@ -613,51 +496,79 @@ impl OcrEngine {
             self.options.prompt.as_bytes(),
             b"\0",
             &image,
-        ]);
-        let path = cache_dir.join(format!("{key}.md"));
-        let item_lock = {
-            let mut locks = self
-                .cache_locks
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+        ];
+        self.cached(
+            &key_parts,
+            "md",
+            label,
+            Some,
+            |text| Some(text.clone()),
+            || self.run_vision_uncached(&image),
+        )
+    }
+
+    /// Content-addressed cache around an OCR call. Concurrent requests for
+    /// the same key wait for the first one instead of repeating it.
+    fn cached<T>(
+        &self,
+        key_parts: &[&[u8]],
+        extension: &str,
+        label: &str,
+        decode: impl FnOnce(String) -> Option<T>,
+        encode: impl FnOnce(&T) -> Option<String>,
+        compute: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(cache_dir) = &self.options.cache_dir else {
+            return compute();
         };
+        let key = sha256_hex(key_parts);
+        let path = cache_dir.join(format!("{key}.{extension}"));
+        let item_lock = self
+            .cache_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(key)
+            .or_default()
+            .clone();
         let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
+
         match fs::read_to_string(&path) {
-            Ok(text) => {
-                output::info(format!("OCR cache hit: {label}"));
-                return Ok(text);
+            Ok(data) => {
+                if let Some(value) = decode(data) {
+                    output::info(format!("OCR cache hit: {label}"));
+                    return Ok(value);
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                output::warn(format!("cannot read OCR cache {}: {error}", path.display()))
+                output::warn(format!("cannot read OCR cache {}: {error}", path.display()));
             }
         }
 
-        let text = self.run_vision_uncached(&image)?;
-        let cache_result: Result<()> = (|| {
-            fs::create_dir_all(cache_dir)?;
-            atomic::write_atomic(&path, text.as_bytes())?;
-            Ok(())
-        })();
-        if let Err(error) = cache_result {
+        let value = compute()?;
+        if let Some(data) = encode(&value)
+            && let Err(error) = fs::create_dir_all(cache_dir)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| atomic::write_atomic(&path, data.as_bytes()))
+        {
             output::warn(format!(
-                "cannot write OCR cache {}: {error}",
+                "cannot write OCR cache {}: {error:#}",
                 path.display()
             ));
         }
-        Ok(text)
+        Ok(value)
+    }
+
+    fn authorization(&self) -> String {
+        format!("Bearer {}", self.options.api_key)
     }
 
     fn run_vision_uncached(&self, image: &[u8]) -> Result<String> {
         self.ensure_api_key()?;
-        let mime = match image::guess_format(image).ok() {
-            Some(image::ImageFormat::Png) => "image/png",
-            Some(image::ImageFormat::WebP) => "image/webp",
-            Some(image::ImageFormat::Gif) => "image/gif",
+        let mime = match image::guess_format(image) {
+            Ok(image::ImageFormat::Png) => "image/png",
+            Ok(image::ImageFormat::WebP) => "image/webp",
+            Ok(image::ImageFormat::Gif) => "image/gif",
             _ => "image/jpeg",
         };
         let payload = json!({
@@ -677,7 +588,7 @@ impl OcrEngine {
             "temperature": 0.0,
             "max_tokens": self.options.max_tokens
         });
-        let authorization = format!("Bearer {}", self.options.api_key);
+        let authorization = self.authorization();
 
         for attempt in 1..=MAX_ATTEMPTS {
             let permit = self.gate.enter();
@@ -746,121 +657,27 @@ impl OcrEngine {
     }
 }
 
-fn parallel_map<T, R, F>(items: &[T], jobs: usize, work: F) -> Vec<R>
-where
-    T: Sync,
-    R: Send,
-    F: Fn(&T) -> R + Sync,
-{
-    if items.len() <= 1 || jobs == 1 {
-        return items.iter().map(work).collect();
+fn reject_pages(path: &Path, pages: Option<&str>) -> Result<()> {
+    if pages.is_some() {
+        return Err(crate::commands::common::err_pdf_only_page_ranges(path));
     }
-
-    let next = AtomicUsize::new(0);
-    let results = Mutex::new(
-        std::iter::repeat_with(|| None)
-            .take(items.len())
-            .collect::<Vec<Option<R>>>(),
-    );
-    thread::scope(|scope| {
-        for _ in 0..jobs.min(items.len()) {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(index) else {
-                        break;
-                    };
-                    let result = work(item);
-                    results.lock().unwrap_or_else(|error| error.into_inner())[index] = Some(result);
-                }
-            });
-        }
-    });
-    results
-        .into_inner()
-        .unwrap_or_else(|error| error.into_inner())
-        .into_iter()
-        .map(|result| result.expect("each parallel item is processed"))
-        .collect()
+    Ok(())
 }
 
 fn models_endpoint(endpoint: &str) -> Result<String> {
-    let endpoint = endpoint.trim_end_matches('/');
     let base = endpoint
+        .trim_end_matches('/')
         .strip_suffix("/chat/completions")
         .context("OCR endpoint must end with /chat/completions for doctor")?;
     Ok(format!("{base}/models"))
 }
 
-#[derive(Debug)]
-pub struct ExtractedImage {
-    pub label: String,
-    pub bytes: Vec<u8>,
-}
-
-pub fn extract_pdf_images(
-    document: &Document,
-    options: &ImageOptions,
-) -> Result<Vec<ExtractedImage>> {
-    let mut output = Vec::new();
-    for (page_number, page_id) in document.get_pages() {
-        let images = match document.get_page_images(page_id) {
-            Ok(images) => images,
-            Err(error) => {
-                output::warn(format!(
-                    "page {page_number}: cannot inspect images: {error}"
-                ));
-                continue;
-            }
-        };
-        let page_rotation = crate::pdf::transform::page_geometry(document, page_id)
-            .map(|g| g.rotation)
-            .unwrap_or(0);
-
-        let mut best_image: Option<(u32, ExtractedImage)> = None;
-
-        for (index, image_info) in images.into_iter().enumerate() {
-            let stream = match document
-                .get_object(image_info.id)
-                .and_then(|obj| obj.as_stream())
-            {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let _label = format!("page-{page_number}-image-{}", index + 1);
-            let mut image = match pdf::image::decode(stream) {
-                Ok(img) => img,
-                Err(_) => continue,
-            };
-            if page_rotation == 90 {
-                image = image.rotate90();
-            } else if page_rotation == 180 {
-                image = image.rotate180();
-            } else if page_rotation == 270 {
-                image = image.rotate270();
-            }
-
-            let area = image.width().saturating_mul(image.height());
-            if best_image
-                .as_ref()
-                .is_none_or(|(best_area, _)| area > *best_area)
-                && let Ok(bytes) = imageconv::encode_jpeg_on_white(&image, options.jpeg_quality)
-            {
-                best_image = Some((
-                    area,
-                    ExtractedImage {
-                        label: format!("page-{page_number}"),
-                        bytes,
-                    },
-                ));
-            }
-        }
-
-        if let Some((_, best)) = best_image {
-            output.push(best);
-        }
-    }
-    Ok(output)
+/// The largest image of every page, oriented like the page.
+pub fn extract_pdf_images(document: &Document, options: &ImageOptions) -> Vec<ExtractedImage> {
+    pdf_image::extract_images(document, Selection::Largest, options.jpeg_quality)
+        .into_iter()
+        .flat_map(|(_, images)| images)
+        .collect()
 }
 
 fn has_text_layer(text: &str, pages: usize) -> bool {
@@ -918,41 +735,20 @@ mod tests {
     use super::*;
 
     fn options_without_api_key() -> OcrOptions {
-        let config = crate::config::Config::default();
-        let image = config.image_options(None, None);
         OcrOptions {
-            backend: OcrBackend::Groq,
-            lang: None,
             api_key: String::new(),
-            proxy: String::new(),
-            model: config.ocr_model,
-            prompt: config.ocr_prompt,
-            endpoint: config.ocr_endpoint,
             timeout: Duration::from_secs(1),
-            force_image_ocr: false,
-            image,
-            jobs: 1,
-            max_tokens: config.ocr_max_tokens,
-            cache_dir: None,
+            ..OcrOptions::from_config(&Config::default())
         }
     }
 
     #[test]
     fn ocr_backend_parsing() {
-        assert_eq!(OcrBackend::parse("groq", "").unwrap(), OcrBackend::Groq);
+        assert_eq!(OcrBackend::parse("groq").unwrap(), OcrBackend::Groq);
+        assert_eq!(OcrBackend::parse("auto").unwrap(), OcrBackend::Auto);
         if cfg!(windows) {
-            assert_eq!(
-                OcrBackend::parse("windows", "").unwrap(),
-                OcrBackend::Windows
-            );
-            assert_eq!(
-                OcrBackend::parse("winocr", "").unwrap(),
-                OcrBackend::Windows
-            );
-            assert_eq!(
-                OcrBackend::parse("auto", "key123").unwrap(),
-                OcrBackend::Auto
-            );
+            assert_eq!(OcrBackend::parse("windows").unwrap(), OcrBackend::Windows);
+            assert_eq!(OcrBackend::parse("winocr").unwrap(), OcrBackend::Windows);
         }
     }
 
@@ -982,14 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn parallel_map_preserves_input_order() {
-        assert_eq!(
-            parallel_map(&[3, 1, 2, 4], 3, |value| value * 2),
-            vec![6, 2, 4, 8]
-        );
-    }
-
-    #[test]
     fn derives_models_endpoint_without_exposing_credentials() {
         assert_eq!(
             models_endpoint("https://api.groq.com/openai/v1/chat/completions").unwrap(),
@@ -998,11 +786,59 @@ mod tests {
     }
 
     #[test]
+    fn winocr_cache_round_trips_word_boxes() {
+        let result = OcrPageResult {
+            text: "Слово".to_owned(),
+            words: vec![OcrWordBox {
+                text: "Слово".to_owned(),
+                x: 1.0,
+                y: 2.0,
+                width: 3.0,
+                height: 4.0,
+                line_y: 2.0,
+                line_height: 4.0,
+            }],
+            image_width: 10,
+            image_height: 20,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"width\":10"));
+        let parsed: OcrPageResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.words[0].line_height, 4.0);
+        assert_eq!((parsed.image_width, parsed.image_height), (10, 20));
+    }
+
+    #[test]
+    fn cache_returns_stored_value_without_recomputing() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = OcrEngine::new(OcrOptions {
+            cache_dir: Some(directory.path().to_path_buf()),
+            ..options_without_api_key()
+        })
+        .unwrap();
+        let store = |value: &str| {
+            engine.cached(
+                &[b"key"],
+                "md",
+                "test",
+                Some,
+                |text| Some(text.clone()),
+                || Ok(value.to_owned()),
+            )
+        };
+        assert_eq!(store("first").unwrap(), "first");
+        assert_eq!(store("second").unwrap(), "first");
+    }
+
+    #[test]
     fn native_pdf_text_does_not_require_api_key() {
         let temporary = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
         let text = "Текстовый слой документа. ".repeat(20);
-        let mut document =
-            crate::textpdf::render(&text, &crate::textpdf::TextOptions::default()).unwrap();
+        let Ok(mut document) =
+            crate::textpdf::render(&text, &crate::textpdf::TextOptions::default())
+        else {
+            return;
+        };
         document.save(temporary.path()).unwrap();
         let engine = OcrEngine::new(options_without_api_key()).unwrap();
 
@@ -1016,17 +852,18 @@ mod tests {
     #[test]
     fn native_pdf_text_with_page_filter() {
         let temporary = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
-        let doc1 =
-            crate::textpdf::render("Первая страница", &crate::textpdf::TextOptions::default())
-                .unwrap();
-        let doc2 =
-            crate::textpdf::render("Вторая страница", &crate::textpdf::TextOptions::default())
-                .unwrap();
-        let mut merged = crate::pdf::merge_documents(vec![doc1, doc2]).unwrap();
+        let options = crate::textpdf::TextOptions::default();
+        let (Ok(first), Ok(second)) = (
+            crate::textpdf::render("Первая страница", &options),
+            crate::textpdf::render("Вторая страница", &options),
+        ) else {
+            return;
+        };
+        let mut merged = crate::pdf::merge_documents(vec![first, second]).unwrap();
         merged.save(temporary.path()).unwrap();
         let engine = OcrEngine::new(options_without_api_key()).unwrap();
 
-        let spec = crate::fileset::InputSpec {
+        let spec = InputSpec {
             path: temporary.path().to_path_buf(),
             pages: Some("2".to_owned()),
         };

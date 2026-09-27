@@ -79,46 +79,55 @@ impl InputFormatSet {
 }
 
 pub fn detect(path: &Path) -> Option<Format> {
-    let path_str = path.to_string_lossy();
-    if path_str.to_ascii_lowercase().ends_with(".fb2.zip") {
+    if has_extension(path, "zip") && !is_fb2_zip(path) {
+        return detect_zip_content(path);
+    }
+    detect_by_extension(path).or_else(|| is_text_file(path).then_some(Format::Text))
+}
+
+/// Format implied by the file name alone, without touching the file system.
+/// Generic `.zip` archives and unknown extensions return `None`.
+pub fn detect_by_extension(path: &Path) -> Option<Format> {
+    if is_fb2_zip(path) {
         return Some(Format::Fb2);
     }
-
-    if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
-        match extension.to_ascii_lowercase().as_str() {
-            "jpg" | "jpeg" => return Some(Format::Jpeg),
-            "png" => return Some(Format::Png),
-            "bmp" | "gif" | "tiff" | "tif" | "webp" | "apng" => return Some(Format::Raster),
-            "heic" | "heif" | "avif" | "psd" | "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx"
-            | "pnm" | "ppm" | "pgm" | "pbm" | "pam" | "sgi" | "xbm" | "jp2" | "j2k" | "j2c"
-            | "jpc" | "jpf" | "jpx" | "jls" | "dpx" | "fits" | "fit" | "fts" | "pgx" | "ras"
-            | "sun" | "xwd" | "pix" => return Some(Format::FfmpegRaster),
-            "jxr" | "wdp" | "hdp" | "ico" => return Some(Format::WicRaster),
-            "3fr" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf" | "fff"
-            | "gpr" | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf"
-            | "pef" | "raf" | "raw" | "rw2" | "rwl" | "sr2" | "srf" | "srw" | "x3f" => {
-                return Some(Format::CameraRaw);
-            }
-            "pdf" => return Some(Format::Pdf),
-            "doc" | "docx" | "rtf" | "odt" => return Some(Format::Word),
-            "xls" | "xlsx" | "ods" => return Some(Format::Excel),
-            "ppt" | "pptx" | "pps" | "ppsx" | "odp" => return Some(Format::PowerPoint),
-            "epub" => return Some(Format::Epub),
-            "fb2" => return Some(Format::Fb2),
-            "htmlz" => return Some(Format::Htmlz),
-            "cbz" => return Some(Format::Cbz),
-            "zip" => return detect_zip_content(path),
-            "md" | "txt" | "json" | "jsonc" | "xml" | "yaml" | "yml" | "log" | "ini" | "cfg"
-            | "csv" | "tsv" => return Some(Format::Text),
-            _ => {}
-        }
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some(Format::Jpeg),
+        "png" => Some(Format::Png),
+        "bmp" | "gif" | "tiff" | "tif" | "webp" | "apng" => Some(Format::Raster),
+        "heic" | "heif" | "avif" | "psd" | "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx"
+        | "pnm" | "ppm" | "pgm" | "pbm" | "pam" | "sgi" | "xbm" | "jp2" | "j2k" | "j2c" | "jpc"
+        | "jpf" | "jpx" | "jls" | "dpx" | "fits" | "fit" | "fts" | "pgx" | "ras" | "sun"
+        | "xwd" | "pix" => Some(Format::FfmpegRaster),
+        "jxr" | "wdp" | "hdp" | "ico" => Some(Format::WicRaster),
+        "3fr" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf" | "fff" | "gpr"
+        | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf" | "pef" | "raf"
+        | "raw" | "rw2" | "rwl" | "sr2" | "srf" | "srw" | "x3f" => Some(Format::CameraRaw),
+        "pdf" => Some(Format::Pdf),
+        "doc" | "docx" | "rtf" | "odt" => Some(Format::Word),
+        "xls" | "xlsx" | "ods" => Some(Format::Excel),
+        "ppt" | "pptx" | "pps" | "ppsx" | "odp" => Some(Format::PowerPoint),
+        "epub" => Some(Format::Epub),
+        "fb2" => Some(Format::Fb2),
+        "htmlz" => Some(Format::Htmlz),
+        "cbz" => Some(Format::Cbz),
+        "md" | "txt" | "json" | "jsonc" | "xml" | "yaml" | "yml" | "log" | "ini" | "cfg"
+        | "csv" | "tsv" => Some(Format::Text),
+        _ => None,
     }
+}
 
-    if is_text_file(path) {
-        Some(Format::Text)
-    } else {
-        None
-    }
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+fn is_fb2_zip(path: &Path) -> bool {
+    has_extension(path, "zip")
+        && path
+            .file_stem()
+            .is_some_and(|stem| has_extension(Path::new(stem), "fb2"))
 }
 
 /// Inspects ZIP archive entries to detect EPUB, FB2, HTMLZ, or CBZ format.
@@ -126,7 +135,7 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
     let Ok(file) = File::open(path) else {
         return None;
     };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+    let Ok(archive) = zip::ZipArchive::new(file) else {
         return None;
     };
 
@@ -135,18 +144,18 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
     let mut has_epub_container = false;
     let mut has_fb2 = false;
 
-    for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else {
+    for index in 0..archive.len() {
+        let Some(name) = archive.name_for_index(index) else {
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
         if name.ends_with("container.xml") {
             has_epub_container = true;
         } else if name == "index.html" {
             has_htmlz_index = true;
         } else if name.ends_with(".fb2") {
             has_fb2 = true;
-        } else if detect(Path::new(&name)).is_some_and(|f| f.is_image()) {
+        } else if detect_by_extension(Path::new(&name)).is_some_and(Format::is_image) {
             has_image = true;
         }
     }

@@ -1,14 +1,14 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result, bail};
 
-use super::common::{DOCUMENT_SEPARATOR, err_pdf_only_page_ranges, finish_batch, write_output};
+use super::common::{
+    DOCUMENT_SEPARATOR, err_pdf_only_page_ranges, finish_batch, handle_results, write_output,
+};
 use crate::cli::OcrArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
 use crate::ocr::{OcrBackend, OcrEngine, OcrOptions};
-use crate::output;
+use crate::{output, pdf};
 
 pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Ocr)?;
@@ -22,135 +22,73 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
     if !(1..=64).contains(&jobs) {
         bail!("--jobs must be between 1 and 64");
     }
-    let cache_dir = (!args.no_cache && config.ocr_cache).then(|| {
-        args.cache_dir
-            .clone()
-            .unwrap_or_else(|| config.ocr_cache_dir.clone())
-    });
-
-    let engine_name = args.engine.as_deref().unwrap_or(&config.ocr_engine);
-    let backend = OcrBackend::parse(engine_name, &config.groq_api_key)?;
-    let lang = args.lang.or_else(|| config.ocr_lang.clone());
-
+    let defaults = OcrOptions::from_config(config);
     let engine = OcrEngine::new(OcrOptions {
-        backend,
-        lang,
-        api_key: config.groq_api_key.clone(),
-        proxy: args.proxy.unwrap_or_else(|| config.proxy.clone()),
-        model: args.model.unwrap_or_else(|| config.ocr_model.clone()),
-        prompt: args.prompt.unwrap_or_else(|| config.ocr_prompt.clone()),
-        endpoint: args.endpoint.unwrap_or_else(|| config.ocr_endpoint.clone()),
-        timeout: Duration::from_secs(config.ocr_timeout_seconds),
+        backend: OcrBackend::parse(args.engine.as_deref().unwrap_or(&config.ocr_engine))?,
+        lang: args.lang.or(defaults.lang),
+        proxy: args.proxy.unwrap_or(defaults.proxy),
+        model: args.model.unwrap_or(defaults.model),
+        prompt: args.prompt.unwrap_or(defaults.prompt),
+        endpoint: args.endpoint.unwrap_or(defaults.endpoint),
         force_image_ocr: args.force_ocr,
         image: config.image_options(None, args.ffmpeg),
         jobs,
-        max_tokens: config.ocr_max_tokens,
-        cache_dir,
+        cache_dir: (!args.no_cache && config.ocr_cache).then(|| {
+            args.cache_dir
+                .unwrap_or_else(|| config.ocr_cache_dir.clone())
+        }),
+        ..defaults
     })?;
+    let searchable = |spec: &InputSpec| {
+        engine.create_searchable_pdf_for_spec(spec, &config.page_size, config.font_path.as_deref())
+    };
 
     if args.in_place {
-        for spec in &specs {
-            if formats::detect(&spec.path) != Some(Format::Pdf) {
-                bail!(
-                    "--in-place is only supported for PDF files, but found {}",
-                    spec.path.display()
-                );
-            }
+        if let Some(spec) = specs
+            .iter()
+            .find(|spec| formats::detect(&spec.path) != Some(Format::Pdf))
+        {
+            bail!(
+                "--in-place is only supported for PDF files, but found {}",
+                spec.path.display()
+            );
         }
-
-        let mut failures = 0usize;
-        for spec in &specs {
-            if let Some(pages) = &spec.pages {
-                output::info(format!(
-                    "Queued OCR (in-place): {}:{}",
-                    spec.path.display(),
-                    pages
-                ));
-            } else {
-                output::info(format!("Queued OCR (in-place): {}", spec.path.display()));
-            }
-
-            match engine.create_searchable_pdf_for_spec(spec, config) {
-                Ok(mut doc) => match crate::pdf::save_to_bytes(&mut doc) {
-                    Ok(bytes) => {
-                        if let Err(error) = write_output(&spec.path, &bytes) {
-                            failures += 1;
-                            output::warn(format!(
-                                "error writing {}: {error:#}",
-                                spec.path.display()
-                            ));
-                            if fail_fast {
-                                return Err(error).with_context(|| {
-                                    format!("failed to process {}", spec.path.display())
-                                });
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        failures += 1;
-                        output::warn(format!(
-                            "error generating PDF for {}: {error:#}",
-                            spec.path.display()
-                        ));
-                        if fail_fast {
-                            return Err(error).with_context(|| {
-                                format!("failed to process {}", spec.path.display())
-                            });
-                        }
-                    }
-                },
-                Err(error) => {
-                    failures += 1;
-                    output::warn(format!(
-                        "error processing {}: {error:#}",
-                        spec.path.display()
-                    ));
-                    if fail_fast {
-                        return Err(error)
-                            .with_context(|| format!("failed to process {}", spec.path.display()));
-                    }
-                }
-            }
-        }
+        let results = specs.iter().map(|spec| {
+            output::info(format!("Queued OCR (in-place): {}", describe(spec)));
+            let result = searchable(spec)
+                .and_then(|mut document| pdf::save_to_bytes(&mut document))
+                .and_then(|bytes| write_output(&spec.path, &bytes));
+            (&spec.path, result)
+        });
+        let failures = handle_results(
+            results,
+            fail_fast,
+            "failed to process",
+            "error processing",
+            drop,
+        )?;
         return finish_batch("ocr", specs.len(), failures, specs.len() - failures);
     }
 
-    let is_pdf_output = args
-        .out
-        .as_ref()
-        .and_then(|p| p.extension())
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("pdf"))
-        .unwrap_or(false);
-
-    if is_pdf_output {
-        let output_path = args.out.as_ref().unwrap();
-        let mut documents = Vec::new();
-        for spec in &specs {
-            let doc = engine.create_searchable_pdf_for_spec(spec, config)?;
-            documents.push(doc);
-        }
-        if documents.is_empty() {
-            bail!("no pages could be extracted for searchable PDF");
-        }
-        let mut doc = crate::pdf::merge_documents(documents)?;
-        let bytes = crate::pdf::save_to_bytes(&mut doc)?;
-        write_output(output_path, &bytes)?;
+    let pdf_output = args.out.as_ref().filter(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+    });
+    if let Some(output_path) = pdf_output {
+        let documents = specs.iter().map(searchable).collect::<Result<Vec<_>>>()?;
+        let mut document = pdf::merge_documents(documents)?;
+        write_output(output_path, &pdf::save_to_bytes(&mut document)?)?;
         return finish_batch("ocr", specs.len(), 0, 1);
     }
 
     for spec in &specs {
-        if let Some(pages) = &spec.pages {
-            output::info(format!("Queued OCR: {}:{}", spec.path.display(), pages));
-        } else {
-            output::info(format!("Queued OCR: {}", spec.path.display()));
-        }
+        output::info(format!("Queued OCR: {}", describe(spec)));
     }
     let results = extract(&engine, &specs, fail_fast);
     let combined = args.out.is_some();
     let mut parts = Vec::new();
     let mut failures = 0usize;
-
     for (spec, result) in specs.iter().zip(results) {
         match result {
             Ok(text) if combined => parts.push(text),
@@ -189,6 +127,13 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
         specs.len() - failures
     };
     finish_batch("ocr", specs.len(), failures, outputs)
+}
+
+fn describe(spec: &InputSpec) -> String {
+    match &spec.pages {
+        Some(pages) => format!("{}:{pages}", spec.path.display()),
+        None => spec.path.display().to_string(),
+    }
 }
 
 fn extract(engine: &OcrEngine, specs: &[InputSpec], fail_fast: bool) -> Vec<Result<String>> {

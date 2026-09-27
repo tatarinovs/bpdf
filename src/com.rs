@@ -1,4 +1,8 @@
-//! RAII COM apartment manager for Windows COM and WinRT operations.
+//! COM apartment initialisation for Windows COM and WinRT operations.
+//!
+//! The apartment is deliberately never uninitialised: `windows` caches
+//! activation factories per process, and tearing the apartment down would
+//! invalidate them for later calls on the same thread.
 
 #[cfg(windows)]
 mod platform {
@@ -6,7 +10,8 @@ mod platform {
     use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
-    /// An RAII guard that ensures the multithreaded COM/WinRT apartment is initialized on the current thread.
+    /// Proof that the multithreaded COM/WinRT apartment is initialised on the
+    /// current thread. Hold it for as long as COM objects are in use.
     pub struct ComApartment;
 
     impl ComApartment {
@@ -26,13 +31,3 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::ComApartment;
-
-#[cfg(not(windows))]
-pub struct ComApartment;
-
-#[cfg(not(windows))]
-impl ComApartment {
-    pub fn initialize() -> anyhow::Result<Self> {
-        Ok(Self)
-    }
-}

@@ -1,10 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use lopdf::{Dictionary, Document, Object, Stream, dictionary};
+use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use ttf_parser::{Face, GlyphId};
+
+use crate::font_subset;
+use crate::winocr::OcrWordBox;
 
 #[derive(Clone, Debug)]
 pub struct TextOptions {
@@ -25,267 +29,260 @@ impl Default for TextOptions {
     }
 }
 
+/// Recognised words of one existing PDF page, in page units measured from
+/// the top-left corner.
+#[derive(Clone, Debug)]
+pub struct PageTextOverlay {
+    pub page_id: ObjectId,
+    pub page_width: f64,
+    pub page_height: f64,
+    pub scaled_words: Vec<OcrWordBox>,
+    pub fallback_text: Option<String>,
+}
+
+/// A loaded TrueType font that records which glyphs a document uses, so only
+/// those are embedded.
+struct FontWriter<'a> {
+    data: &'a [u8],
+    face: Face<'a>,
+    used: BTreeMap<u16, char>,
+    glyphs: HashMap<char, (u16, char)>,
+}
+
+/// Raw bytes of the configured or first available system Unicode font.
+fn load_font(explicit: Option<&Path>) -> Result<Vec<u8>> {
+    let path = find_font(explicit)?;
+    fs::read(&path).with_context(|| format!("failed to read font {}", path.display()))
+}
+
+impl<'a> FontWriter<'a> {
+    fn new(data: &'a [u8]) -> Result<Self> {
+        let face = Face::parse(data, 0)
+            .map_err(|error| anyhow::anyhow!("failed to parse font: {error:?}"))?;
+        Ok(Self {
+            data,
+            face,
+            used: BTreeMap::new(),
+            glyphs: HashMap::new(),
+        })
+    }
+
+    /// Glyph for a character, falling back to '?' (or .notdef); the second
+    /// value is the character actually drawn.
+    fn glyph(&mut self, character: char) -> (u16, char) {
+        let face = &self.face;
+        *self
+            .glyphs
+            .entry(character)
+            .or_insert_with(|| match face.glyph_index(character) {
+                Some(glyph) => (glyph.0, character),
+                None => (face.glyph_index('?').map_or(0, |glyph| glyph.0), '?'),
+            })
+    }
+
+    fn advance(&self, glyph: u16) -> f64 {
+        f64::from(self.face.glyph_hor_advance(GlyphId(glyph)).unwrap_or(0))
+            / f64::from(self.face.units_per_em())
+    }
+
+    fn text_width(&mut self, text: &str, font_size: f64) -> f64 {
+        text.chars()
+            .map(|character| {
+                let glyph = self.glyph(character).0;
+                self.advance(glyph)
+            })
+            .sum::<f64>()
+            * font_size
+    }
+
+    /// Hex string of glyph ids for a `Tj` operator; records used glyphs.
+    fn encode(&mut self, text: &str) -> String {
+        let mut hex = String::with_capacity(text.len() * 4);
+        for character in text.chars() {
+            let (glyph, drawn) = self.glyph(character);
+            self.used.entry(glyph).or_insert(drawn);
+            let _ = write!(hex, "{glyph:04X}");
+        }
+        hex
+    }
+
+    fn wrap(&mut self, text: &str, font_size: f64, max_width: f64) -> Vec<String> {
+        let mut output = Vec::new();
+        for paragraph in text.lines() {
+            if paragraph.trim().is_empty() {
+                output.push(String::new());
+                continue;
+            }
+            let mut line = String::new();
+            let mut line_width = 0.0;
+            for word in paragraph.split_inclusive(char::is_whitespace) {
+                let word_width = self.text_width(word, font_size);
+                if line.is_empty() || line_width + word_width <= max_width {
+                    line.push_str(word);
+                    line_width += word_width;
+                    continue;
+                }
+                self.break_long_line(line.trim_end(), font_size, max_width, &mut output);
+                line = word.trim_start().to_owned();
+                line_width = self.text_width(&line, font_size);
+            }
+            self.break_long_line(line.trim_end(), font_size, max_width, &mut output);
+        }
+        output
+    }
+
+    fn break_long_line(
+        &mut self,
+        line: &str,
+        font_size: f64,
+        max_width: f64,
+        output: &mut Vec<String>,
+    ) {
+        let mut chunk = String::new();
+        let mut chunk_width = 0.0;
+        for character in line.chars() {
+            let glyph = self.glyph(character).0;
+            let width = self.advance(glyph) * font_size;
+            if !chunk.is_empty() && chunk_width + width > max_width {
+                output.push(std::mem::take(&mut chunk));
+                chunk_width = 0.0;
+            }
+            chunk.push(character);
+            chunk_width += width;
+        }
+        output.push(chunk);
+    }
+
+    /// Write the subset font objects and return the Type0 font id.
+    fn embed(self, document: &mut Document) -> ObjectId {
+        let units = f64::from(self.face.units_per_em());
+        let metric = |value: i16| f64::from(value) * 1000.0 / units;
+
+        let used_glyphs = self.used.keys().copied().collect::<BTreeSet<_>>();
+        let font_data = font_subset::subset_truetype(self.data, &used_glyphs)
+            .unwrap_or_else(|| self.data.to_vec());
+        let font_file_id = document.add_object(Stream::new(
+            dictionary! { "Length1" => font_data.len() as i64 },
+            font_data,
+        ));
+
+        let bounds = self.face.global_bounding_box();
+        let descriptor_id = document.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "BpdfEmbedded",
+            "Flags" => 32,
+            "FontBBox" => vec![
+                metric(bounds.x_min).into(),
+                metric(bounds.y_min).into(),
+                metric(bounds.x_max).into(),
+                metric(bounds.y_max).into(),
+            ],
+            "ItalicAngle" => 0,
+            "Ascent" => metric(self.face.ascender()),
+            "Descent" => metric(self.face.descender()),
+            "CapHeight" => metric(self.face.ascender()),
+            "StemV" => 80,
+            "FontFile2" => font_file_id,
+        });
+
+        let widths = self
+            .used
+            .keys()
+            .flat_map(|glyph| {
+                [
+                    Object::from(i64::from(*glyph)),
+                    Object::Array(vec![(self.advance(*glyph) * 1000.0).into()]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let cid_font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "BpdfEmbedded",
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::string_literal("Adobe"),
+                "Ordering" => Object::string_literal("Identity"),
+                "Supplement" => 0,
+            },
+            "FontDescriptor" => descriptor_id,
+            "DW" => 1000,
+            "W" => widths,
+            "CIDToGIDMap" => "Identity",
+        });
+        let to_unicode_id = document.add_object(Stream::new(
+            dictionary! {},
+            build_to_unicode_cmap(&self.used).into_bytes(),
+        ));
+        document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "BpdfEmbedded",
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(cid_font_id)],
+            "ToUnicode" => to_unicode_id,
+        })
+    }
+}
+
 pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
     let text = text.trim_start_matches('\u{feff}');
-    let font_path = find_font(options.font_path.as_deref())?;
-    let font_data = fs::read(&font_path)
-        .with_context(|| format!("failed to read font {}", font_path.display()))?;
-    let face = Face::parse(&font_data, 0)
-        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error:?}", font_path.display()))?;
+    let font_data = load_font(options.font_path.as_deref())?;
+    let mut font = FontWriter::new(&font_data)?;
 
     let (page_width, page_height) = crate::pdf::paper_size(&options.page_size)?;
-    let usable_width = page_width - 2.0 * options.margin;
     let line_height = options.font_size * 1.25;
     let lines_per_page = ((page_height - 2.0 * options.margin) / line_height)
         .floor()
         .max(1.0) as usize;
-    let lines = wrap_text(text, &face, options.font_size, usable_width);
-    let page_lines = if lines.is_empty() {
-        vec![Vec::new()]
-    } else {
-        lines
-            .chunks(lines_per_page)
-            .map(<[String]>::to_vec)
-            .collect::<Vec<_>>()
-    };
+    let lines = font.wrap(text, options.font_size, page_width - 2.0 * options.margin);
+    let start_y = page_height - options.margin - options.font_size;
 
-    let mut used = BTreeMap::<u16, char>::new();
-    let encoded_pages = page_lines
-        .iter()
-        .map(|lines| {
-            lines
-                .iter()
-                .map(|line| encode_line(line, &face, &mut used))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    build_document(
-        &font_data,
-        &face,
-        &used,
-        &encoded_pages,
-        options,
-        PageLayout {
-            width: page_width,
-            height: page_height,
-            line_height,
-        },
-    )
-}
-
-#[derive(Clone, Copy)]
-struct PageLayout {
-    width: f64,
-    height: f64,
-    line_height: f64,
-}
-
-fn build_document(
-    font_data: &[u8],
-    face: &Face<'_>,
-    used: &BTreeMap<u16, char>,
-    pages: &[Vec<Vec<u8>>],
-    options: &TextOptions,
-    layout: PageLayout,
-) -> Result<Document> {
-    let mut document = Document::with_version("1.7");
-    let pages_id = document.new_object_id();
-    let units = f64::from(face.units_per_em());
-    let scale_metric = |value: i16| f64::from(value) * 1000.0 / units;
-
-    let mut font_stream_dict = Dictionary::new();
-    font_stream_dict.set("Length1", font_data.len() as i64);
-    let font_file_id = document.add_object(Stream::new(font_stream_dict, font_data.to_vec()));
-
-    let bounds = face.global_bounding_box();
-    let descriptor_id = document.add_object(dictionary! {
-        "Type" => "FontDescriptor",
-        "FontName" => "BpdfEmbedded",
-        "Flags" => 32,
-        "FontBBox" => vec![
-            scale_metric(bounds.x_min).into(),
-            scale_metric(bounds.y_min).into(),
-            scale_metric(bounds.x_max).into(),
-            scale_metric(bounds.y_max).into(),
-        ],
-        "ItalicAngle" => 0,
-        "Ascent" => scale_metric(face.ascender()),
-        "Descent" => scale_metric(face.descender()),
-        "CapHeight" => scale_metric(face.ascender()),
-        "StemV" => 80,
-        "FontFile2" => font_file_id,
-    });
-
-    let mut widths = Vec::<Object>::new();
-    for glyph_id in used.keys() {
-        let advance = face
-            .glyph_hor_advance(GlyphId(*glyph_id))
-            .unwrap_or(face.units_per_em());
-        widths.push(i64::from(*glyph_id).into());
-        widths.push(Object::Array(vec![
-            (f64::from(advance) * 1000.0 / units).into(),
-        ]));
-    }
-
-    let cid_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "CIDFontType2",
-        "BaseFont" => "BpdfEmbedded",
-        "CIDSystemInfo" => dictionary! {
-            "Registry" => Object::string_literal("Adobe"),
-            "Ordering" => Object::string_literal("Identity"),
-            "Supplement" => 0,
-        },
-        "FontDescriptor" => descriptor_id,
-        "DW" => 1000,
-        "W" => widths,
-        "CIDToGIDMap" => "Identity",
-    });
-    let to_unicode_id = document.add_object(Stream::new(
-        dictionary! {},
-        build_to_unicode_cmap(used).into_bytes(),
-    ));
-    let type0_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type0",
-        "BaseFont" => "BpdfEmbedded",
-        "Encoding" => "Identity-H",
-        "DescendantFonts" => vec![Object::Reference(cid_font_id)],
-        "ToUnicode" => to_unicode_id,
-    });
-    let resources_id = document.add_object(dictionary! {
-        "Font" => dictionary! {
-            "F0" => type0_font_id,
-        },
-    });
-
-    let mut page_ids = Vec::with_capacity(pages.len());
-    for lines in pages {
-        let mut content = String::from("BT\n/F0 ");
-        content.push_str(&format!("{:.3} Tf\n", options.font_size));
-        let start_y = layout.height - options.margin - options.font_size;
-        for (index, encoded) in lines.iter().enumerate() {
-            let y = start_y - index as f64 * layout.line_height;
-            content.push_str(&format!(
-                "1 0 0 1 {:.3} {:.3} Tm\n<{}> Tj\n",
+    let mut contents = Vec::new();
+    for page_lines in lines.chunks(lines_per_page) {
+        let mut content = format!("BT\n/F0 {:.3} Tf\n", options.font_size);
+        for (index, line) in page_lines.iter().enumerate() {
+            let y = start_y - index as f64 * line_height;
+            let _ = write!(
+                content,
+                "1 0 0 1 {:.3} {y:.3} Tm\n<{}> Tj\n",
                 options.margin,
-                y,
-                hex(encoded)
-            ));
+                font.encode(line)
+            );
         }
         content.push_str("ET\n");
-
-        let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), layout.width.into(), layout.height.into()],
-            "Resources" => resources_id,
-            "Contents" => content_id,
-        });
-        page_ids.push(Object::Reference(page_id));
+        contents.push(content);
+    }
+    if contents.is_empty() {
+        contents.push("BT\nET\n".to_owned());
     }
 
+    let mut document = Document::with_version("1.7");
+    let pages_id = document.new_object_id();
+    let font_id = font.embed(&mut document);
+    let resources_id = document.add_object(dictionary! {
+        "Font" => dictionary! { "F0" => font_id },
+    });
+    let kids = contents
+        .into_iter()
+        .map(|content| {
+            let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+            Object::Reference(document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), page_width.into(), page_height.into()],
+                "Resources" => resources_id,
+                "Contents" => content_id,
+            }))
+        })
+        .collect::<Vec<_>>();
+    let count = kids.len() as i64;
     document.objects.insert(
         pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => page_ids,
-            "Count" => pages.len() as i64,
-        }),
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }),
     );
-    let catalog_id = document.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
+    let catalog_id = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     document.trailer.set("Root", catalog_id);
     Ok(document)
-}
-
-fn wrap_text(text: &str, face: &Face<'_>, font_size: f64, max_width: f64) -> Vec<String> {
-    let mut output = Vec::new();
-
-    for paragraph in text.replace("\r\n", "\n").split('\n') {
-        if paragraph.trim().is_empty() {
-            output.push(String::new());
-            continue;
-        }
-
-        let mut line = String::new();
-        let mut line_width = 0.0;
-        for word in paragraph.split_inclusive(char::is_whitespace) {
-            let word_width = text_width(word, face, font_size);
-            if line.is_empty() || line_width + word_width <= max_width {
-                line.push_str(word);
-                line_width += word_width;
-                continue;
-            }
-            output.extend(break_long_line(line.trim_end(), face, font_size, max_width));
-            let trimmed = word.trim_start();
-            line = trimmed.to_owned();
-            line_width = text_width(trimmed, face, font_size);
-        }
-        output.extend(break_long_line(line.trim_end(), face, font_size, max_width));
-    }
-
-    output
-}
-
-fn break_long_line(line: &str, face: &Face<'_>, font_size: f64, max_width: f64) -> Vec<String> {
-    if line.is_empty() || text_width(line, face, font_size) <= max_width {
-        return vec![line.to_owned()];
-    }
-
-    let mut result = Vec::new();
-    let mut chunk = String::new();
-    let mut chunk_width = 0.0;
-    let units = f64::from(face.units_per_em());
-    for character in line.chars() {
-        let glyph = face
-            .glyph_index(character)
-            .or_else(|| face.glyph_index('?'))
-            .unwrap_or(GlyphId(0));
-        let char_width = f64::from(face.glyph_hor_advance(glyph).unwrap_or(0)) * font_size / units;
-        if !chunk.is_empty() && chunk_width + char_width > max_width {
-            result.push(std::mem::take(&mut chunk));
-            chunk_width = 0.0;
-        }
-        chunk.push(character);
-        chunk_width += char_width;
-    }
-    if !chunk.is_empty() {
-        result.push(chunk);
-    }
-    result
-}
-
-fn text_width(text: &str, face: &Face<'_>, font_size: f64) -> f64 {
-    let units = f64::from(face.units_per_em());
-    text.chars()
-        .map(|character| {
-            let glyph = face
-                .glyph_index(character)
-                .or_else(|| face.glyph_index('?'))
-                .unwrap_or(GlyphId(0));
-            f64::from(face.glyph_hor_advance(glyph).unwrap_or(0)) * font_size / units
-        })
-        .sum()
-}
-
-fn encode_line(line: &str, face: &Face<'_>, used: &mut BTreeMap<u16, char>) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(line.len() * 2);
-    for character in line.chars() {
-        let display = if face.glyph_index(character).is_some() {
-            character
-        } else {
-            '?'
-        };
-        let glyph = face.glyph_index(display).unwrap_or(GlyphId(0)).0;
-        used.entry(glyph).or_insert(display);
-        encoded.extend_from_slice(&glyph.to_be_bytes());
-    }
-    encoded
 }
 
 fn build_to_unicode_cmap(used: &BTreeMap<u16, char>) -> String {
@@ -296,29 +293,18 @@ fn build_to_unicode_cmap(used: &BTreeMap<u16, char>) -> String {
          1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
     );
     for chunk in used.iter().collect::<Vec<_>>().chunks(100) {
-        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
         for (glyph, character) in chunk {
-            let utf16 = character
-                .encode_utf16(&mut [0; 2])
-                .iter()
-                .flat_map(|unit| unit.to_be_bytes())
-                .collect::<Vec<_>>();
-            cmap.push_str(&format!("<{glyph:04X}> <{}>\n", hex(&utf16)));
+            let _ = write!(cmap, "<{glyph:04X}> <");
+            for unit in character.encode_utf16(&mut [0; 2]) {
+                let _ = write!(cmap, "{unit:04X}");
+            }
+            cmap.push_str(">\n");
         }
         cmap.push_str("endbfchar\n");
     }
     cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
     cmap
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 pub(crate) fn find_font(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -329,61 +315,36 @@ pub(crate) fn find_font(explicit: Option<&Path>) -> Result<PathBuf> {
         bail!("configured font does not exist: {}", path.display());
     }
 
-    let candidates = [
+    [
         r"C:\Windows\Fonts\arial.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/Library/Fonts/Arial Unicode.ttf",
-    ];
-    candidates
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            anyhow::anyhow!("no Unicode TrueType font found; set font_path in config.toml")
-        })
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .context("no Unicode TrueType font found; set font_path in config.toml")
 }
 
-#[derive(Clone, Debug)]
-pub struct SearchablePageInput {
-    pub jpeg_bytes: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub words: Vec<crate::winocr::OcrWordBox>,
-    pub fallback_text: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PageTextOverlay {
-    pub page_id: lopdf::ObjectId,
-    pub page_width: f64,
-    pub page_height: f64,
-    pub scaled_words: Vec<crate::winocr::OcrWordBox>,
-    pub fallback_text: Option<String>,
-}
-
+/// Add an invisible (render mode 3) text layer to existing pages.
 pub fn overlay_searchable_text(
     document: &mut Document,
     overlays: &[PageTextOverlay],
     font_path: Option<&Path>,
 ) -> Result<()> {
+    const FONT_RESOURCE: &[u8] = b"BpdfF0";
     if overlays.is_empty() {
         return Ok(());
     }
+    let font_data = load_font(font_path)?;
+    let mut font = FontWriter::new(&font_data)?;
+    let ascender = f64::from(font.face.ascender());
+    let ascent_ratio = ascender / (ascender - f64::from(font.face.descender()));
 
-    let font_path = find_font(font_path)?;
-    let font_data = fs::read(&font_path)
-        .with_context(|| format!("failed to read font {}", font_path.display()))?;
-    let face = Face::parse(&font_data, 0)
-        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error:?}", font_path.display()))?;
-
-    let mut used = BTreeMap::<u16, char>::new();
-
-    // First, process all pages to build the 'used' glyph map and create content streams.
-    // We cannot add objects to the document while building the font because we need all used characters first.
+    // Glyph usage must be complete before the font is embedded.
     let mut page_contents = Vec::with_capacity(overlays.len());
-
     for overlay in overlays {
         let mut content = String::from("\nq\nBT\n3 Tr\n");
         if !overlay.scaled_words.is_empty() {
@@ -392,63 +353,33 @@ pub fn overlay_searchable_text(
                     continue;
                 }
                 let text = format!("{} ", word.text);
-                let encoded = encode_line(&text, &face, &mut used);
-                let word_pt_x = word.x;
-
-                // We use line_height as the font size so that the entire line has a uniform font size,
-                // which prevents the selection highlight from jumping in height.
+                // A uniform size per line keeps the selection highlight steady;
+                // the baseline sits one ascent below the line top.
                 let font_size = word.line_height.max(word.height).max(4.0);
-
-                // We position the baseline such that the top of the line bounding box matches the top of the font's Ascent.
-                // Ascent is usually around 80% of the total font height. We'll compute it exactly from the font metrics.
-                let _units_per_em = face.units_per_em() as f64;
-                let ascender = face.ascender() as f64;
-                let descender = face.descender() as f64;
-
-                let line_top_y = overlay.page_height - word.line_y;
-                let total_font_height = ascender - descender;
-
-                // Baseline is positioned below the top of the line by the font's scaled ascent.
-                let ascent_scaled = font_size * (ascender / total_font_height);
-                let word_pt_y = line_top_y - ascent_scaled;
-
-                let target_width = word.width;
-
-                let natural_width = text_width(&text, &face, 1.0); // at 1 pt size
-                let current_natural_width = natural_width * font_size;
-
-                let scale = if current_natural_width > 0.0 {
-                    (target_width / current_natural_width) * 100.0
+                let baseline = overlay.page_height - word.line_y - font_size * ascent_ratio;
+                let natural_width = font.text_width(&text, font_size);
+                let horizontal_scale = if natural_width > 0.0 {
+                    word.width / natural_width * 100.0
                 } else {
                     100.0
                 };
-
-                content.push_str(&format!("{:.1} Tz\n", scale));
-                content.push_str(&format!("/BpdfF0 {:.3} Tf\n", font_size));
-                content.push_str(&format!(
-                    "1 0 0 1 {:.3} {:.3} Tm\n<{}> Tj\n",
-                    word_pt_x,
-                    word_pt_y,
-                    hex(&encoded)
-                ));
+                let _ = write!(
+                    content,
+                    "{horizontal_scale:.1} Tz\n/BpdfF0 {font_size:.3} Tf\n1 0 0 1 {:.3} {baseline:.3} Tm\n<{}> Tj\n",
+                    word.x,
+                    font.encode(&text)
+                );
             }
         } else if let Some(fallback) = &overlay.fallback_text {
             let font_size = 10.0;
-            let line_height = font_size * 1.25;
-            let lines = wrap_text(fallback, &face, font_size, overlay.page_width - 40.0);
-            content.push_str(&format!("100 Tz\n/BpdfF0 {:.3} Tf\n", font_size));
+            let _ = write!(content, "100 Tz\n/BpdfF0 {font_size:.3} Tf\n");
             let mut y = overlay.page_height - 20.0 - font_size;
-            for line in lines {
+            for line in font.wrap(fallback, font_size, overlay.page_width - 40.0) {
                 if !line.trim().is_empty() {
-                    let text = format!("{} ", line);
-                    let encoded = encode_line(&text, &face, &mut used);
-                    content.push_str(&format!(
-                        "1 0 0 1 20.000 {:.3} Tm\n<{}> Tj\n",
-                        y,
-                        hex(&encoded)
-                    ));
+                    let hex = font.encode(&format!("{line} "));
+                    let _ = write!(content, "1 0 0 1 20.000 {y:.3} Tm\n<{hex}> Tj\n");
                 }
-                y -= line_height;
+                y -= font_size * 1.25;
                 if y < 20.0 {
                     break;
                 }
@@ -458,349 +389,28 @@ pub fn overlay_searchable_text(
         page_contents.push((overlay.page_id, content));
     }
 
-    // Now that 'used' is fully populated, build the font objects.
-    let units = f64::from(face.units_per_em());
-    let scale_metric = |value: i16| f64::from(value) * 1000.0 / units;
-
-    let mut font_stream_dict = Dictionary::new();
-    font_stream_dict.set("Length1", font_data.len() as i64);
-    let font_file_id = document.add_object(Stream::new(font_stream_dict, font_data.to_vec()));
-
-    let bounds = face.global_bounding_box();
-    let descriptor_id = document.add_object(dictionary! {
-        "Type" => "FontDescriptor",
-        "FontName" => "BpdfEmbedded",
-        "Flags" => 32,
-        "FontBBox" => vec![
-            scale_metric(bounds.x_min).into(),
-            scale_metric(bounds.y_min).into(),
-            scale_metric(bounds.x_max).into(),
-            scale_metric(bounds.y_max).into(),
-        ],
-        "ItalicAngle" => 0,
-        "Ascent" => scale_metric(face.ascender()),
-        "Descent" => scale_metric(face.descender()),
-        "CapHeight" => scale_metric(face.ascender()),
-        "StemV" => 80,
-        "FontFile2" => font_file_id,
-    });
-
-    let mut widths = Vec::<Object>::new();
-    for glyph_id in used.keys() {
-        let advance = face
-            .glyph_hor_advance(GlyphId(*glyph_id))
-            .unwrap_or(face.units_per_em());
-        widths.push(i64::from(*glyph_id).into());
-        widths.push(Object::Array(vec![
-            (f64::from(advance) * 1000.0 / units).into(),
-        ]));
-    }
-
-    let cid_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "CIDFontType2",
-        "BaseFont" => "BpdfEmbedded",
-        "CIDSystemInfo" => dictionary! {
-            "Registry" => Object::string_literal("Adobe"),
-            "Ordering" => Object::string_literal("Identity"),
-            "Supplement" => 0,
-        },
-        "FontDescriptor" => descriptor_id,
-        "DW" => 1000,
-        "W" => widths,
-        "CIDToGIDMap" => "Identity",
-    });
-    let to_unicode_id = document.add_object(Stream::new(
-        dictionary! {},
-        build_to_unicode_cmap(&used).into_bytes(),
-    ));
-    let type0_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type0",
-        "BaseFont" => "BpdfEmbedded",
-        "Encoding" => "Identity-H",
-        "DescendantFonts" => vec![Object::Reference(cid_font_id)],
-        "ToUnicode" => to_unicode_id,
-    });
-
-    // Inject the new text stream into each page
+    let font_id = font.embed(document);
     for (page_id, content) in page_contents {
-        let new_content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-
-        let mut resource_id_to_update = None;
-
-        {
-            let page = document.get_object_mut(page_id)?.as_dict_mut()?;
-
-            // Ensure Resources dictionary exists and has Font dict
-            match page.get_mut(b"Resources") {
-                Ok(Object::Reference(id)) => {
-                    resource_id_to_update = Some(*id);
-                }
-                Ok(Object::Dictionary(r)) => {
-                    let font_dict = match r.get_mut(b"Font") {
-                        Ok(Object::Dictionary(f)) => f,
-                        _ => {
-                            r.set("Font", dictionary! {});
-                            r.get_mut(b"Font").unwrap().as_dict_mut().unwrap()
-                        }
-                    };
-                    font_dict.set("BpdfF0", type0_font_id);
-                }
-                _ => {
-                    let mut r = dictionary! {};
-                    r.set("Font", dictionary! { "BpdfF0" => type0_font_id });
-                    page.set("Resources", r);
-                }
-            };
-
-            // Append to Contents
-            match page.get(b"Contents").cloned() {
-                Ok(Object::Array(mut arr)) => {
-                    arr.push(Object::Reference(new_content_id));
-                    page.set("Contents", Object::Array(arr));
-                }
-                Ok(Object::Reference(id)) => {
-                    page.set(
-                        "Contents",
-                        vec![Object::Reference(id), Object::Reference(new_content_id)],
-                    );
-                }
-                Ok(val) => {
-                    page.set("Contents", vec![val, Object::Reference(new_content_id)]);
-                }
-                Err(_) => {
-                    page.set("Contents", Object::Reference(new_content_id));
-                }
-            }
-        }
-
-        if let Some(res_id) = resource_id_to_update {
-            let res_dict = document.get_object_mut(res_id)?.as_dict_mut()?;
-            let font_dict = match res_dict.get_mut(b"Font") {
-                Ok(Object::Dictionary(f)) => f,
-                _ => {
-                    res_dict.set("Font", dictionary! {});
-                    res_dict.get_mut(b"Font").unwrap().as_dict_mut().unwrap()
-                }
-            };
-            font_dict.set("BpdfF0", type0_font_id);
-        }
-    }
-
-    Ok(())
-}
-
-pub fn render_searchable_pdf(
-    pages: &[SearchablePageInput],
-    page_size: &str,
-    font_path: Option<&Path>,
-) -> Result<Document> {
-    if pages.is_empty() {
-        bail!("no pages to render in searchable PDF");
-    }
-    let font_path = find_font(font_path)?;
-    let font_data = fs::read(&font_path)
-        .with_context(|| format!("failed to read font {}", font_path.display()))?;
-    let face = Face::parse(&font_data, 0)
-        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error:?}", font_path.display()))?;
-
-    let mut used = BTreeMap::<u16, char>::new();
-    let mut document = Document::with_version("1.7");
-    let pages_id = document.new_object_id();
-
-    let mut page_ids = Vec::with_capacity(pages.len());
-
-    for page_input in pages {
-        let (page_width, page_height) = if page_size.eq_ignore_ascii_case("none")
-            || page_size.eq_ignore_ascii_case("original")
-            || page_size.eq_ignore_ascii_case("keep")
-        {
-            (
-                f64::from(page_input.width) * 72.0 / 150.0,
-                f64::from(page_input.height) * 72.0 / 150.0,
-            )
-        } else {
-            let (mut pw, mut ph) = crate::pdf::paper_size(page_size)?;
-            if (page_input.width > page_input.height) != (pw > ph) {
-                std::mem::swap(&mut pw, &mut ph);
-            }
-            (pw, ph)
-        };
-
-        let image_stream = Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Image",
-                "Width" => page_input.width as i64,
-                "Height" => page_input.height as i64,
-                "ColorSpace" => "DeviceRGB",
-                "BitsPerComponent" => 8,
-                "Filter" => "DCTDecode",
-            },
-            page_input.jpeg_bytes.clone(),
-        );
-        let image_id = document.add_object(image_stream);
-
-        let mut content = format!(
-            "q\n{:.4} 0 0 {:.4} 0 0 cm\n/Im0 Do\nQ\nBT\n3 Tr\n",
-            page_width, page_height
-        );
-
-        let scale_x = page_width / f64::from(page_input.width.max(1));
-        let scale_y = page_height / f64::from(page_input.height.max(1));
-
-        if !page_input.words.is_empty() {
-            for word in &page_input.words {
-                if word.text.trim().is_empty() {
-                    continue;
-                }
-                let encoded = encode_line(&word.text, &face, &mut used);
-                let word_pt_x = word.x * scale_x;
-                let word_pt_y = page_height - (word.y + word.height) * scale_y;
-                let font_size = (word.height * scale_y).max(4.0);
-
-                content.push_str(&format!("/F0 {:.3} Tf\n", font_size));
-                content.push_str(&format!(
-                    "1 0 0 1 {:.3} {:.3} Tm\n<{}> Tj\n",
-                    word_pt_x,
-                    word_pt_y,
-                    hex(&encoded)
-                ));
-            }
-        } else if let Some(fallback) = &page_input.fallback_text {
-            let font_size = 10.0;
-            let line_height = font_size * 1.25;
-            let lines = wrap_text(fallback, &face, font_size, page_width - 40.0);
-            content.push_str(&format!("/F0 {:.3} Tf\n", font_size));
-            let mut y = page_height - 20.0 - font_size;
-            for line in lines {
-                if !line.trim().is_empty() {
-                    let encoded = encode_line(&line, &face, &mut used);
-                    content.push_str(&format!(
-                        "1 0 0 1 20.000 {:.3} Tm\n<{}> Tj\n",
-                        y,
-                        hex(&encoded)
-                    ));
-                }
-                y -= line_height;
-                if y < 20.0 {
-                    break;
-                }
-            }
-        }
-        content.push_str("ET\n");
-
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-
-        let page_dict = dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), page_width.into(), page_height.into()],
-            "Contents" => content_id,
-        };
-        let page_id = document.add_object(page_dict);
-        page_ids.push((page_id, image_id));
-    }
-
-    let units = f64::from(face.units_per_em());
-    let scale_metric = |value: i16| f64::from(value) * 1000.0 / units;
-
-    let mut font_stream_dict = Dictionary::new();
-    font_stream_dict.set("Length1", font_data.len() as i64);
-    let font_file_id = document.add_object(Stream::new(font_stream_dict, font_data.to_vec()));
-
-    let bounds = face.global_bounding_box();
-    let descriptor_id = document.add_object(dictionary! {
-        "Type" => "FontDescriptor",
-        "FontName" => "BpdfEmbedded",
-        "Flags" => 32,
-        "FontBBox" => vec![
-            scale_metric(bounds.x_min).into(),
-            scale_metric(bounds.y_min).into(),
-            scale_metric(bounds.x_max).into(),
-            scale_metric(bounds.y_max).into(),
-        ],
-        "ItalicAngle" => 0,
-        "Ascent" => scale_metric(face.ascender()),
-        "Descent" => scale_metric(face.descender()),
-        "CapHeight" => scale_metric(face.ascender()),
-        "StemV" => 80,
-        "FontFile2" => font_file_id,
-    });
-
-    let mut widths = Vec::<Object>::new();
-    for glyph_id in used.keys() {
-        let advance = face
-            .glyph_hor_advance(GlyphId(*glyph_id))
-            .unwrap_or(face.units_per_em());
-        widths.push(i64::from(*glyph_id).into());
-        widths.push(Object::Array(vec![
-            (f64::from(advance) * 1000.0 / units).into(),
-        ]));
-    }
-
-    let cid_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "CIDFontType2",
-        "BaseFont" => "BpdfEmbedded",
-        "CIDSystemInfo" => dictionary! {
-            "Registry" => Object::string_literal("Adobe"),
-            "Ordering" => Object::string_literal("Identity"),
-            "Supplement" => 0,
-        },
-        "FontDescriptor" => descriptor_id,
-        "DW" => 1000,
-        "W" => widths,
-        "CIDToGIDMap" => "Identity",
-    });
-    let to_unicode_id = document.add_object(Stream::new(
-        dictionary! {},
-        build_to_unicode_cmap(&used).into_bytes(),
-    ));
-    let type0_font_id = document.add_object(dictionary! {
-        "Type" => "Font",
-        "Subtype" => "Type0",
-        "BaseFont" => "BpdfEmbedded-Identity-H",
-        "Encoding" => "Identity-H",
-        "DescendantFonts" => vec![Object::Reference(cid_font_id)],
-        "ToUnicode" => to_unicode_id,
-    });
-
-    for (page_id, image_id) in &page_ids {
-        let resources = dictionary! {
-            "Font" => dictionary! {
-                "F0" => type0_font_id,
-            },
-            "XObject" => dictionary! {
-                "Im0" => *image_id,
-            },
-        };
-        let resources_id = document.add_object(resources);
+        crate::pdf::transform::install_resources(
+            document,
+            page_id,
+            &[(b"Font", FONT_RESOURCE, font_id)],
+        )?;
+        let old = document
+            .get_dictionary(page_id)?
+            .get(b"Contents")
+            .ok()
+            .cloned();
+        let mut contents = Vec::new();
+        crate::pdf::transform::append_content_objects(document, &mut contents, old);
+        contents.push(Object::Reference(content_id));
         document
-            .get_object_mut(*page_id)?
+            .get_object_mut(page_id)?
             .as_dict_mut()?
-            .set("Resources", resources_id);
+            .set("Contents", contents);
     }
-
-    let page_obj_ids = page_ids
-        .iter()
-        .map(|(pid, _)| Object::Reference(*pid))
-        .collect::<Vec<_>>();
-    document.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => page_obj_ids,
-            "Count" => pages.len() as i64,
-        }),
-    );
-    let catalog_id = document.add_object(dictionary! {
-        "Type" => "Catalog",
-        "Pages" => pages_id,
-    });
-    document.trailer.set("Root", catalog_id);
-    Ok(document)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -820,46 +430,39 @@ mod tests {
         let text = parsed.extract_text(&[1]).unwrap();
         assert!(text.contains("Первая строка"));
         assert!(text.contains("Вторая строка"));
+        // The embedded font is a subset, far smaller than a system font.
+        assert!(bytes.len() < 300_000, "{} bytes", bytes.len());
     }
 
     #[test]
-    fn render_searchable_pdf_creates_text_layer_and_image() {
-        let dummy_jpeg = vec![
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x01,
-            0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
-            0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
-            0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
-            0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
-            0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-            0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x02, 0x00, 0x02,
-            0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
-            0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02,
-            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF, 0xDA, 0x00, 0x08, 0x01,
-            0x01, 0x00, 0x00, 0x3F, 0x00, 0x7F, 0x00, 0xFF, 0xD9,
-        ];
-        let page_input = SearchablePageInput {
-            jpeg_bytes: dummy_jpeg,
-            width: 2,
-            height: 2,
-            words: vec![crate::winocr::OcrWordBox {
+    fn overlay_adds_searchable_text_to_an_image_page() {
+        let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
+        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let overlay = PageTextOverlay {
+            page_id,
+            page_width: 842.0,
+            page_height: 595.0,
+            scaled_words: vec![OcrWordBox {
                 text: "ТестовоеСлово".to_owned(),
-                x: 0.0,
-                y: 0.0,
-                width: 2.0,
-                height: 2.0,
-                line_y: 0.0,
-                line_height: 2.0,
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 12.0,
+                line_y: 10.0,
+                line_height: 12.0,
             }],
             fallback_text: None,
         };
-        let Ok(mut document) = render_searchable_pdf(&[page_input], "A4", None) else {
+        if overlay_searchable_text(&mut document, &[overlay], None).is_err() {
             return;
-        };
+        }
         let bytes = crate::pdf::save_to_bytes(&mut document).unwrap();
         let parsed = Document::load_mem(&bytes).unwrap();
-        assert_eq!(parsed.get_pages().len(), 1);
         let text = parsed.extract_text(&[1]).unwrap();
         assert!(text.contains("ТестовоеСлово"));
+        let page_id = *parsed.get_pages().get(&1).unwrap();
+        assert_eq!(parsed.get_page_images(page_id).unwrap().len(), 1);
     }
 
     #[test]

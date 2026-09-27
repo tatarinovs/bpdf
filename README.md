@@ -318,7 +318,8 @@ bpdf doctor
 
 ### Форматы изображений
 
-- Встроенный Rust-декодер используется для JPEG, PNG, BMP, GIF, TIFF, WebP и APNG. Для BMP/GIF/TIFF/WebP/APNG при ошибке встроенного декодера автоматически пробуется FFmpeg.
+- Встроенный Rust-декодер используется для JPEG, PNG, BMP, GIF, WebP и APNG. TIFF на Windows декодируется через Windows Imaging Component, на остальных ОС — встроенным декодером. Для BMP/GIF/WebP/APNG при ошибке встроенного декодера автоматически пробуется FFmpeg.
+- Текстовые файлы и FB2 читаются с учётом BOM и XML-декларации кодировки; файлы без неё, не являющиеся UTF-8, читаются как Windows-1251.
 - Через FFmpeg обрабатываются HEIC/HEIF, AVIF, PSD, JPEG 2000 (`.jp2`, `.j2k`, `.j2c`, `.jpc`, `.jpf`, `.jpx`), JPEG-LS (`.jls`), DDS, EXR, HDR, QOI, TGA, PCX, PNM (`.pnm`, `.ppm`, `.pgm`, `.pbm`, `.pam`), SGI, XBM, DPX, FITS (`.fits`, `.fit`, `.fts`), PGX, Sun Raster, XWD и PIX. Берётся первый видеопоток и первый кадр.
 - Через встроенные кодеки Windows Imaging Component обрабатываются JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO. Для ICO выбирается изображение с наибольшим разрешением.
 - Снимки фотокамер `.3fr`, `.arw`, `.bay`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw` и `.x3f` по умолчанию декодируются в **Pure Rust** без внешних утилит и кодеков через извлечение полноразмерного аппаратного JPEG-превью камеры. При необходимости полной проявки сенсора на Windows через WIC используется опция `raw_develop = true` в `config.toml`.

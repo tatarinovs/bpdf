@@ -2,15 +2,10 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::common::{
-    err_pdf_only_page_ranges, finish_batch, handle_results, resolve_in_place_output,
-    validate_single_out, write_output,
-};
+use super::common::PdfOrJpegEdit;
 use crate::config::Config;
-use crate::fileset::{InputSpec, expand};
-use crate::formats::{self, Format, InputFormatSet};
-use crate::imageconv::{self, ImageOptions};
-use crate::pdf::{self, transform};
+use crate::formats::InputFormatSet;
+use crate::pdf::transform;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -29,68 +24,32 @@ pub fn run(
     if short_edge == Some(0) {
         bail!("--short-edge must be greater than zero");
     }
-    let specs = expand(inputs, InputFormatSet::Resize)?;
-    validate_single_out(out, specs.len())?;
-
     let mut image_options = config.image_options(None, None);
     image_options.long_edge = long_edge;
     image_options.short_edge = short_edge;
     image_options.force_reencode = true;
 
-    let results = specs.iter().map(|spec| {
-        (
-            &spec.path,
-            resize_one(spec, size, pages, out, &image_options),
-        )
-    });
-    let failures = handle_results(
-        results,
-        fail_fast,
-        "failed to process",
-        "error processing",
-        drop,
-    )?;
-    finish_batch("resize", specs.len(), failures, specs.len() - failures)
-}
-
-fn resize_one(
-    spec: &InputSpec,
-    size: &str,
-    pages: &str,
-    explicit_out: Option<&Path>,
-    image_options: &ImageOptions,
-) -> Result<()> {
-    let input = &spec.path;
-    let format = formats::detect(input);
-    let output_path = resolve_in_place_output(input, explicit_out, "Resizing");
-
-    match format {
-        Some(Format::Pdf) => {
-            let pages = spec.pages.as_deref().unwrap_or(pages);
-            let bytes = pdf::transform_file(input, |document| {
-                transform::resize_pages(document, size, pages)
-            })?;
-            write_output(&output_path, &bytes)?;
-        }
-        Some(Format::Jpeg) => {
-            if spec.pages.is_some() || pages != "all" {
-                return Err(err_pdf_only_page_ranges(input));
-            }
-            let page_size = (image_options.long_edge.is_none()
-                && image_options.short_edge.is_none())
-            .then_some(size);
-            let bytes = imageconv::to_jpeg(input, image_options, page_size)?;
-            write_output(&output_path, &bytes)?;
-        }
-        _ => bail!("unsupported input: {}", input.display()),
+    PdfOrJpegEdit {
+        operation: "resize",
+        verb: "Resizing",
+        formats: InputFormatSet::Resize,
+        pages,
+        out,
+        image_options,
+        // Explicit edge limits replace fitting to the paper size.
+        jpeg_page_size: (long_edge.is_none() && short_edge.is_none()).then_some(size),
+        edit_pdf: |document: &mut lopdf::Document, pages: &str| {
+            transform::resize_pages(document, size, pages)
+        },
     }
-    Ok(())
+    .run(inputs, fail_fast)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::common::test_utils::*;
+    use crate::pdf;
     use image::GenericImageView;
     use std::fs;
 

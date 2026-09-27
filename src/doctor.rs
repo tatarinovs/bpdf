@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -53,32 +53,28 @@ pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
     );
 
     let ffmpeg_ok = probe_command(&config.ffmpeg, &["-version"]);
+    let ffmpeg_status = if ffmpeg_ok {
+        "available"
+    } else {
+        "not available"
+    };
+    check("ffmpeg", ffmpeg_ok, ffmpeg_status, &mut failures);
+
+    let wic = crate::wic::availability();
+    let raw_status = match (&wic, config.raw_develop) {
+        (Ok(name), true) => format!("develop mode active: {name}"),
+        (Err(error), true) => format!("develop mode active, but WIC codec failed: {error:#}"),
+        (Ok(_), false) => {
+            "available (pure Rust preview default, WIC develop codec installed)".to_owned()
+        }
+        (Err(_), false) => "available (pure Rust preview default)".to_owned(),
+    };
     check(
-        "ffmpeg",
-        ffmpeg_ok,
-        if ffmpeg_ok {
-            "available"
-        } else {
-            "not available"
-        },
+        "raw_decoder",
+        !config.raw_develop || wic.is_ok(),
+        raw_status,
         &mut failures,
     );
-
-    let raw_ok = !config.raw_develop || crate::wic::availability().is_ok();
-    let raw_status = if config.raw_develop {
-        match crate::wic::availability() {
-            Ok(name) => format!("develop mode active: {name}"),
-            Err(error) => format!("develop mode active, but WIC codec failed: {error:#}"),
-        }
-    } else {
-        match crate::wic::availability() {
-            Ok(_) => {
-                "available (pure Rust preview default, WIC develop codec installed)".to_string()
-            }
-            Err(_) => "available (pure Rust preview default)".to_string(),
-        }
-    };
-    check("raw_decoder", raw_ok, raw_status, &mut failures);
 
     let office_options = OfficeOptions {
         powershell: config.powershell.clone(),
@@ -86,36 +82,18 @@ pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
     };
     match office::probe(&office_options) {
         Ok(availability) => {
-            check(
-                "word",
-                availability.word,
-                if availability.word {
+            for (name, found) in [
+                ("word", availability.word),
+                ("excel", availability.excel),
+                ("powerpoint", availability.powerpoint),
+            ] {
+                let detail = if found {
                     "COM registration found"
                 } else {
                     "COM registration not found"
-                },
-                &mut failures,
-            );
-            check(
-                "excel",
-                availability.excel,
-                if availability.excel {
-                    "COM registration found"
-                } else {
-                    "COM registration not found"
-                },
-                &mut failures,
-            );
-            check(
-                "powerpoint",
-                availability.powerpoint,
-                if availability.powerpoint {
-                    "COM registration found"
-                } else {
-                    "COM registration not found"
-                },
-                &mut failures,
-            );
+                };
+                check(name, found, detail, &mut failures);
+            }
         }
         Err(error) => {
             check("word", false, format!("{error:#}"), &mut failures);
@@ -162,22 +140,8 @@ pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
         }
     }
 
-    let network_result = OcrEngine::new(OcrOptions {
-        backend: crate::ocr::OcrBackend::Groq,
-        lang: None,
-        api_key: config.groq_api_key.clone(),
-        proxy: config.proxy.clone(),
-        model: config.ocr_model.clone(),
-        prompt: config.ocr_prompt.clone(),
-        endpoint: config.ocr_endpoint.clone(),
-        timeout: Duration::from_secs(config.ocr_timeout_seconds),
-        force_image_ocr: false,
-        image: config.image_options(None, None),
-        jobs: 1,
-        max_tokens: config.ocr_max_tokens,
-        cache_dir: None,
-    })
-    .and_then(|engine| engine.check_connection());
+    let network_result = OcrEngine::new(OcrOptions::from_config(config))
+        .and_then(|engine| engine.check_connection());
     let network_ok = network_result.is_ok();
     if config.proxy.trim().is_empty() {
         check(
@@ -235,14 +199,14 @@ fn check(name: &str, ok: bool, detail: impl AsRef<str>, failures: &mut usize) {
     );
 }
 
-fn probe_command(program: &PathBuf, args: &[&str]) -> bool {
+fn probe_command(program: &Path, args: &[&str]) -> bool {
     let mut command = Command::new(program);
     command.args(args);
     process::run(command, Duration::from_secs(10), "dependency probe")
         .is_ok_and(|output| output.status.success())
 }
 
-fn probe_cache(directory: &PathBuf) -> Result<()> {
+fn probe_cache(directory: &Path) -> Result<()> {
     fs::create_dir_all(directory)?;
     let path = directory.join(format!(".doctor-{}.tmp", std::process::id()));
     fs::write(&path, b"bpdf")?;

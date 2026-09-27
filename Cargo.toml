@@ -1,6 +1,6 @@
 [package]
 name = "bpdf"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Second-generation loss-conscious PDF and image processing toolkit"
@@ -19,7 +19,6 @@ image = { version = "0.25.10", default-features = false, features = [
     "gif",
     "jpeg",
     "png",
-    "tiff",
     "webp",
 ] }
 lopdf = { version = "0.44.0", default-features = false }
@@ -29,13 +28,19 @@ tempfile = "3.23.0"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 ureq = { version = "3.3.0", default-features = false, features = [
     "json",
-    "rustls",
     "socks-proxy",
 ] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
-miniz_oxide = "0.8"
+zip = { version = "2.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+flate2 = "1.1"
+sha2 = "0.11"
+base64 = "0.23"
+memchr = "2"
+encoding_rs = "0.8"
 
+# Windows uses the system TLS stack (SChannel) and the system certificate
+# store; multi-page and single-page TIFF are decoded through WIC.
 [target.'cfg(windows)'.dependencies]
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls"] }
 windows = { version = "0.62.2", features = [
     "Win32_Graphics_Imaging",
     "Win32_Storage_FileSystem",
@@ -50,12 +55,39 @@ windows = { version = "0.62.2", features = [
     "Storage",
 ] }
 
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+image = { version = "0.25.10", default-features = false, features = ["tiff"] }
+
 [profile.release]
 strip = true
 lto = "fat"
 opt-level = "z"
 codegen-units = 1
 panic = "abort"
+
+# Pixel-heavy codecs dominate run time; optimise them for speed while the rest
+# of the binary stays size-optimised.
+[profile.release.package.image]
+opt-level = 2
+[profile.release.package.zune-jpeg]
+opt-level = 2
+[profile.release.package.zune-core]
+opt-level = 2
+[profile.release.package.image-webp]
+opt-level = 2
+[profile.release.package.png]
+opt-level = 2
+[profile.release.package.fdeflate]
+opt-level = 2
+[profile.release.package.miniz_oxide]
+opt-level = 2
+[profile.release.package.flate2]
+opt-level = 2
+[profile.release.package.crc32fast]
+opt-level = 2
+[profile.release.package.sha2]
+opt-level = 2
 
 [dev-dependencies]
 lopdf = "0.44.0"

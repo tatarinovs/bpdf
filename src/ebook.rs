@@ -5,37 +5,24 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use zip::ZipArchive;
 
-use crate::xml;
+use crate::formats::Format;
+use crate::{encoding, xml};
 
-/// Reads an ebook (EPUB, FB2, FB2.ZIP, or HTMLZ) and returns its contents formatted as clean text.
-pub fn load(path: &Path) -> Result<String> {
-    let path_str = path.to_string_lossy();
-    if path_str.to_ascii_lowercase().ends_with(".fb2.zip") {
-        return load_fb2_zip(path);
+/// Reads an ebook of an already detected format and returns its contents
+/// as clean text.
+pub fn load(path: &Path, format: Format) -> Result<String> {
+    match format {
+        Format::Epub => load_epub(path),
+        Format::Htmlz => load_htmlz(path),
+        Format::Fb2 if is_zip(path) => load_fb2_zip(path),
+        _ => load_fb2_raw(path),
     }
+}
 
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_ascii_lowercase().as_str() {
-            "epub" => return load_epub(path),
-            "fb2" => return load_fb2_raw(path),
-            "htmlz" => return load_htmlz(path),
-            "zip" => {
-                if let Ok(text) = load_epub(path) {
-                    return Ok(text);
-                }
-                if let Ok(text) = load_fb2_zip(path) {
-                    return Ok(text);
-                }
-                if let Ok(text) = load_htmlz(path) {
-                    return Ok(text);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Fallback: try raw FB2 XML
-    load_fb2_raw(path)
+fn is_zip(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
 }
 
 /// Load `.htmlz` archive containing an `index.html` or html file.
@@ -46,17 +33,17 @@ pub fn load_htmlz(path: &Path) -> Result<String> {
         .with_context(|| format!("failed to read ZIP archive {}", path.display()))?;
 
     let mut index_file = None;
-    for i in 0..archive.len() {
-        let Ok(entry) = archive.by_index(i) else {
+    for index in 0..archive.len() {
+        let Some(name) = archive.name_for_index(index) else {
             continue;
         };
-        let name = entry.name().to_ascii_lowercase();
-        if name == "index.html" || name == "index.htm" {
-            index_file = Some(entry.name().to_owned());
+        let lower = name.to_ascii_lowercase();
+        if lower == "index.html" || lower == "index.htm" {
+            index_file = Some(name.to_owned());
             break;
         }
-        if index_file.is_none() && (name.ends_with(".html") || name.ends_with(".htm")) {
-            index_file = Some(entry.name().to_owned());
+        if index_file.is_none() && (lower.ends_with(".html") || lower.ends_with(".htm")) {
+            index_file = Some(name.to_owned());
         }
     }
 
@@ -68,9 +55,7 @@ pub fn load_htmlz(path: &Path) -> Result<String> {
 
 /// Load raw `.fb2` XML document.
 fn load_fb2_raw(path: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read FB2 file {}", path.display()))?;
-    parse_fb2_xml(&content)
+    parse_fb2_xml(&encoding::read_text(path)?)
 }
 
 /// Load `.fb2.zip` archive containing an `.fb2` or `.xml` file.
@@ -80,24 +65,20 @@ fn load_fb2_zip(path: &Path) -> Result<String> {
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to read ZIP structure in {}", path.display()))?;
 
-    let mut target_index = None;
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i)?;
-        let name = entry.name().to_ascii_lowercase();
-        if name.ends_with(".fb2") || name.ends_with(".xml") {
-            target_index = Some(i);
-            break;
-        }
-    }
-
-    let index = target_index.unwrap_or(0);
-    let mut zip_file = archive.by_index(index)?;
-    let mut content = String::new();
-    zip_file
-        .read_to_string(&mut content)
+    let index = (0..archive.len())
+        .find(|index| {
+            archive.name_for_index(*index).is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                name.ends_with(".fb2") || name.ends_with(".xml")
+            })
+        })
+        .unwrap_or(0);
+    let mut bytes = Vec::new();
+    archive
+        .by_index(index)?
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read inner FB2 file from {}", path.display()))?;
-
-    parse_fb2_xml(&content)
+    parse_fb2_xml(&encoding::decode_text(&bytes))
 }
 
 /// Parses FictionBook 2 (FB2) XML into readable text.
@@ -634,7 +615,7 @@ mod tests {
 
         zip.finish().unwrap();
 
-        let text = load(&epub_path).unwrap();
+        let text = load(&epub_path, Format::Epub).unwrap();
         assert!(text.contains("EPUB Test Book"));
         assert!(text.contains("Author: Alice Smith"));
         assert!(text.contains("# Chapter 1"));

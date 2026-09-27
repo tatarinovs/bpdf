@@ -11,9 +11,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
-use image::{
-    DynamicImage, ExtendedColorType, GenericImageView, ImageFormat, ImageReader, Rgb, RgbImage,
-};
+use image::{DynamicImage, ExtendedColorType, GenericImageView, ImageFormat, ImageReader};
 use tempfile::Builder;
 
 use crate::formats::{self, Format};
@@ -21,6 +19,28 @@ use crate::metadata;
 use crate::process;
 
 const MAX_IMAGE_FRAMES: usize = 10_000;
+/// Longest edge sent to vision OCR; larger images are downscaled first.
+const OCR_MAX_EDGE: u32 = 1536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Orientation {
+    Portrait,
+    Landscape,
+}
+
+impl Orientation {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "portrait" => Ok(Self::Portrait),
+            "landscape" => Ok(Self::Landscape),
+            _ => bail!("invalid orientation '{value}': expected 'portrait' or 'landscape'"),
+        }
+    }
+
+    pub fn is_landscape(self) -> bool {
+        self == Self::Landscape
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ImageOptions {
@@ -30,95 +50,121 @@ pub struct ImageOptions {
     pub image_dpi: u32,
     pub long_edge: Option<u32>,
     pub short_edge: Option<u32>,
-    pub orient: Option<String>,
+    pub orient: Option<Orientation>,
     pub rotation_degrees: Option<i64>,
     pub force_reencode: bool,
     pub raw_develop: bool,
 }
 
+impl Default for ImageOptions {
+    fn default() -> Self {
+        Self {
+            keep_icc: false,
+            ffmpeg: PathBuf::from("ffmpeg"),
+            jpeg_quality: 95,
+            image_dpi: 150,
+            long_edge: None,
+            short_edge: None,
+            orient: None,
+            rotation_degrees: None,
+            force_reencode: false,
+            raw_develop: false,
+        }
+    }
+}
+
+impl ImageOptions {
+    /// True when pixels must be decoded even if the source already is a JPEG
+    /// that fits the page.
+    fn needs_reencode(&self) -> bool {
+        self.force_reencode
+            || self.long_edge.is_some()
+            || self.short_edge.is_some()
+            || self.orient.is_some()
+            || self
+                .rotation_degrees
+                .is_some_and(|degrees| degrees.rem_euclid(360) != 0)
+    }
+}
+
 pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
-    let format = formats::detect(path);
-    if format.is_some_and(Format::requires_ffmpeg) {
-        return ffmpeg_to_jpeg_for_page(path, options, page_size);
-    }
-    if format.is_some_and(Format::requires_wic) {
-        return decoded_to_jpeg_for_page(crate::wic::decode(path)?, options, page_size);
-    }
-    if format == Some(Format::CameraRaw) {
-        return raw_to_jpeg_for_page(path, options, page_size);
-    }
-
-    let input = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-
-    // Preserve the lossless JPEG fast path when its dimensions already fit.
-    let jpeg_target = (format == Some(Format::Jpeg))
-        .then(|| image::image_dimensions(path).ok())
-        .flatten()
-        .and_then(|(width, height)| {
-            dpi_target_for_dimensions(width, height, page_size, options.image_dpi)
-        });
-
-    let needs_reencode = options.force_reencode
-        || options.long_edge.is_some()
-        || options.short_edge.is_some()
-        || options.orient.is_some()
-        || options
-            .rotation_degrees
-            .is_some_and(|deg| deg.rem_euclid(360) != 0);
-
-    if format == Some(Format::Jpeg) && jpeg_target.is_none() && !needs_reencode {
-        return metadata::strip_jpeg(&input, options.keep_icc);
+    match formats::detect(path) {
+        Some(Format::FfmpegRaster) => {
+            return apply_transformations(decode_with_ffmpeg(path, options)?, options, page_size);
+        }
+        Some(Format::WicRaster) => {
+            return apply_transformations(crate::wic::decode(path)?, options, page_size);
+        }
+        Some(Format::CameraRaw) => return raw_to_jpeg(path, options, page_size),
+        #[cfg(windows)]
+        Some(Format::Raster) if is_tiff(path) => {
+            return apply_transformations(crate::wic::decode(path)?, options, page_size);
+        }
+        _ => {}
     }
 
-    let native = ImageReader::new(Cursor::new(input))
-        .with_guessed_format()
-        .context("failed to determine image format")?
-        .decode();
-    let image = match native {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if let Some(jpeg) = jpeg_fast_path(&bytes, options, page_size) {
+        return Ok(jpeg);
+    }
+    let image = match decode_bytes(&bytes) {
         Ok(image) => image,
         Err(native_error) => decode_with_ffmpeg(path, options).with_context(|| {
             format!(
-                "native decoder failed for {}: {native_error}",
+                "native decoder failed for {}: {native_error:#}",
                 path.display()
             )
         })?,
     };
-    apply_transformations(image, options, page_size, jpeg_target)
+    apply_transformations(image, options, page_size)
 }
 
-/// Convert raw image bytes into JPEG for PDF page creation.
+/// Convert in-memory image bytes into a JPEG suitable for a PDF page.
 pub fn bytes_to_jpeg(
     bytes: &[u8],
     options: &ImageOptions,
     page_size: Option<&str>,
 ) -> Result<Vec<u8>> {
-    if let Ok(ImageFormat::Jpeg) = image::guess_format(bytes) {
-        let jpeg_target = ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()
-            .and_then(|r| r.into_dimensions().ok())
-            .and_then(|(w, h)| dpi_target_for_dimensions(w, h, page_size, options.image_dpi));
-        if jpeg_target.is_none() {
-            let needs_reencode = options.force_reencode
-                || options.long_edge.is_some()
-                || options.short_edge.is_some()
-                || options.orient.is_some()
-                || options
-                    .rotation_degrees
-                    .is_some_and(|deg| deg.rem_euclid(360) != 0);
-            if !needs_reencode && let Ok(stripped) = metadata::strip_jpeg(bytes, options.keep_icc) {
-                return Ok(stripped);
-            }
-        }
+    if let Some(jpeg) = jpeg_fast_path(bytes, options, page_size) {
+        return Ok(jpeg);
     }
+    apply_transformations(decode_bytes(bytes)?, options, page_size)
+}
 
-    let image = ImageReader::new(Cursor::new(bytes))
+/// A JPEG that already fits the page is only stripped of metadata, which
+/// keeps the original compressed pixels.
+fn jpeg_fast_path(
+    bytes: &[u8],
+    options: &ImageOptions,
+    page_size: Option<&str>,
+) -> Option<Vec<u8>> {
+    if options.needs_reencode() || image::guess_format(bytes).ok()? != ImageFormat::Jpeg {
+        return None;
+    }
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Jpeg)
+        .into_dimensions()
+        .ok()?;
+    if dpi_target_for_dimensions(width, height, page_size, options.image_dpi).is_some() {
+        return None;
+    }
+    metadata::strip_jpeg(bytes, options.keep_icc).ok()
+}
+
+fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
+    ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("failed to determine image format")?
         .decode()
-        .context("failed to decode image bytes")?;
+        .context("failed to decode image")
+}
 
-    apply_transformations(image, options, page_size, None)
+#[cfg(windows)]
+fn is_tiff(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("tif") || value.eq_ignore_ascii_case("tiff")
+        })
 }
 
 /// Decode every logical page/frame for PDF construction. Single-image callers
@@ -133,14 +179,19 @@ pub fn to_jpegs_for_pdf(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let open = || -> Result<BufReader<File>> {
+        Ok(BufReader::new(File::open(path).with_context(|| {
+            format!("failed to open {}", path.display())
+        })?))
+    };
     match extension.as_str() {
         "gif" => {
-            let decoder = GifDecoder::new(BufReader::new(File::open(path)?))
+            let decoder = GifDecoder::new(open()?)
                 .with_context(|| format!("failed to decode GIF {}", path.display()))?;
             encode_animation_frames(decoder.into_frames(), options, page_size, path)
         }
         "png" | "apng" => {
-            let decoder = PngDecoder::new(BufReader::new(File::open(path)?))
+            let decoder = PngDecoder::new(open()?)
                 .with_context(|| format!("failed to decode PNG {}", path.display()))?;
             if decoder.is_apng()? {
                 encode_animation_frames(decoder.apng()?.into_frames(), options, page_size, path)
@@ -149,7 +200,7 @@ pub fn to_jpegs_for_pdf(
             }
         }
         "webp" => {
-            let decoder = WebPDecoder::new(BufReader::new(File::open(path)?))
+            let decoder = WebPDecoder::new(open()?)
                 .with_context(|| format!("failed to decode WebP {}", path.display()))?;
             if decoder.has_animation() {
                 encode_animation_frames(decoder.into_frames(), options, page_size, path)
@@ -177,7 +228,7 @@ fn encode_animation_frames(
             );
         }
         let image = DynamicImage::ImageRgba8(frame?.into_buffer());
-        output.push(decoded_to_jpeg_for_page(image, options, page_size)?);
+        output.push(apply_transformations(image, options, page_size)?);
     }
     if output.is_empty() {
         bail!("{} contains no decodable frames", path.display());
@@ -192,21 +243,15 @@ fn decode_tiff_pages(
     page_size: Option<&str>,
 ) -> Result<Vec<Vec<u8>>> {
     let decoder = crate::wic::Decoder::open(path)?;
-    let count = usize::try_from(decoder.frame_count()?)?;
-    if count > MAX_IMAGE_FRAMES {
+    let count = decoder.frame_count()?;
+    if count as usize > MAX_IMAGE_FRAMES {
         bail!(
             "{} contains {count} pages; maximum is {MAX_IMAGE_FRAMES}",
             path.display()
         );
     }
     (0..count)
-        .map(|index| {
-            decoded_to_jpeg_for_page(
-                decoder.decode_frame(u32::try_from(index)?)?,
-                options,
-                page_size,
-            )
-        })
+        .map(|index| apply_transformations(decoder.decode_frame(index)?, options, page_size))
         .collect()
 }
 
@@ -219,36 +264,21 @@ fn decode_tiff_pages(
     Ok(vec![to_jpeg(path, options, page_size)?])
 }
 
-fn raw_to_jpeg_for_page(
-    path: &Path,
-    options: &ImageOptions,
-    page_size: Option<&str>,
-) -> Result<Vec<u8>> {
+fn raw_to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
     if !options.raw_develop {
         match crate::raw::read_preview(path) {
-            Ok(preview_bytes) => {
-                return bytes_to_jpeg(&preview_bytes, options, page_size);
-            }
+            Ok(preview) => return bytes_to_jpeg(&preview, options, page_size),
             Err(preview_error) => {
-                #[cfg(windows)]
-                {
-                    if let Ok(decoded) = crate::wic::decode(path) {
-                        return decoded_to_jpeg_for_page(decoded, options, page_size);
-                    }
-                }
-                return Err(preview_error);
+                return crate::wic::decode(path)
+                    .map_err(|_| preview_error)
+                    .and_then(|image| apply_transformations(image, options, page_size));
             }
         }
     }
-
-    #[cfg(windows)]
-    {
-        decoded_to_jpeg_for_page(crate::wic::decode(path)?, options, page_size)
-    }
-    #[cfg(not(windows))]
-    {
-        let preview_bytes = crate::raw::read_preview(path)?;
-        bytes_to_jpeg(&preview_bytes, options, page_size)
+    match crate::wic::decode(path) {
+        Ok(image) => apply_transformations(image, options, page_size),
+        Err(error) if cfg!(windows) => Err(error),
+        Err(_) => bytes_to_jpeg(&crate::raw::read_preview(path)?, options, page_size),
     }
 }
 
@@ -257,41 +287,29 @@ pub fn for_ocr(path: &Path, options: &ImageOptions) -> Result<Vec<u8>> {
         return to_jpeg(path, options, None);
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let format = image::guess_format(&bytes).ok();
     if matches!(
-        format,
-        Some(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif)
+        image::guess_format(&bytes),
+        Ok(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif)
     ) {
         return Ok(bytes);
     }
     to_jpeg(path, options, None)
 }
 
+/// Downscale an image for vision OCR. Small images are passed through
+/// untouched; only their header is parsed.
 pub fn optimize_for_ocr(bytes: &[u8]) -> Result<Vec<u8>> {
-    let image = image::load_from_memory(bytes).context("failed to decode OCR image")?;
-    let (width, height) = image.dimensions();
-    if width <= 1536 && height <= 1536 && bytes.len() < 3 * 1024 * 1024 {
+    let (width, height) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("failed to determine OCR image format")?
+        .into_dimensions()
+        .context("failed to read OCR image dimensions")?;
+    if width <= OCR_MAX_EDGE && height <= OCR_MAX_EDGE && bytes.len() < 3 * 1024 * 1024 {
         return Ok(bytes.to_vec());
     }
-
-    let target_dimensions = fit_dimensions(width, height, 1536, 1536);
-    resize_to_jpeg_with_filter(&image, target_dimensions, 80, FilterType::CatmullRom)
-}
-
-fn ffmpeg_to_jpeg_for_page(
-    path: &Path,
-    options: &ImageOptions,
-    page_size: Option<&str>,
-) -> Result<Vec<u8>> {
-    decoded_to_jpeg_for_page(decode_with_ffmpeg(path, options)?, options, page_size)
-}
-
-fn decoded_to_jpeg_for_page(
-    image: DynamicImage,
-    options: &ImageOptions,
-    page_size: Option<&str>,
-) -> Result<Vec<u8>> {
-    apply_transformations(image, options, page_size, None)
+    let image = image::load_from_memory(bytes).context("failed to decode OCR image")?;
+    let target = fit_dimensions(width, height, OCR_MAX_EDGE, OCR_MAX_EDGE);
+    resize_to_jpeg_with_filter(&image, target, 80, FilterType::CatmullRom)
 }
 
 fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
@@ -300,21 +318,19 @@ fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImag
 
     let mut command = Command::new(&options.ffmpeg);
     command
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-y")
-        .arg("-i")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
         // HEIC files often expose both the primary image and a thumbnail.
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-map_metadata")
-        .arg("-1")
-        .arg("-pix_fmt")
-        .arg("rgba")
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-map_metadata",
+            "-1",
+            "-pix_fmt",
+            "rgba",
+        ])
         .arg(&output_path);
     let output = process::run(command, Duration::from_secs(120), "ffmpeg").with_context(|| {
         format!(
@@ -332,11 +348,6 @@ fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImag
     image::open(&output_path).context("ffmpeg produced no decodable PNG output")
 }
 
-fn dpi_target(image: &DynamicImage, page_size: Option<&str>, image_dpi: u32) -> Option<(u32, u32)> {
-    let (width, height) = image.dimensions();
-    dpi_target_for_dimensions(width, height, page_size, image_dpi)
-}
-
 fn dpi_target_for_dimensions(
     width: u32,
     height: u32,
@@ -346,40 +357,58 @@ fn dpi_target_for_dimensions(
     if image_dpi == 0 {
         return None;
     }
-    let size = page_size?;
-    let (page_width, page_height) = crate::pdf::paper_size(size).ok()?;
+    let (page_width, page_height) = crate::pdf::paper_size(page_size?).ok()?;
     fit_dimensions_for_dpi(width, height, page_width, page_height, image_dpi)
 }
 
+/// Encode as baseline JPEG. Grayscale stays single-channel; transparency is
+/// composited onto white.
 pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<Vec<u8>> {
-    if let Some(rgb) = image.as_rgb8() {
-        let mut bytes = Vec::new();
-        JpegEncoder::new_with_quality(&mut bytes, quality)
-            .encode(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                ExtendedColorType::Rgb8,
-            )
-            .context("failed to encode JPEG")?;
-        return Ok(bytes);
-    }
-
-    let rgba = image.to_rgba8();
     let (width, height) = image.dimensions();
-    let rgb = RgbImage::from_fn(width, height, |x, y| {
-        let pixel = rgba.get_pixel(x, y).0;
-        let alpha = u16::from(pixel[3]);
-        let blend = |channel: u8| -> u8 {
-            ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
-        };
-        Rgb([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])])
-    });
-
     let mut bytes = Vec::new();
-    JpegEncoder::new_with_quality(&mut bytes, quality)
-        .encode_image(&DynamicImage::ImageRgb8(rgb))
-        .context("failed to encode JPEG")?;
+    let mut encode = |data: &[u8], color: ExtendedColorType| {
+        JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode(data, width, height, color)
+            .context("failed to encode JPEG")
+    };
+    let blend = |channel: u8, alpha: u8| -> u8 {
+        let alpha = u16::from(alpha);
+        ((u16::from(channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+    };
+
+    match image {
+        DynamicImage::ImageLuma8(gray) => encode(gray.as_raw(), ExtendedColorType::L8)?,
+        DynamicImage::ImageRgb8(rgb) => encode(rgb.as_raw(), ExtendedColorType::Rgb8)?,
+        DynamicImage::ImageLuma16(_) => encode(image.to_luma8().as_raw(), ExtendedColorType::L8)?,
+        DynamicImage::ImageLumaA8(_) | DynamicImage::ImageLumaA16(_) => {
+            let gray = image
+                .to_luma_alpha8()
+                .as_raw()
+                .chunks_exact(2)
+                .map(|pixel| blend(pixel[0], pixel[1]))
+                .collect::<Vec<_>>();
+            encode(&gray, ExtendedColorType::L8)?
+        }
+        _ if !image.color().has_alpha() => {
+            encode(image.to_rgb8().as_raw(), ExtendedColorType::Rgb8)?
+        }
+        _ => {
+            let rgb = image
+                .to_rgba8()
+                .as_raw()
+                .chunks_exact(4)
+                .flat_map(|pixel| {
+                    let alpha = pixel[3];
+                    [
+                        blend(pixel[0], alpha),
+                        blend(pixel[1], alpha),
+                        blend(pixel[2], alpha),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            encode(&rgb, ExtendedColorType::Rgb8)?
+        }
+    }
     Ok(bytes)
 }
 
@@ -400,10 +429,14 @@ fn fit_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> O
     }
     let scale =
         (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
-    Some((
+    Some(scaled(width, height, scale))
+}
+
+fn scaled(width: u32, height: u32, scale: f64) -> (u32, u32) {
+    (
         (f64::from(width) * scale).round().max(1.0) as u32,
         (f64::from(height) * scale).round().max(1.0) as u32,
-    ))
+    )
 }
 
 pub(crate) fn fit_dimensions_for_dpi(
@@ -437,58 +470,60 @@ fn resize_to_jpeg_with_filter(
 ) -> Result<Vec<u8>> {
     match target_dimensions {
         Some((width, height)) => {
-            let resized = image.resize_exact(width, height, filter);
-            encode_jpeg_on_white(&resized, quality)
+            encode_jpeg_on_white(&resize(image, width, height, filter), quality)
         }
         None => encode_jpeg_on_white(image, quality),
     }
+}
+
+/// High-quality resize. Strong reductions first average whole pixel blocks
+/// (cheap and alias-free) down to twice the target, then the requested
+/// filter produces the final size; this is several times faster than running
+/// a wide Lanczos kernel over the full-resolution image.
+pub(crate) fn resize(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> DynamicImage {
+    let (source_width, source_height) = image.dimensions();
+    if source_width >= width.saturating_mul(4) && source_height >= height.saturating_mul(4) {
+        let reduced = image.thumbnail_exact(width * 2, height * 2);
+        return reduced.resize_exact(width, height, filter);
+    }
+    image.resize_exact(width, height, filter)
 }
 
 pub(crate) fn apply_transformations(
     mut image: DynamicImage,
     options: &ImageOptions,
     page_size: Option<&str>,
-    default_target: Option<(u32, u32)>,
 ) -> Result<Vec<u8>> {
-    if let Some(orient) = &options.orient {
-        let (w, h) = image.dimensions();
-        let is_landscape = w > h;
-        match orient.to_lowercase().as_str() {
-            "portrait" if is_landscape => {
-                image = image.rotate90();
-            }
-            "landscape" if !is_landscape => {
-                image = image.rotate90();
-            }
-            _ => {}
+    if let Some(orient) = options.orient {
+        let (width, height) = image.dimensions();
+        if (width > height) != orient.is_landscape() && width != height {
+            image = image.rotate90();
         }
     }
 
-    if let Some(degrees) = options.rotation_degrees {
-        let degrees = degrees.rem_euclid(360);
-        match degrees {
-            90 => image = image.rotate90(),
-            180 => image = image.rotate180(),
-            270 => image = image.rotate270(),
-            _ => {} // 0 or invalid multiple of 90 handled as no-op
-        }
+    match options
+        .rotation_degrees
+        .map(|degrees| degrees.rem_euclid(360))
+    {
+        Some(90) => image = image.rotate90(),
+        Some(180) => image = image.rotate180(),
+        Some(270) => image = image.rotate270(),
+        _ => {}
     }
 
-    let (w, h) = image.dimensions();
+    let (width, height) = image.dimensions();
     let target_dimensions = if let Some(long) = options.long_edge {
-        fit_dimensions(w, h, long, long)
+        fit_dimensions(width, height, long, long)
     } else if let Some(short) = options.short_edge {
-        let scale = (f64::from(short) / f64::from(w)).max(f64::from(short) / f64::from(h));
-        if (scale - 1.0).abs() > f64::EPSILON {
-            Some((
-                (f64::from(w) * scale).round().max(1.0) as u32,
-                (f64::from(h) * scale).round().max(1.0) as u32,
-            ))
-        } else {
-            None
-        }
+        let scale = (f64::from(short) / f64::from(width)).max(f64::from(short) / f64::from(height));
+        ((scale - 1.0).abs() > f64::EPSILON).then(|| scaled(width, height, scale))
     } else {
-        default_target.or_else(|| dpi_target(&image, page_size, options.image_dpi))
+        dpi_target_for_dimensions(width, height, page_size, options.image_dpi)
     };
 
     resize_to_jpeg(&image, target_dimensions, options.jpeg_quality)
@@ -497,17 +532,22 @@ pub(crate) fn apply_transformations(
 #[cfg(test)]
 mod tests {
     use image::codecs::gif::GifEncoder;
-    use image::{Delay, Frame, Rgba, RgbaImage};
+    use image::{Delay, Frame, Rgb, RgbImage, Rgba, RgbaImage};
 
     use super::*;
 
+    fn no_dpi() -> ImageOptions {
+        ImageOptions {
+            ffmpeg: PathBuf::from("missing-ffmpeg"),
+            jpeg_quality: 85,
+            image_dpi: 0,
+            ..ImageOptions::default()
+        }
+    }
+
     #[test]
     fn alpha_is_composited_onto_white() {
-        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            1,
-            1,
-            image::Rgba([0, 0, 0, 0]),
-        ));
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0])));
         let jpeg = encode_jpeg_on_white(&image, 100).unwrap();
         let decoded = image::load_from_memory(&jpeg).unwrap().to_rgb8();
         assert!(
@@ -516,6 +556,16 @@ mod tests {
                 .0
                 .iter()
                 .all(|channel| *channel > 245)
+        );
+    }
+
+    #[test]
+    fn grayscale_stays_single_channel() {
+        let image = DynamicImage::ImageLuma8(image::GrayImage::from_pixel(4, 4, image::Luma([90])));
+        let jpeg = encode_jpeg_on_white(&image, 90).unwrap();
+        assert_eq!(
+            image::load_from_memory(&jpeg).unwrap().color(),
+            image::ColorType::L8
         );
     }
 
@@ -532,9 +582,34 @@ mod tests {
 
     #[test]
     fn decoded_external_image_uses_the_common_page_dpi_target() {
-        let image = DynamicImage::ImageRgb8(RgbImage::new(2400, 1600));
-        assert_eq!(dpi_target(&image, Some("A4"), 150), Some((1754, 1169)));
-        assert_eq!(dpi_target(&image, Some("A4"), 0), None);
+        assert_eq!(
+            dpi_target_for_dimensions(2400, 1600, Some("A4"), 150),
+            Some((1754, 1169))
+        );
+        assert_eq!(dpi_target_for_dimensions(2400, 1600, Some("A4"), 0), None);
+    }
+
+    #[test]
+    fn strong_reduction_keeps_exact_target_and_colour() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1000, 600, Rgb([200, 100, 50])));
+        let resized = resize(&image, 100, 60, FilterType::Lanczos3);
+        assert_eq!(resized.dimensions(), (100, 60));
+        let pixel = resized.to_rgb8().get_pixel(50, 30).0;
+        assert!(
+            pixel
+                .iter()
+                .zip([200, 100, 50])
+                .all(|(a, b)| a.abs_diff(b) <= 1)
+        );
+    }
+
+    #[test]
+    fn orientation_parsing_is_case_insensitive() {
+        assert_eq!(
+            Orientation::parse("Landscape").unwrap(),
+            Orientation::Landscape
+        );
+        assert!(Orientation::parse("diagonal").is_err());
     }
 
     #[test]
@@ -544,23 +619,7 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
             .save_with_format(&path, ImageFormat::WebP)
             .unwrap();
-        let jpeg = to_jpeg(
-            &path,
-            &ImageOptions {
-                keep_icc: false,
-                ffmpeg: PathBuf::from("missing-ffmpeg"),
-                jpeg_quality: 85,
-                image_dpi: 0,
-                force_reencode: false,
-                long_edge: None,
-                short_edge: None,
-                orient: None,
-                rotation_degrees: None,
-                raw_develop: false,
-            },
-            None,
-        )
-        .unwrap();
+        let jpeg = to_jpeg(&path, &no_dpi(), None).unwrap();
         assert_eq!(image::guess_format(&jpeg).unwrap(), ImageFormat::Jpeg);
     }
 
@@ -588,23 +647,7 @@ mod tests {
             .unwrap();
         drop(encoder);
 
-        let frames = to_jpegs_for_pdf(
-            &path,
-            &ImageOptions {
-                keep_icc: false,
-                ffmpeg: PathBuf::from("missing-ffmpeg"),
-                jpeg_quality: 85,
-                image_dpi: 0,
-                force_reencode: false,
-                long_edge: None,
-                short_edge: None,
-                orient: None,
-                rotation_degrees: None,
-                raw_develop: false,
-            },
-            None,
-        )
-        .unwrap();
+        let frames = to_jpegs_for_pdf(&path, &no_dpi(), None).unwrap();
         assert_eq!(frames.len(), 2);
         assert!(
             frames
@@ -629,20 +672,7 @@ mod tests {
         fake_raw.extend_from_slice(b"RAW_FOOTER");
         fs::write(&path, fake_raw).unwrap();
 
-        let options = ImageOptions {
-            keep_icc: false,
-            ffmpeg: PathBuf::from("missing-ffmpeg"),
-            jpeg_quality: 85,
-            image_dpi: 0,
-            force_reencode: false,
-            long_edge: None,
-            short_edge: None,
-            orient: None,
-            rotation_degrees: None,
-            raw_develop: false,
-        };
-
-        let result = to_jpeg(&path, &options, None).unwrap();
+        let result = to_jpeg(&path, &no_dpi(), None).unwrap();
         assert_eq!(image::guess_format(&result).unwrap(), ImageFormat::Jpeg);
     }
 }

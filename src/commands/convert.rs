@@ -1,17 +1,20 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
 use super::common::{
-    OutputRegistry, err_pdf_only_page_ranges, finish_batch, handle_results, write_output,
+    OutputRegistry, batch, err_pdf_only_page_ranges, finish_batch, handle_results, write_output,
 };
 use crate::cli::ConvertArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
-use crate::imageconv::{self, ImageOptions};
-use crate::{ocr, output, pdf};
+use crate::imageconv::{self, ImageOptions, Orientation};
+use crate::pdf::image::{self as pdf_image, Selection};
+use crate::{output, pdf};
 
 #[derive(Debug)]
 enum Plan {
@@ -20,16 +23,25 @@ enum Plan {
     Pdf(Option<String>),
 }
 
+struct Converter<'a> {
+    output_dir: Option<&'a Path>,
+    force: bool,
+    render: bool,
+    image_options: ImageOptions,
+    registry: Mutex<OutputRegistry>,
+}
+
 pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Convert)?;
-    let mut image_options = config.image_options(args.keep_icc, args.ffmpeg.clone());
+    let mut image_options = config.image_options(args.keep_icc, args.ffmpeg);
     image_options.long_edge = args.long_edge;
     image_options.short_edge = args.short_edge;
-    image_options.orient = args.orient;
+    image_options.orient = args.orient.as_deref().map(Orientation::parse).transpose()?;
     if let Some(quality) = args.quality {
         image_options.jpeg_quality = quality;
         image_options.force_reencode = true;
     }
+
     let output_dir = args.out.as_deref();
     if let Some(directory) = output_dir {
         if !directory.exists() {
@@ -41,21 +53,21 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
 
     let mut registry = OutputRegistry::default();
     let plans = build_plans(&specs, output_dir, args.force, &mut registry);
-    let mut outputs = 0usize;
-    let results = plans.into_iter().map(|(input, plan)| {
-        let result = plan.and_then(|plan| {
-            execute(
-                &input,
-                plan,
-                output_dir,
-                args.force,
-                args.render,
-                &image_options,
-                &mut registry,
-            )
-        });
+    let converter = Converter {
+        output_dir,
+        force: args.force,
+        render: args.render,
+        image_options,
+        registry: Mutex::new(registry),
+    };
+    let results = batch(&plans, fail_fast, |(input, plan)| {
+        let result = match plan {
+            Ok(plan) => converter.execute(input, plan),
+            Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        };
         (input, result)
     });
+    let mut outputs = 0usize;
     let failures = handle_results(
         results,
         fail_fast,
@@ -81,16 +93,20 @@ fn build_plans(
                     if spec.pages.is_some() {
                         return Err(err_pdf_only_page_ranges(&input));
                     }
-                    let is_tiff = input.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    let is_tiff = input.extension().and_then(OsStr::to_str).is_some_and(|e| {
                         e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
                     });
                     if is_tiff {
-                        Ok(Plan::Tiff)
-                    } else {
-                        let output = image_output_path(&input, output_dir)?;
-                        registry.reserve(&input, &output, force)?;
-                        Ok(Plan::Image(output))
+                        return Ok(Plan::Tiff);
                     }
+                    let file_name = input
+                        .file_name()
+                        .with_context(|| format!("{} has no file name", input.display()))?;
+                    let output = output_dir
+                        .map_or_else(|| input.clone(), |directory| directory.join(file_name))
+                        .with_extension("jpg");
+                    registry.reserve(&input, &output, force)?;
+                    Ok(Plan::Image(output))
                 }
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
                 _ => bail!("unsupported convert input: {}", input.display()),
@@ -100,120 +116,130 @@ fn build_plans(
         .collect()
 }
 
-fn execute(
-    input: &Path,
-    plan: Plan,
-    output_dir: Option<&Path>,
-    force: bool,
-    render: bool,
-    image_options: &ImageOptions,
-    registry: &mut OutputRegistry,
-) -> Result<usize> {
-    match plan {
-        Plan::Image(output) => {
-            output::info(format!("Converting {}", input.display()));
-            let jpeg = imageconv::to_jpeg(input, image_options, None)?;
-            write_output(&output, &jpeg)?;
-            Ok(1)
-        }
-        Plan::Tiff => {
-            output::info(format!("Converting TIFF pages from {}", input.display()));
-            let frames = imageconv::to_jpegs_for_pdf(input, image_options, None)?;
-            if frames.is_empty() {
-                bail!("no decodable frames found in {}", input.display());
+impl Converter<'_> {
+    fn execute(&self, input: &Path, plan: &Plan) -> Result<usize> {
+        match plan {
+            Plan::Image(output) => {
+                output::info(format!("Converting {}", input.display()));
+                write_output(
+                    output,
+                    &imageconv::to_jpeg(input, &self.image_options, None)?,
+                )?;
+                Ok(1)
             }
-            let file_stem = input
-                .file_stem()
-                .with_context(|| format!("{} has no file stem", input.display()))?;
-            let count = frames.len();
-            for (i, bytes) in frames.into_iter().enumerate() {
-                let suffix = if count > 1 {
-                    format!("page_{}.jpg", i + 1)
-                } else {
-                    "jpg".to_string()
-                };
-                let output = output_dir
-                    .map(|directory| directory.join(file_stem).with_extension(&suffix))
-                    .unwrap_or_else(|| input.with_extension(&suffix));
-                registry.reserve(input, &output, force)?;
-                output::info(format!("Saving page to {}", output.display()));
-                write_output(&output, &bytes)?;
-            }
-            Ok(count)
-        }
-        Plan::Pdf(pages) => {
-            let mut document = pdf::load(input)?;
-
-            // Auto-detect text pages if --render was not explicitly provided
-            let mut should_render = render;
-            if !should_render
-                && let Ok(text) = pdf::extract_text(&document)
-                && !text.trim().is_empty()
-            {
-                should_render = true;
-            }
-
-            if should_render {
-                output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
-                if pages.is_some() {
-                    output::warn(
-                        "Page selection is not yet supported for PDF rendering, rendering all pages.",
-                    );
+            Plan::Tiff => {
+                output::info(format!("Converting TIFF pages from {}", input.display()));
+                let frames = imageconv::to_jpegs_for_pdf(input, &self.image_options, None)?;
+                if frames.is_empty() {
+                    bail!("no decodable frames found in {}", input.display());
                 }
-                let rendered =
-                    crate::winpdf::render_pdf_to_jpegs(input, output_dir, image_options)?;
-                let count = rendered.len();
-                for (output_path, bytes) in rendered {
-                    output::info(format!("Saving rendered page to {}", output_path.display()));
-                    registry.reserve(input, &output_path, force)?;
-                    write_output(&output_path, &bytes)?;
-                }
-                return Ok(count);
+                let single = frames.len() == 1;
+                let outputs = frames
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, bytes)| {
+                        let suffix = if single {
+                            "jpg".to_owned()
+                        } else {
+                            format!("page_{}.jpg", index + 1)
+                        };
+                        Ok((self.sibling_output(input, &suffix)?, bytes))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.write_all(input, outputs, "Saving page to")
             }
+            Plan::Pdf(pages) => self.convert_pdf(input, pages.as_deref()),
+        }
+    }
 
-            output::info(format!("Extracting images from PDF {}", input.display()));
-            if let Some(pages) = pages {
-                pdf::select_pages(&mut document, &pages)?;
+    fn convert_pdf(&self, input: &Path, pages: Option<&str>) -> Result<usize> {
+        let mut document = pdf::load(input)?;
+        // Pages with fonts carry vector text that image extraction would lose.
+        let has_text = document.get_pages().values().any(|page_id| {
+            document
+                .get_page_fonts(*page_id)
+                .is_ok_and(|fonts| !fonts.is_empty())
+        });
+        if self.render || has_text {
+            output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
+            if pages.is_some() {
+                output::warn(
+                    "Page selection is not yet supported for PDF rendering, rendering all pages.",
+                );
             }
-            let images = ocr::extract_pdf_images(&document, image_options)
-                .with_context(|| format!("failed to extract images from {}", input.display()))?;
-            if images.is_empty() {
-                bail!("no extractable images found in {}", input.display());
-            }
-            let file_stem = input
-                .file_stem()
-                .with_context(|| format!("{} has no file stem", input.display()))?;
-            let outputs = images
+            let rendered = crate::winpdf::render_pdf_to_jpegs(input, &self.image_options)?
                 .into_iter()
-                .map(|image| {
-                    let suffix = format!("{}.jpg", image.label);
-                    let output = output_dir
-                        .map(|directory| directory.join(file_stem).with_extension(&suffix))
-                        .unwrap_or_else(|| input.with_extension(&suffix));
-                    registry.reserve(input, &output, force)?;
-                    Ok((output, image.bytes))
+                .enumerate()
+                .map(|(index, bytes)| {
+                    Ok((
+                        self.sibling_output(input, &format!("page_{}.jpg", index + 1))?,
+                        bytes,
+                    ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let count = outputs.len();
-            for (output_path, bytes) in outputs {
-                output::info(format!(
-                    "Saving extracted image to {}",
-                    output_path.display()
-                ));
-                write_output(&output_path, &bytes)?;
-            }
-            Ok(count)
+            return self.write_all(input, rendered, "Saving rendered page to");
         }
+
+        output::info(format!("Extracting images from PDF {}", input.display()));
+        if let Some(pages) = pages {
+            pdf::select_pages(&mut document, pages)?;
+        }
+        let outputs = pdf_image::extract_images(
+            &document,
+            Selection::Largest,
+            self.image_options.jpeg_quality,
+        )
+        .into_iter()
+        .flat_map(|(_, images)| images)
+        .map(|image| {
+            let output = self.sibling_output(input, &format!("{}.jpg", image.label))?;
+            Ok((output, image.bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        if outputs.is_empty() {
+            bail!("no extractable images found in {}", input.display());
+        }
+        self.write_all(input, outputs, "Saving extracted image to")
+    }
+
+    fn sibling_output(&self, input: &Path, suffix: &str) -> Result<PathBuf> {
+        output_for_suffix(input, self.output_dir, suffix)
+    }
+
+    /// Reserve every destination first, so a name clash writes nothing.
+    fn write_all(
+        &self,
+        input: &Path,
+        outputs: Vec<(PathBuf, Vec<u8>)>,
+        message: &str,
+    ) -> Result<usize> {
+        {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for (path, _) in &outputs {
+                registry.reserve(input, path, self.force)?;
+            }
+        }
+        for (path, bytes) in &outputs {
+            output::info(format!("{message} {}", path.display()));
+            write_output(path, bytes)?;
+        }
+        Ok(outputs.len())
     }
 }
 
-fn image_output_path(input: &Path, output_dir: Option<&Path>) -> Result<PathBuf> {
-    let file_name = input
-        .file_name()
-        .with_context(|| format!("{} has no file name", input.display()))?;
-    Ok(output_dir
-        .map(|directory| directory.join(file_name).with_extension("jpg"))
-        .unwrap_or_else(|| input.with_extension("jpg")))
+/// `<stem>.<suffix>` next to the input or inside `output_dir`.
+fn output_for_suffix(input: &Path, output_dir: Option<&Path>, suffix: &str) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .with_context(|| format!("{} has no file stem", input.display()))?;
+    let mut name = stem.to_os_string();
+    name.push(".");
+    name.push(suffix);
+    let directory = output_dir.unwrap_or_else(|| input.parent().unwrap_or(Path::new("")));
+    Ok(directory.join(name))
 }
 
 #[cfg(test)]

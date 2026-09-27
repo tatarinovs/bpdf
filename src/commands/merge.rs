@@ -1,11 +1,10 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use super::common::{
-    DOCUMENT_SEPARATOR, finish_batch, handle_results, join_numbers, reject_output_collision,
+    DOCUMENT_SEPARATOR, batch, finish_batch, handle_results, join_numbers, reject_output_collision,
     same_path, suffixed_output, write_output,
 };
 use super::optimize_document;
@@ -48,13 +47,8 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     };
 
     output::info(format!("Reading {} input file(s)...", specs.len()));
-    let loads = specs.iter().enumerate().map(|(index, spec)| {
-        output::info(format!(
-            "[{}/{}] {}",
-            index + 1,
-            specs.len(),
-            spec.path.display()
-        ));
+    let loads = batch(&specs, fail_fast, |spec| {
+        output::info(format!("Reading {}", spec.path.display()));
         (
             &spec.path,
             input::load(spec, &options).map(|doc| (spec.path.clone(), doc)),
@@ -149,7 +143,7 @@ fn merge_text(specs: &[InputSpec], output_path: &Path, fail_fast: bool) -> Resul
     let mut result = String::new();
     let mut count = 0;
     for spec in specs {
-        match fs::read_to_string(&spec.path) {
+        match crate::encoding::read_text(&spec.path) {
             Ok(content) => {
                 if count != 0 {
                     result.push_str(DOCUMENT_SEPARATOR);
