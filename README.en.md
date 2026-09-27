@@ -1,6 +1,6 @@
 # bpdf — Fast, Lightweight PDF & Document Toolkit in Rust
 
-[![Version](https://img.shields.io/badge/Version-0.5.4-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/Version-0.6.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg?logo=windows)]()
 [![Language](https://img.shields.io/badge/Язык-Русский-blue.svg)](README.md)
@@ -19,11 +19,14 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 - **Table of Contents & Bookmarks:** Automatically build hierarchical PDF Outlines when merging documents (`merge --bookmarks`).
 - **Content-Addressed OCR Cache:** SHA-256 hash-based disk caching (image hash + engine/model + prompt). Repetitive tasks and concurrent workers resolve instantly with zero redundant network requests.
 - **Network Proxy Support:** Full HTTP and SOCKS5 proxy compatibility for bypassing network restrictions or corporate firewalls.
-- **Watermarks & Stamps:** Overlay transparent PNG stamps with precise anchor positioning (`br`, `center`, or millimeter X,Y offsets), scale factors, opacity, and blend modes (`multiply` for authentic wet-ink appearance, `over`, `under`, `auto`).
+- **Stamps:** Overlay transparent PNG (or JPEG) stamps with precise anchor positioning (`br`, `center`, or millimeter X,Y offsets), scale factors, opacity, and blend modes (`multiply` for authentic wet-ink appearance, `over`, `under`, `auto`).
 - **Page Normalization & Resizing:** Fit and center pages to standard A4 or Letter, unify orientation by majority vote, or preserve native dimensions (`none`/`original`/`keep`).
 - **Lossless Metadata Stripping (Strip):** Remove EXIF / metadata from JPEG and PNG without re-encoding pixels; sanitize PDF Info / XMP metadata.
-- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), and DPI-aware image optimization (`optimize`).
-- **Safe In-Place Edits:** Safe in-place file replacement when `-o` is explicitly provided, with atomic temporary write-and-rename semantics to prevent data corruption.
+- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), and DPI-aware image optimization (`optimize`), including fitting a target file size (`--max-size`).
+- **Page Numbers & Watermarks:** Template page numbers (`number`) and text watermarks such as "COPY" (`watermark`), kept horizontal on rotated pages.
+- **Phone Photos:** EXIF orientation is honoured by merge, convert and OCR, so photos never end up sideways.
+- **Parallel Processing:** Batch inputs and images inside PDFs are processed on all cores (up to 8 threads).
+- **Safe In-Place Edits:** Atomic temporary write-and-rename semantics prevent data corruption. `rotate`, `resize` and `strip` edit in place by default; other PDF modifiers write a suffixed copy unless `-o` names the source.
 - **PDF Info Metadata:** View (`metadata show`) and update (`metadata set`) Title, Author, Subject, Keywords, and Creator properties.
 - **System Diagnostics (`doctor`):** Inspect runtime environment, configuration validity, helper binaries (`ffmpeg`, `powershell`, MS Office), and verify Groq API connectivity without consuming OCR quotas.
 - **Automation & Total Commander:** Optimized for **Total Commander** workflows with a ready-to-use button bar (`bpdf.bar`), embedded action icons, and `@list.txt` / `@"%UL"` list file support. Features silent mode (`--quiet`), NDJSON streaming (`--json`), glob expansion (`*.jpg`), and natural alphanumeric sorting (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`).
@@ -37,10 +40,11 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 | **Core (PDF, JPEG, PNG, BMP, GIF, WebP, APNG)** | Native Pure Rust | Native Pure Rust | No external dependencies required. |
 | **TIFF (single and multi-page)** | Native WIC | Native Pure Rust | Windows decodes TIFF through Windows Imaging Component. |
 | **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Native Pure Rust | Native Pure Rust | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
-| **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | Via FFmpeg | Uses Windows Imaging Component. |
+| **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | — | Uses Windows Imaging Component. |
 | **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or `--ffmpeg path/to/ffmpeg`. |
 | **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
-| **E-books (EPUB, FB2, FB2.ZIP)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction. |
+| **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |
+| **PDF page rendering (`convert --render`)** | Native Windows renderer | — | Image extraction from PDFs works everywhere. |
 | **OCR (Windows Media OCR)** | Native Windows 10/11 | — | Offline, built-in, no API keys needed. |
 | **OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or environment variable. |
 
@@ -55,7 +59,7 @@ cargo build --release
 cargo test --all-targets
 ```
 
-Build is completely clean and does not require third-party C/C++ compilers.
+On Windows the build needs no C/C++ compiler (TLS uses the system SChannel). On Linux/macOS TLS uses `rustls` with `ring`, which requires a C compiler (`cc`/`clang`).
 
 ### Windows Optimized Build Script
 
@@ -132,7 +136,8 @@ bpdf ocr <INPUTS>... [OPTIONS]
 - `<INPUTS>...` — Input files (JPG, PNG, PDF, RAW, etc., including page ranges: `scan.pdf:1-5`), directories, or globs.
 - `-o, --out <PATH>` — Output destination:
   - If `.pdf` extension (e.g. `-o searchable.pdf`) — outputs a **Searchable PDF**.
-  - If `.md` or omitted — outputs Markdown files with recognized text.
+  - Any other extension (e.g. `-o all.md`) — one combined Markdown file.
+  - Omitted — one `.md` file next to each input.
 - `--in-place` — Inject the searchable text layer directly into the source PDF file (overwrites original safely).
 - `--engine <ENGINE>` — Recognition engine: `groq`, `windows` (or `winocr`), `auto`.
 - `--lang <LANG>` — Language tag for Windows OCR (e.g. `en-US`, `ru`, `de-DE`).
@@ -141,14 +146,14 @@ bpdf ocr <INPUTS>... [OPTIONS]
 - `--prompt <TEXT>` — Custom prompt instructions for vision model.
 - `--endpoint <URL>` — Groq API endpoint URL.
 - `--force-ocr` — Force OCR processing even if the PDF already contains extractable text.
-- `--jobs <NUM>` — Concurrent worker threads (from 1 to 64, default `1`).
+- `--jobs <NUM>` — Concurrent OCR requests (1-64; defaults to `ocr_jobs` from the configuration, `1` without one).
 - `--no-cache` — Disable OCR disk cache.
 - `--cache-dir <PATH>` — Custom path for OCR cache directory.
 
 ---
 
 ### 3. `bpdf split`
-Splits a multipage PDF into separate single-page PDF files.
+Splits a multipage PDF into separate single-page PDF files named `<name>_01.pdf`, `<name>_02.pdf`, … (in the source folder unless `OUTPUT_DIR` is given).
 
 ```powershell
 bpdf split <INPUT> [OUTPUT_DIR]
@@ -171,7 +176,7 @@ bpdf extract document.pdf 1-5,8,last output.pdf
 ---
 
 ### 5. `bpdf inspect`
-Displays detailed diagnostic information about a PDF file (PDF version, page count, embedded fonts, images, dimensions, rotation).
+Displays diagnostic information about a PDF file: PDF version, page count, and the number of fonts and images per page; `--text` also prints the text layer.
 
 ```powershell
 bpdf inspect <INPUT> [--text]
@@ -180,7 +185,7 @@ bpdf inspect <INPUT> [--text]
 ---
 
 ### 6. `bpdf strip`
-Removes EXIF metadata from JPEG/PNG images without re-encoding, and sanitizes PDF Info / XMP dictionaries.
+Removes EXIF metadata from JPEG/PNG images without re-encoding (a JPEG keeps only its orientation tag), and sanitizes PDF Info / XMP dictionaries. Edits in place unless `-o` is given for a single input.
 
 ```powershell
 bpdf strip <INPUTS>... [OPTIONS]
@@ -189,7 +194,7 @@ bpdf strip <INPUTS>... [OPTIONS]
 ---
 
 ### 7. `bpdf rotate`
-Rotates PDF pages or JPEG images by multiples of 90 degrees, or aligns them to `portrait` or `landscape`.
+Rotates PDF pages or JPEG images by multiples of 90 degrees, or aligns them to `portrait` or `landscape`. Edits in place unless `-o` is given.
 
 ```powershell
 bpdf rotate <INPUTS>... <DEGREES> [-p <PAGES>] [-o <OUT>]
@@ -199,7 +204,7 @@ bpdf rotate <INPUTS>... --orient <landscape|portrait> [-p <PAGES>] [-o <OUT>]
 ---
 
 ### 8. `bpdf resize`
-Scales and centers PDF pages onto A4 or Letter sheets, or resizes JPEG images by long/short edge dimensions.
+Scales and centers PDF pages onto A4 or Letter sheets, or resizes JPEG images by long/short edge dimensions. Edits in place unless `-o` is given.
 
 ```powershell
 bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-o <OUT>]
@@ -217,7 +222,7 @@ bpdf text <INPUT> [-o <OUT>]
 ---
 
 ### 10. `bpdf stamp`
-Applies a transparent PNG stamp or seal to an existing PDF document.
+Applies a stamp or seal (transparent PNG or JPEG) to an existing PDF document. The physical size comes from `--dpi` or the image's PNG pHYs / JPEG JFIF/EXIF resolution.
 
 ```powershell
 bpdf stamp <INPUT> <STAMP> [OPTIONS]
@@ -261,8 +266,10 @@ bpdf metadata set document.pdf --title "Financial Report 2026" --author "John Do
 ### 13. `bpdf convert`
 Converts images (multipage TIFF, JPEG 2000, JPEG-LS, JPEG XR, ICO, camera RAW, etc.) and PDF pages to JPEG format.
 
+For PDFs it extracts the largest embedded image of each page (JPEGs are copied without re-encoding). Pages with fonts, or all pages with `--render`, are rendered to JPEG instead (Windows only); a page range in the input (`doc.pdf:2-4`) limits both modes.
+
 ```powershell
-bpdf convert <INPUTS>... [OPTIONS]
+bpdf convert <INPUTS>... [-o <DIR>] [--render] [--long-edge <PX>] [--short-edge <PX>] [--orient <MODE>] [-q <0-100>] [--force]
 ```
 
 ---
@@ -300,7 +307,7 @@ Options: `--size`, `--angle`, `--position`, `--color`, `--opacity`, `--pages`, `
 
 ## Page Selection Syntax
 
-In commands like `extract`, `rotate`, `resize`, `stamp`, `ocr`, and input specs:
+In `extract`, `rotate`, `resize`, `stamp`, `number`, `watermark`, and in input specs (`doc.pdf:1-3` for `merge`, `ocr`, `convert`, `rotate`, `resize`):
 - `all` — all pages;
 - `first` — first page;
 - `last` (or `l`) — last page;
@@ -329,7 +336,7 @@ C:\docs\appendix.pdf:even
 ### Total Commander Integration
 `bpdf` is fully optimized for **Total Commander**:
 - **Button Bar:** Includes a pre-configured `bpdf.bar` button bar file for easy addition to your Total Commander toolbars.
-- **List File Support:** Seamlessly works with Total Commander's selected files lists using parameter `@\"%UL\"` (UTF-8 list of selected files) or single-file `%P%N`.
+- **List File Support:** Seamlessly works with Total Commander's selected files lists using parameter `@"%UL"` (UTF-8 list of selected files) or single-file `%P%N`.
 - **Embedded Action Icons:** The Windows executable embeds individual action icons for each toolbar command (merge, OCR, split, extract, rotate, stamp, metadata).
 
 ---

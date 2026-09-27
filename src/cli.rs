@@ -110,7 +110,7 @@ pub enum Command {
     },
     /// Check configuration and external integrations without exposing secrets.
     Doctor(DoctorArgs),
-    /// Apply a PNG stamp to an existing PDF.
+    /// Apply an image stamp to an existing PDF.
     Stamp(StampArgs),
     /// Add page numbers to a PDF.
     Number(NumberArgs),
@@ -179,7 +179,7 @@ pub struct DoctorArgs {
 pub struct StampArgs {
     /// Source PDF file.
     pub input: PathBuf,
-    /// PNG image used as the stamp.
+    /// Stamp image (PNG with transparency, or JPEG).
     pub stamp: PathBuf,
     /// Destination PDF; may equal the input for an in-place update.
     #[arg(short, long)]
@@ -193,7 +193,7 @@ pub struct StampArgs {
     /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub opacity: f64,
-    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG if omitted).
+    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG/JPEG metadata if omitted).
     #[arg(long)]
     pub dpi: Option<f64>,
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
@@ -291,7 +291,7 @@ pub struct MergeArgs {
     #[arg(long, conflicts_with = "auto_rotate")]
     pub no_rotate: bool,
 
-    /// PNG image to apply as a stamp.
+    /// Stamp image (PNG with transparency, or JPEG).
     #[arg(long)]
     pub stamp: Option<PathBuf>,
     /// Stamp anchor or X,Y mm offset from the bottom-right.
@@ -303,7 +303,7 @@ pub struct MergeArgs {
     /// Stamp opacity from 0 (transparent) to 1 (opaque).
     #[arg(long, default_value_t = 1.0)]
     pub stamp_op: f64,
-    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG if omitted).
+    /// Stamp image resolution in DPI (determines physical size; auto-detected from PNG/JPEG metadata if omitted).
     #[arg(long)]
     pub stamp_dpi: Option<f64>,
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
