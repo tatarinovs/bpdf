@@ -339,7 +339,7 @@ C:\docs\appendix.pdf:even
 
 ### Total Commander Integration
 `bpdf` is fully optimized for **Total Commander**:
-- **Button Bar:** Includes a pre-configured `bpdf.bar` button bar file for easy addition to your Total Commander toolbars.
+- **Button Bar:** Includes a pre-configured `bpdf.bar` button bar file for easy addition to your Total Commander toolbars. Install `bpdf.exe` into `%COMMANDER_PATH%\tools\bpdf\` (put `stamp.png` there for the stamp button). Button captions are Russian, encoded in windows-1251, and display correctly only with a Cyrillic system code page.
 - **List File Support:** Seamlessly works with Total Commander's selected files lists using parameter `@"%UL"` (UTF-8 list of selected files) or single-file `%P%N`.
 - **Embedded Action Icons:** The Windows executable embeds individual action icons for each toolbar command (merge, OCR, split, extract, rotate, stamp, metadata).
 

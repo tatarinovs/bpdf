@@ -174,10 +174,17 @@ fn default_output(specs: &[InputSpec]) -> PathBuf {
     let first = &specs[0].path;
     let candidate = first.with_extension("pdf");
     if specs.len() == 1 && !same_path(first, &candidate) {
-        candidate
-    } else {
-        suffixed_output(first, "merged", "pdf")
+        return candidate;
     }
+    // A previous result selected together with its sources must not block the merge.
+    let is_input = |path: &Path| specs.iter().any(|spec| same_path(path, &spec.path));
+    let mut output = suffixed_output(first, "merged", "pdf");
+    let mut index = 2;
+    while is_input(&output) {
+        output = suffixed_output(first, &format!("merged_{index}"), "pdf");
+        index += 1;
+    }
+    output
 }
 
 fn should_merge_as_text(specs: &[InputSpec], output: &Path) -> bool {
@@ -210,6 +217,15 @@ mod tests {
             pages: None,
         }];
         assert_eq!(default_output(&specs), PathBuf::from("scan_merged.pdf"));
+    }
+
+    #[test]
+    fn previous_merge_result_among_inputs_gets_next_name() {
+        let specs = ["scan.pdf", "scan_merged.pdf", "scan_merged_2.pdf"].map(|path| InputSpec {
+            path: PathBuf::from(path),
+            pages: None,
+        });
+        assert_eq!(default_output(&specs), PathBuf::from("scan_merged_3.pdf"));
     }
 
     #[test]
