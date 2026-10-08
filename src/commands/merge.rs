@@ -172,16 +172,6 @@ fn merge_text(specs: &[InputSpec], output_path: &Path, fail_fast: bool) -> Resul
 
 fn default_output(specs: &[InputSpec]) -> PathBuf {
     let first = &specs[0].path;
-    if specs
-        .iter()
-        .all(|spec| formats::detect(&spec.path) == Some(Format::Text))
-    {
-        let extension = first
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("txt");
-        return PathBuf::from(format!("merged_output.{extension}"));
-    }
     let candidate = first.with_extension("pdf");
     if specs.len() == 1 && !same_path(first, &candidate) {
         candidate
@@ -230,5 +220,14 @@ mod tests {
         }];
         assert!(!should_merge_as_text(&specs, Path::new("data.pdf")));
         assert!(should_merge_as_text(&specs, Path::new("combined.json")));
+    }
+
+    #[test]
+    fn text_inputs_default_to_pdf_output() {
+        let specs = [InputSpec {
+            path: PathBuf::from("notes.txt"),
+            pages: None,
+        }];
+        assert_eq!(default_output(&specs), PathBuf::from("notes.pdf"));
     }
 }
