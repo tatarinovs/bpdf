@@ -86,9 +86,9 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
 
 /// Browser layout of an HTML page, or its text when no browser can render it.
 fn load_html(path: &Path, html: &HtmlOptions, text: &TextOptions) -> Result<Document> {
-    match html::convert_to_pdf(path, html) {
-        Ok(bytes) => Document::load_mem(&bytes)
-            .with_context(|| format!("browser output for {} is invalid", path.display())),
+    let (width, height) = crate::pdf::paper_size(&text.page_size)?;
+    match html::convert_to_pdf(path, html, height / width) {
+        Ok(document) => Ok(document),
         Err(browser_err) => {
             crate::output::warn(format!(
                 "Browser rendering unavailable for {}, using text extraction: {browser_err:#}",
