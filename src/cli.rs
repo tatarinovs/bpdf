@@ -31,7 +31,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Merge PDF, image frames, Office/OpenDocument and text files.
+    /// Merge PDF, image frames, Office/OpenDocument, HTML and text files.
     Merge(MergeArgs),
     /// Extract text from PDF/images, using Groq Vision when needed.
     Ocr(OcrArgs),
@@ -132,7 +132,7 @@ pub enum Command {
         #[command(subcommand)]
         command: MetadataCommand,
     },
-    /// Convert supported images or PDF embedded images to JPEG.
+    /// Convert supported images, PDF pages or images, and HTML pages to JPEG.
     Convert(ConvertArgs),
 }
 
@@ -438,6 +438,9 @@ pub struct ConvertArgs {
     /// Render PDF pages to JPEG instead of extracting embedded images.
     #[arg(long)]
     pub render: bool,
+    /// Browser window size for HTML pages, e.g. 1200x1600 (overrides config).
+    #[arg(long)]
+    pub viewport: Option<String>,
 }
 
 /// Parse a colour name or `#RRGGBB` into RGB components in 0..=1.

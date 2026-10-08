@@ -33,8 +33,11 @@ pub struct Config {
     pub ffmpeg: PathBuf,
     pub powershell: PathBuf,
     pub font_path: Option<PathBuf>,
+    pub browser: Option<PathBuf>,
     pub jpeg_quality: u8,
     pub office_timeout_seconds: u64,
+    pub html_timeout_seconds: u64,
+    pub html_viewport: String,
     pub ocr_timeout_seconds: u64,
     pub ocr_jobs: usize,
     pub ocr_max_tokens: u32,
@@ -66,8 +69,11 @@ impl Default for Config {
             ffmpeg: PathBuf::from("ffmpeg"),
             powershell: PathBuf::from("powershell.exe"),
             font_path: None,
+            browser: None,
             jpeg_quality: 95,
             office_timeout_seconds: 120,
+            html_timeout_seconds: 60,
+            html_viewport: "1200x1600".to_owned(),
             ocr_timeout_seconds: 120,
             ocr_jobs: 1,
             ocr_max_tokens: 4096,
@@ -136,6 +142,10 @@ impl Config {
         if config.office_timeout_seconds == 0 {
             bail!("office_timeout_seconds must be positive");
         }
+        if config.html_timeout_seconds == 0 {
+            bail!("html_timeout_seconds must be positive");
+        }
+        crate::html::Viewport::parse(&config.html_viewport).context("html_viewport")?;
         if config.ocr_timeout_seconds == 0 {
             bail!("ocr_timeout_seconds must be positive");
         }

@@ -1,8 +1,11 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 use lopdf::Document;
 
 use crate::fileset::InputSpec;
 use crate::formats::{self, Format};
+use crate::html::{self, HtmlOptions};
 use crate::imageconv::{self, ImageOptions};
 use crate::office::{self, OfficeOptions};
 use crate::pdf;
@@ -15,6 +18,7 @@ use crate::textpdf::{self, TextOptions};
 pub struct LoadOptions {
     pub image: ImageOptions,
     pub office: OfficeOptions,
+    pub html: HtmlOptions,
     pub text: TextOptions,
 }
 
@@ -63,6 +67,10 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
                 }
             }
         }
+        Some(Format::Html) => {
+            reject_pages(spec)?;
+            load_html(&spec.path, &options.html, &options.text)
+        }
         Some(Format::Text) => {
             reject_pages(spec)?;
             textpdf::render(&crate::encoding::read_text(&spec.path)?, &options.text)
@@ -73,6 +81,22 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             textpdf::render(&text, &options.text)
         }
         _ => bail!("unsupported merge format: {}", spec.path.display()),
+    }
+}
+
+/// Browser layout of an HTML page, or its text when no browser can render it.
+fn load_html(path: &Path, html: &HtmlOptions, text: &TextOptions) -> Result<Document> {
+    match html::convert_to_pdf(path, html) {
+        Ok(bytes) => Document::load_mem(&bytes)
+            .with_context(|| format!("browser output for {} is invalid", path.display())),
+        Err(browser_err) => {
+            crate::output::warn(format!(
+                "Browser rendering unavailable for {}, using text extraction: {browser_err:#}",
+                path.display()
+            ));
+            let source = crate::encoding::read_text(path)?;
+            textpdf::render(&crate::ebook::convert_html_to_text(&source), text)
+        }
     }
 }
 

@@ -12,6 +12,7 @@ use crate::cli::MergeArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
+use crate::html::HtmlOptions;
 use crate::input::{self, LoadOptions};
 use crate::office::OfficeOptions;
 use crate::output;
@@ -38,6 +39,10 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         office: OfficeOptions {
             powershell: config.powershell.clone(),
             timeout: Duration::from_secs(config.office_timeout_seconds),
+        },
+        html: HtmlOptions {
+            browser: config.browser.clone(),
+            timeout: Duration::from_secs(config.html_timeout_seconds),
         },
         text: TextOptions {
             page_size: page_size.clone(),

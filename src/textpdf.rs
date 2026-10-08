@@ -239,15 +239,17 @@ pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
 
     let mut contents = Vec::new();
     for page_lines in lines.chunks(lines_per_page) {
-        let mut content = format!("BT\n/F0 {:.3} Tf\n", options.font_size);
+        // `T*` line advances, unlike absolute `Tm` moves, also tell text
+        // extractors where lines end.
+        let mut content = format!(
+            "BT\n/F0 {:.3} Tf\n{line_height:.3} TL\n{:.3} {start_y:.3} Td\n",
+            options.font_size, options.margin
+        );
         for (index, line) in page_lines.iter().enumerate() {
-            let y = start_y - index as f64 * line_height;
-            let _ = write!(
-                content,
-                "1 0 0 1 {:.3} {y:.3} Tm\n<{}> Tj\n",
-                options.margin,
-                font.encode(line)
-            );
+            if index > 0 {
+                content.push_str("T*\n");
+            }
+            let _ = writeln!(content, "<{}> Tj", font.encode(line));
         }
         content.push_str("ET\n");
         contents.push(content);
@@ -353,10 +355,17 @@ pub fn overlay_searchable_text(
     for overlay in overlays {
         let mut content = String::from("\nq\nBT\n3 Tr\n");
         if !overlay.scaled_words.is_empty() {
+            let mut line_y = None;
             for word in &overlay.scaled_words {
                 if word.text.trim().is_empty() {
                     continue;
                 }
+                // One text object per line: text extractors end a line at
+                // `ET`, while render mode and scaling carry over to the next.
+                if line_y.is_some_and(|y| y != word.line_y) {
+                    content.push_str("ET\nBT\n");
+                }
+                line_y = Some(word.line_y);
                 let text = format!("{} ", word.text);
                 // A uniform size per line keeps the selection highlight steady;
                 // the baseline sits one ascent below the line top.
@@ -382,7 +391,7 @@ pub fn overlay_searchable_text(
             for line in font.wrap(fallback, font_size, overlay.page_width - 40.0) {
                 if !line.trim().is_empty() {
                     let hex = font.encode(&format!("{line} "));
-                    let _ = write!(content, "1 0 0 1 20.000 {y:.3} Tm\n<{hex}> Tj\n");
+                    let _ = write!(content, "1 0 0 1 20.000 {y:.3} Tm\n<{hex}> Tj\nET\nBT\n");
                 }
                 y -= font_size * 1.25;
                 if y < 20.0 {
@@ -546,8 +555,13 @@ mod tests {
         let parsed = Document::load_mem(&bytes).unwrap();
         assert_eq!(parsed.get_pages().len(), 1);
         let text = parsed.extract_text(&[1]).unwrap();
-        assert!(text.contains("Первая строка"));
-        assert!(text.contains("Вторая строка"));
+        assert!(
+            text.contains(
+                "Первая строка
+Вторая строка"
+            ),
+            "{text:?}"
+        );
         // The embedded font is a subset, far smaller than a system font.
         assert!(bytes.len() < 300_000, "{} bytes", bytes.len());
     }
@@ -561,15 +575,19 @@ mod tests {
             page_id,
             page_width: 842.0,
             page_height: 595.0,
-            scaled_words: vec![OcrWordBox {
-                text: "ТестовоеСлово".to_owned(),
-                x: 10.0,
-                y: 10.0,
-                width: 100.0,
-                height: 12.0,
-                line_y: 10.0,
-                line_height: 12.0,
-            }],
+            scaled_words: ["ТестовоеСлово", "второе", "Следующая"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| OcrWordBox {
+                    text: text.to_owned(),
+                    x: 10.0 + 110.0 * (index % 2) as f64,
+                    y: 10.0,
+                    width: 100.0,
+                    height: 12.0,
+                    line_y: if index < 2 { 10.0 } else { 30.0 },
+                    line_height: 12.0,
+                })
+                .collect(),
             fallback_text: None,
         };
         if overlay_searchable_text(&mut document, &[overlay], None).is_err() {
@@ -578,7 +596,13 @@ mod tests {
         let bytes = crate::pdf::save_to_bytes(&mut document).unwrap();
         let parsed = Document::load_mem(&bytes).unwrap();
         let text = parsed.extract_text(&[1]).unwrap();
-        assert!(text.contains("ТестовоеСлово"));
+        assert!(
+            text.contains(
+                "ТестовоеСлово второе 
+Следующая"
+            ),
+            "{text:?}"
+        );
         let page_id = *parsed.get_pages().get(&1).unwrap();
         assert_eq!(parsed.get_page_images(page_id).unwrap().len(), 1);
     }

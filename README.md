@@ -11,7 +11,7 @@
 
 ## Возможности
 
-- **Объединение (Merge):** Склеивание PDF, обычных изображений, комиксов (CBZ), JPEG 2000/JPEG-LS/JPEG XR, HEIC/AVIF/PSD, RAW-снимков камер, электронных книг (EPUB, FB2, FB2.ZIP, HTMLZ), документов Word/Excel/PowerPoint/OpenDocument и текстовых файлов в единый PDF или текстовый файл.
+- **Объединение (Merge):** Склеивание PDF, обычных изображений, комиксов (CBZ), JPEG 2000/JPEG-LS/JPEG XR, HEIC/AVIF/PSD, RAW-снимков камер, электронных книг (EPUB, FB2, FB2.ZIP, HTMLZ), HTML-страниц, документов Word/Excel/PowerPoint/OpenDocument и текстовых файлов в единый PDF или текстовый файл.
 - **Многостраничные изображения и комиксы:** Все страницы TIFF, архивы CBZ (с естественной сортировкой страниц) и все кадры GIF/APNG/анимированного WebP становятся отдельными страницами PDF при `merge`.
 - **Распознавание текста (OCR) и создание Searchable PDF:** Извлечение текста со сканов, картинок и PDF в Markdown или создание PDF с невидимым текстовым слоем (`-o searchable.pdf`) через облачный **Groq Vision** (Qwen / Llama) или нативный локальный **Windows Media OCR** (без API-ключей и интернета).
 - **Оглавление и закладки (Bookmarks):** Автоматическое построение дерева закладок PDF Outlines при объединении файлов (`merge --bookmarks`).
@@ -26,7 +26,7 @@
 - **Скорость:** Файлы в пакетных командах и картинки внутри PDF обрабатываются параллельно на всех ядрах (до 8 потоков).
 - **Безопасное изменение in-place:** Атомарная запись через временный файл; правила перезаписи исходников описаны в разделе [Правила перезаписи файлов](#правила-перезаписи-файлов-in-place).
 - **Метаданные PDF Info:** Просмотр (`metadata show`) и редактирование (`metadata set`) полей Title, Author, Subject, Keywords, Creator.
-- **Диагностика (`doctor`):** Проверка конфигурации, доступности внешних утилит (`ffmpeg`, `powershell`, MS Office) и проверка API Groq без расхода лимитов OCR.
+- **Диагностика (`doctor`):** Проверка конфигурации, доступности внешних утилит (`ffmpeg`, `powershell`, MS Office, браузер для HTML) и проверка API Groq без расхода лимитов OCR.
 - **Автоматизация и Total Commander:** Полная оптимизация для работы с **Total Commander** (готовая панель кнопок `bpdf.bar`, встроенные иконки под каждое действие, поддержка списков файлов `@"%UL"` и `%P%N`). Поддержка тихих пакетных скриптов (`--quiet`), потокового вывода NDJSON (`--json`), шаблонов (globs `*.jpg`), естественной сортировки (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`) и файловых манифестов (`@list.txt`).
 
 ---
@@ -38,6 +38,7 @@
 - **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
 - **RAW-снимки камер:** По умолчанию снимки `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, `.orf`, `.rw2` и другие мгновенно обрабатываются в **Pure Rust** путём извлечения полноразмерного встроенного превью от процессора камеры (кроссплатформенно: Windows, Linux, macOS). Полная проявка сенсора через Windows Imaging Component включается опцией `raw_develop = true` в `config.toml` (требует Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`).
 - **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
+- **HTML-страницы:** `.html`, `.htm`, `.xhtml` вёрстаются headless-браузером на движке Chromium (Microsoft Edge есть в любой Windows 10/11; также подходят Chrome и Chromium) — со стилями, картинками и JavaScript, текст в PDF остаётся выделяемым. Если браузер не найден, срабатывает fallback: из страницы извлекается текст (без скриптов и стилей) и рендерится как текстовый PDF.
 - **Groq Vision OCR:** Groq API Key требуется только для распознавания изображений; извлечение готового текстового слоя PDF работает без ключа. Ключ задаётся в `config.toml`, в том числе через `%GROQ_API_KEY%`.
 
 ---
@@ -295,14 +296,17 @@ bpdf metadata set <INPUT> [OPTIONS]
 
 При передаче PDF-файлов команда по умолчанию извлекает с каждой страницы самое крупное встроенное изображение (идеально для сканов); JPEG-картинки сохраняются без перекодирования. Если на страницах есть шрифты (текстовые документы), программа автоматически переключается на рендер страниц в JPEG. Рендер доступен только на Windows (встроенный рендерер PDF).
 
+HTML-страницы (`.html`, `.htm`, `.xhtml`) снимаются headless-браузером (Edge/Chrome/Chromium) в окне заданного размера — по умолчанию 1200×1600 (`html_viewport` в конфиге или `--viewport`) — и сохраняются как `<имя>.jpg`. Перед снимком браузер ждёт загрузки веб-шрифтов и картинок. Удобно для карточек маркетплейсов и баннеров, свёрстанных в HTML.
+
 ```powershell
 bpdf convert <INPUTS>... [OPTIONS]
 ```
 
 **Параметры:**
-- `<INPUTS>...` — Исходные изображения или PDF-файлы (включая диапазоны страниц для PDF: `doc.pdf:1-5`).
+- `<INPUTS>...` — Исходные изображения, PDF-файлы (включая диапазоны страниц для PDF: `doc.pdf:1-5`) или HTML-страницы.
 - `-o, --out <PATH>` — Директория назначения для сохранённых JPEG-файлов.
 - `--render` — Для PDF: принудительно рендерить страницы в JPEG вместо извлечения встроенных картинок (полезно для принудительного рендера сканов). Диапазон страниц во входе (`doc.pdf:2-4`) учитывается и при рендере; файлы называются по номерам страниц.
+- `--viewport <WxH>` — Размер окна браузера для HTML, например `1080x1080` (переопределяет `html_viewport`).
 - `--long-edge <PX>` — Максимальный размер длинной стороны изображения.
 - `--short-edge <PX>` — Минимальный размер короткой стороны изображения.
 - `--orient <MODE>` — Принудительная ориентация (`landscape` или `portrait`).
@@ -378,6 +382,7 @@ bpdf watermark contract.pdf "КОПИЯ" --color red --opacity 0.25 -o contract_
 ### Электронные книги и текстовые форматы
 
 - **Электронные книги:** `.epub`, `.fb2`, `.fb2.zip`, `.htmlz` (распаковка архивов, автоизвлечение структуры глав, заголовков и метаданных Title/Author при конвертации в PDF). `.zip` распознаётся по содержимому: EPUB, FB2, HTMLZ или архив изображений (как `.cbz`).
+- HTML: `.html`, `.htm`, `.xhtml` (через Edge/Chrome/Chromium, иначе — текст страницы). Относительные ссылки на CSS и картинки разрешаются от папки файла. Размер бумаги задаётся CSS страницы (`@page`), затем страницы приводятся к `page_size`.
 - Word: `.doc`, `.docx`, `.rtf`, `.odt`.
 - Excel: `.xls`, `.xlsx`, `.ods`.
 - PowerPoint: `.ppt`, `.pptx`, `.pps`, `.ppsx`, `.odp`.
@@ -484,6 +489,10 @@ ffmpeg = 'ffmpeg'
 powershell = 'powershell.exe'
 # font_path = '%WINDIR%\Fonts\arial.ttf'
 office_timeout_seconds = 120
+# Браузер для HTML (по умолчанию ищутся Edge, Chrome, Chromium)
+# browser = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+html_timeout_seconds = 60
+html_viewport = "1200x1600" # размер окна для convert page.html
 ```
 
 Полный образец с комментариями и всеми необязательными полями находится в [`config.example.toml`](config.example.toml).
@@ -525,11 +534,18 @@ bpdf convert scan.jp2 medical.jls photo.jxr icon.ico --out converted
 # Конвертация RAW-снимков фотоаппаратов в JPEG (быстрое превью без кодеков)
 bpdf convert photo.cr3 photo.nef photo.arw --out converted
 
+# Карточки товаров из HTML в JPEG 1200×1600 (все .html в папке)
+bpdf convert cards --out jpg
+bpdf convert banner.html --viewport 1080x1080 -q 90
+
 # Все страницы TIFF и кадры анимации становятся страницами PDF
 bpdf merge multipage.tiff animation.apng animation.webp -o pages.pdf
 
 # PowerPoint и OpenDocument в PDF
 bpdf merge slides.pptx report.odt table.ods -o office.pdf
+
+# Сохранённая веб-страница в PDF (вёрстка через Edge/Chrome)
+bpdf merge page.html -o page.pdf
 
 # Конвертация электронных книг (EPUB, FB2, FB2.ZIP) в PDF
 bpdf merge book.epub -o book.pdf

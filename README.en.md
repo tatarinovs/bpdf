@@ -13,7 +13,7 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 
 ## Key Features
 
-- **Universal Merge:** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP), Office documents (Word, Excel, PowerPoint, OpenDocument), and text/source-code files into a single PDF or merged text document.
+- **Universal Merge:** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP), HTML pages, Office documents (Word, Excel, PowerPoint, OpenDocument), and text/source-code files into a single PDF or merged text document.
 - **Multipage Images & Animation Frames:** All TIFF pages, comic book archives (CBZ with natural sort), and all frames of GIF, APNG, and animated WebP become distinct sequential PDF pages.
 - **OCR & Searchable (Sandwich) PDF:** Extract text to Markdown or create a PDF with an invisible searchable text layer (`-o searchable.pdf` / `--in-place`) using cloud **Groq Vision** (Qwen / Llama) or native local **Windows Media OCR** (offline, zero external API keys).
 - **Table of Contents & Bookmarks:** Automatically build hierarchical PDF Outlines when merging documents (`merge --bookmarks`).
@@ -43,7 +43,9 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 | **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | — | Uses Windows Imaging Component. |
 | **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or `--ffmpeg path/to/ffmpeg`. |
 | **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
+| **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. Without a browser, the page text is extracted and rendered as a text PDF. |
 | **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |
+| **HTML to JPEG (`convert page.html`)** | Edge / Chrome | Chrome / Chromium | Viewport-sized screenshot; no fallback without a browser. |
 | **PDF page rendering (`convert --render`)** | Native Windows renderer | — | Image extraction from PDFs works everywhere. |
 | **OCR (Windows Media OCR)** | Native Windows 10/11 | — | Offline, built-in, no API keys needed. |
 | **OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or environment variable. |
@@ -268,8 +270,10 @@ Converts images (multipage TIFF, JPEG 2000, JPEG-LS, JPEG XR, ICO, camera RAW, e
 
 For PDFs it extracts the largest embedded image of each page (JPEGs are copied without re-encoding). Pages with fonts, or all pages with `--render`, are rendered to JPEG instead (Windows only); a page range in the input (`doc.pdf:2-4`) limits both modes.
 
+HTML pages (`.html`, `.htm`, `.xhtml`) are captured by a headless Chromium-based browser (Edge/Chrome/Chromium) in a window of `--viewport` size (default `html_viewport = "1200x1600"`) after web fonts and images load, and saved as `<name>.jpg` — handy for marketplace cards and banners laid out in HTML.
+
 ```powershell
-bpdf convert <INPUTS>... [-o <DIR>] [--render] [--long-edge <PX>] [--short-edge <PX>] [--orient <MODE>] [-q <0-100>] [--force]
+bpdf convert <INPUTS>... [-o <DIR>] [--render] [--viewport <WxH>] [--long-edge <PX>] [--short-edge <PX>] [--orient <MODE>] [-q <0-100>] [--force]
 ```
 
 ---
@@ -388,6 +392,10 @@ ocr_max_tokens = 4096
 ffmpeg = 'ffmpeg'
 powershell = 'powershell.exe'
 office_timeout_seconds = 120
+# Browser for HTML pages (Edge, Chrome or Chromium are found automatically)
+# browser = '/usr/bin/chromium'
+html_timeout_seconds = 60
+html_viewport = "1200x1600" # window size for `convert page.html`
 ```
 
 See [`config.example.toml`](config.example.toml) for complete descriptions of all parameters.
@@ -414,6 +422,9 @@ bpdf ocr doc1.pdf doc2.pdf --in-place
 
 # Convert camera RAW files to JPEG instantly (Pure Rust preview extraction)
 bpdf convert photo.cr3 photo.nef photo.arw --out converted/
+
+# Render HTML product cards to 1200x1600 JPEGs
+bpdf convert cards/ --out jpg/
 
 # Strip EXIF metadata from all photos in folder in-place
 bpdf strip photos/*.jpg

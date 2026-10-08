@@ -15,6 +15,7 @@ pub enum Format {
     Excel,
     PowerPoint,
     Text,
+    Html,
     Epub,
     Fb2,
     Htmlz,
@@ -69,8 +70,9 @@ impl InputFormatSet {
     pub fn supports(self, path: &Path) -> bool {
         detect(path).is_some_and(|format| match self {
             Self::Merge => true,
-            Self::Ocr | Self::Convert => {
-                format.is_image() || format == Format::Pdf || format == Format::Cbz
+            Self::Ocr => format.is_image() || format == Format::Pdf || format == Format::Cbz,
+            Self::Convert => {
+                format.is_image() || matches!(format, Format::Pdf | Format::Cbz | Format::Html)
             }
             Self::Strip => matches!(format, Format::Jpeg | Format::Png | Format::Pdf),
             Self::Rotate | Self::Resize => matches!(format, Format::Pdf | Format::Jpeg),
@@ -109,6 +111,7 @@ pub fn detect_by_extension(path: &Path) -> Option<Format> {
         "ppt" | "pptx" | "pps" | "ppsx" | "odp" => Some(Format::PowerPoint),
         "epub" => Some(Format::Epub),
         "fb2" => Some(Format::Fb2),
+        "html" | "htm" | "xhtml" => Some(Format::Html),
         "htmlz" => Some(Format::Htmlz),
         "cbz" => Some(Format::Cbz),
         "md" | "txt" | "json" | "jsonc" | "xml" | "yaml" | "yml" | "log" | "ini" | "cfg"
@@ -225,6 +228,9 @@ mod tests {
         assert_eq!(detect(Path::new("slides.PPTX")), Some(Format::PowerPoint));
         assert_eq!(detect(Path::new("data.JSON")), Some(Format::Text));
         assert_eq!(detect(Path::new("notes.MD")), Some(Format::Text));
+        assert_eq!(detect(Path::new("page.HTML")), Some(Format::Html));
+        assert_eq!(detect(Path::new("page.htm")), Some(Format::Html));
+        assert_eq!(detect(Path::new("page.xhtml")), Some(Format::Html));
     }
 
     #[test]
@@ -237,6 +243,9 @@ mod tests {
         assert!(InputFormatSet::Convert.supports(Path::new("scan.jp2")));
         assert!(InputFormatSet::Convert.supports(Path::new("photo.jxr")));
         assert!(InputFormatSet::Merge.supports(Path::new("slides.pptx")));
+        assert!(InputFormatSet::Merge.supports(Path::new("page.html")));
+        assert!(!InputFormatSet::Ocr.supports(Path::new("page.html")));
+        assert!(InputFormatSet::Convert.supports(Path::new("card.html")));
         assert!(!InputFormatSet::Ocr.supports(Path::new("slides.pptx")));
         assert!(InputFormatSet::Merge.supports(Path::new("photo.nef")));
         assert!(InputFormatSet::Ocr.supports(Path::new("photo.arw")));

@@ -4,17 +4,104 @@ use std::io::Read;
 use anyhow::{Context, Result};
 use zip::ZipArchive;
 
-/// Decode the five standard XML character entities plus `&nbsp;`.
+/// Decode numeric character references, the five XML entities and the HTML
+/// named entities common in books and web pages. One pass, so `&amp;lt;`
+/// stays `&lt;`; unknown or malformed references are kept as written.
 pub fn decode_entities(text: &str) -> String {
     if !text.contains('&') {
         return text.to_owned();
     }
-    text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&nbsp;", " ")
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        result.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let decoded = rest[1..]
+            .find(';')
+            .filter(|&end| end <= 32)
+            .and_then(|end| Some((decode_entity(&rest[1..=end])?, end + 2)));
+        match decoded {
+            Some((character, length)) => {
+                result.push(character);
+                rest = &rest[length..];
+            }
+            None => {
+                result.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+fn decode_entity(name: &str) -> Option<char> {
+    if let Some(number) = name.strip_prefix('#') {
+        let code = match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        };
+        return char::from_u32(code).filter(|&c| c != '\0');
+    }
+    Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        "shy" => '\u{AD}',
+        "laquo" => '«',
+        "raquo" => '»',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "sbquo" => '‚',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "bdquo" => '„',
+        "ndash" => '–',
+        "mdash" => '—',
+        "hellip" => '…',
+        "bull" => '•',
+        "middot" => '·',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "deg" => '°',
+        "plusmn" => '±',
+        "times" => '×',
+        "divide" => '÷',
+        "minus" => '−',
+        "le" => '≤',
+        "ge" => '≥',
+        "ne" => '≠',
+        "asymp" => '≈',
+        "euro" => '€',
+        "pound" => '£',
+        "yen" => '¥',
+        "cent" => '¢',
+        "sect" => '§',
+        "para" => '¶',
+        "numero" => '№',
+        "larr" => '←',
+        "rarr" => '→',
+        "uarr" => '↑',
+        "darr" => '↓',
+        "frac12" => '½',
+        "frac14" => '¼',
+        "frac34" => '¾',
+        "sup2" => '²',
+        "sup3" => '³',
+        "micro" => 'µ',
+        "iexcl" => '¡',
+        "iquest" => '¿',
+        "thinsp" => '\u{2009}',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "zwnj" => '\u{200C}',
+        "zwj" => '\u{200D}',
+        _ => return None,
+    })
 }
 
 /// Strip all XML/HTML tags, returning only text content with entities decoded.
@@ -92,4 +179,23 @@ pub fn collect_sorted_entries(
     }
     crate::fileset::natural_sort_names(&mut names);
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_entities;
+
+    #[test]
+    fn decodes_entities_in_one_pass() {
+        assert_eq!(decode_entities("&amp;lt;b&amp;gt;"), "&lt;b&gt;");
+        assert_eq!(
+            decode_entities("&#1071;&#x44F; &mdash; &laquo;x&raquo;"),
+            "Яя — «x»"
+        );
+        assert_eq!(
+            decode_entities("AT&T &unknown; &#xZZ; &"),
+            "AT&T &unknown; &#xZZ; &"
+        );
+        assert_eq!(decode_entities("&#0;"), "&#0;");
+    }
 }

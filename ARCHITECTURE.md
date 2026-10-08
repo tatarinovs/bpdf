@@ -48,6 +48,9 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   documents and reuses the standard page-tree merger.
 - Word, Excel, and PowerPoint share the same isolated temporary-copy and Office
   process boundary in `office.rs`; only their COM export scripts differ.
+- HTML pages are printed to PDF by a headless Chromium-based browser in
+  `html.rs` (throwaway profile, bounded by `process::run`); without one,
+  `input.rs` falls back to the HTML text extractor shared with EPUB/HTMLZ.
 - PDF image decoding and page-image extraction are implemented once in
   `pdf/image.rs` and are shared by optimize, OCR, and convert. Colour spaces
   are resolved through ICC profiles, Indexed palettes and Separation; stream

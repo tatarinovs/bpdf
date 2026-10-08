@@ -369,89 +369,200 @@ fn extract_xml_attribute(snippet: &str, attr: &str) -> Option<String> {
 }
 
 /// Converts HTML/XHTML to plain text, preserving headings and paragraph boundaries.
-fn convert_html_to_text(html: &str) -> String {
+pub fn convert_html_to_text(html: &str) -> String {
+    // ASCII lowercasing keeps every byte offset, so positions found in
+    // `lower` index `html` as well.
+    let lower = html.to_ascii_lowercase();
     let mut result = String::new();
-    let mut in_tag = false;
-    let mut current_tag = String::new();
-    let mut tag_is_closing = false;
-
     let mut buf = String::new();
+    // Container whose content is metadata or graphics rather than readable text.
+    let mut hidden: Option<&str> = None;
+    let mut pre_depth = 0usize;
+    let mut in_item = false;
+    let mut pos = 0;
 
-    for c in html.chars() {
-        if c == '<' {
-            in_tag = true;
-            current_tag.clear();
-            tag_is_closing = false;
-        } else if c == '>' {
-            in_tag = false;
-            let tag_lower = current_tag.trim().to_ascii_lowercase();
-
-            if tag_lower.starts_with('/') {
-                tag_is_closing = true;
+    while let Some(c) = html[pos..].chars().next() {
+        pos += c.len_utf8();
+        // `<` starts markup only before a name, `/`, `!` or `?`; otherwise
+        // it is text, as in `a < b`.
+        let starts_markup = c == '<'
+            && lower[pos..]
+                .starts_with(|next: char| next.is_ascii_alphabetic() || "/!?".contains(next));
+        if !starts_markup {
+            if hidden.is_none() {
+                push_text(&mut buf, c, pre_depth > 0);
             }
+            continue;
+        }
 
-            let clean_tag_name = tag_lower
-                .trim_start_matches('/')
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
+        if lower[pos..].starts_with("!--") {
+            pos = comment_end(&lower, pos + 3);
+            continue;
+        }
+        let Some(length) = tag_length(&lower[pos..]) else {
+            break;
+        };
+        let tag = lower[pos..pos + length].trim();
+        pos += length + 1;
 
-            match clean_tag_name {
-                "p" | "div" | "tr" => {
-                    let text = xml::decode_entities(&buf);
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        result.push_str(trimmed);
-                        result.push_str("\n\n");
-                    }
-                    buf.clear();
-                }
-                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                    let text = xml::decode_entities(&buf);
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        let level = clean_tag_name.chars().nth(1).unwrap_or('2');
-                        let prefix = match level {
-                            '1' => "# ",
-                            '2' => "## ",
-                            _ => "### ",
-                        };
-                        result.push_str(prefix);
-                        result.push_str(trimmed);
-                        result.push_str("\n\n");
-                    }
-                    buf.clear();
-                }
-                "br" => {
-                    buf.push('\n');
-                }
-                "li" if tag_is_closing => {
-                    let text = xml::decode_entities(&buf);
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        result.push_str("- ");
-                        result.push_str(trimmed);
-                        result.push('\n');
-                    }
-                    buf.clear();
-                }
-                _ => {}
+        let closing = tag.starts_with('/');
+        let self_closing = tag.ends_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+
+        // Script and style content is code, and may contain `<` or `</p>`
+        // in strings; only the matching end tag closes it.
+        if !closing && !self_closing && matches!(name, "script" | "style") {
+            pos = lower[pos..]
+                .find(&format!("</{name}"))
+                .and_then(|start| {
+                    let end = pos + start;
+                    lower[end..].find('>').map(|close| end + close + 1)
+                })
+                .unwrap_or(html.len());
+            continue;
+        }
+
+        if let Some(container) = hidden {
+            if closing && name == container {
+                hidden = None;
+                continue;
             }
-        } else if in_tag {
-            current_tag.push(c);
-        } else {
-            buf.push(c);
+            // `</head>` is optional: the first body element ends the head.
+            let head_ends = container == "head"
+                && !closing
+                && !matches!(
+                    name,
+                    "title" | "meta" | "link" | "base" | "noscript" | "template"
+                );
+            if !head_ends {
+                continue;
+            }
+            hidden = None;
+        }
+        if !closing && !self_closing && matches!(name, "head" | "noscript" | "template" | "svg") {
+            hidden = Some(name);
+            continue;
+        }
+
+        match name {
+            // `</li>` is optional: the next item or the end of the list closes it.
+            "li" | "ul" | "ol" if in_item => {
+                flush(&mut result, &mut buf, "- ", "\n", false);
+                in_item = name == "li" && !closing;
+            }
+            "li" => in_item = !closing,
+            "p" | "div" | "tr" | "pre" | "blockquote" | "section" | "article" | "header"
+            | "footer" | "main" | "aside" | "nav" | "ul" | "ol" | "dl" | "dt" | "dd" | "table"
+            | "figure" | "figcaption" | "hr" | "address" => {
+                flush(&mut result, &mut buf, "", "\n\n", pre_depth > 0);
+                if name == "pre" {
+                    if closing {
+                        pre_depth = pre_depth.saturating_sub(1);
+                    } else {
+                        pre_depth += 1;
+                    }
+                }
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let prefix = match name {
+                    "h1" => "# ",
+                    "h2" => "## ",
+                    _ => "### ",
+                };
+                flush(&mut result, &mut buf, prefix, "\n\n", false);
+            }
+            "br" => {
+                if buf.ends_with(' ') {
+                    buf.pop();
+                }
+                buf.push('\n');
+            }
+            "td" | "th" if closing => push_space(&mut buf),
+            _ => {}
         }
     }
 
-    let remaining = xml::decode_entities(&buf);
-    let trimmed = remaining.trim();
-    if !trimmed.is_empty() {
-        result.push_str(trimmed);
-        result.push_str("\n\n");
-    }
-
+    flush(&mut result, &mut buf, "", "\n\n", pre_depth > 0);
     result
+}
+
+/// Appends the buffered text as one block. Preformatted text keeps its
+/// leading indentation; everything else is trimmed.
+fn flush(result: &mut String, buf: &mut String, prefix: &str, separator: &str, pre: bool) {
+    let text = xml::decode_entities(buf);
+    let trimmed = if pre {
+        text.trim_matches('\n').trim_end()
+    } else {
+        text.trim()
+    };
+    if !trimmed.trim().is_empty() {
+        result.push_str(prefix);
+        result.push_str(trimmed);
+        result.push_str(separator);
+    }
+    buf.clear();
+}
+
+fn push_text(buf: &mut String, c: char, pre: bool) {
+    if pre {
+        if c != '\r' {
+            buf.push(c);
+        }
+    } else if c.is_whitespace() {
+        // Source indentation and line breaks are not visible in HTML.
+        push_space(buf);
+    } else {
+        buf.push(c);
+    }
+}
+
+fn push_space(buf: &mut String) {
+    if !buf.is_empty() && !buf.ends_with([' ', '\n']) {
+        buf.push(' ');
+    }
+}
+
+/// Position after a comment whose body starts at `start`; `<!-->` and
+/// `<!--->` are complete (empty) comments in HTML.
+fn comment_end(lower: &str, start: usize) -> usize {
+    let body = &lower[start..];
+    if body.starts_with('>') {
+        start + 1
+    } else if body.starts_with("->") {
+        start + 2
+    } else {
+        body.find("-->").map_or(lower.len(), |end| start + end + 3)
+    }
+}
+
+/// Length of a tag up to its closing `>`, which does not count inside a
+/// quoted attribute value such as `title="a > b"`.
+fn tag_length(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut after_equals = false;
+    for (index, c) in tag.char_indices() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '>' => return Some(index),
+            '"' | '\'' if after_equals => {
+                quote = Some(c);
+                after_equals = false;
+            }
+            '=' => after_equals = true,
+            c if c.is_whitespace() => {}
+            _ => after_equals = false,
+        }
+    }
+    None
 }
 
 fn extract_fb2_authors(xml: &str) -> Option<String> {
@@ -555,6 +666,41 @@ mod tests {
         assert!(text.contains("Another line of text with bold word."));
         assert!(text.contains("- First item"));
         assert!(text.contains("- Second item"));
+    }
+
+    #[test]
+    fn web_page_text_skips_code_and_collapses_whitespace() {
+        let html = r#"<html><head><title>Ignored</title>
+<style>p > b { color: red }</style>
+<body>
+  <script>if (a < b && c > d) { alert("x"); }</script>
+  <!-- <p>commented out</p> -->
+  <p>Первая
+      строка<br>вторая</p>
+  <table><tr><td>A</td><td>B</td></tr></table>
+  <noscript>Enable JS</noscript>
+</body></html>"#;
+
+        let text = convert_html_to_text(html);
+        assert_eq!(text, "Первая строка\nвторая\n\nA B\n\n");
+    }
+
+    #[test]
+    fn web_page_text_survives_code_and_bare_angle_brackets() {
+        let html = r#"<head><meta charset="utf-8"><script>for(i=0;i<n;i++){s+="</p>"}</script>
+<script>document.write("<!-- not a comment")</script>
+<p title="a > b">5 > 3, a < b &amp;lt; &laquo;да&raquo;&#160;&#x2014;</p>
+<pre>
+  fn main() {
+      x();
+  }</pre>
+<ul><li>one<li>two</ul>"#;
+
+        let text = convert_html_to_text(html);
+        assert_eq!(
+            text,
+            "5 > 3, a < b &lt; «да»\u{a0}—\n\n  fn main() {\n      x();\n  }\n\n- one\n- two\n"
+        );
     }
 
     #[test]

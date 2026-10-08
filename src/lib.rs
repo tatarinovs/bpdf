@@ -13,6 +13,7 @@ mod fileset;
 mod font_subset;
 mod formats;
 mod hash;
+mod html;
 mod imageconv;
 mod input;
 mod metadata;

@@ -108,3 +108,15 @@ powershell = 'powershell.exe'
 
 # Таймаут в секундах для конвертации Office файлов (Word/Excel/PowerPoint) в PDF.
 office_timeout_seconds = 120
+
+# Браузер на движке Chromium для вёрстки HTML-страниц (.html, .htm, .xhtml) в PDF.
+# Если не задан, ищутся Microsoft Edge, Google Chrome и Chromium. Без браузера
+# из страницы извлекается только текст.
+# browser = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+
+# Таймаут в секундах для вёрстки одной HTML-страницы.
+html_timeout_seconds = 60
+
+# Размер окна браузера (ШИРИНАxВЫСОТА в пикселях) для `bpdf convert page.html`.
+# Снимок делается ровно этого размера; переопределяется ключом --viewport.
+html_viewport = "1200x1600"

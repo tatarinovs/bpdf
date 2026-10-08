@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -12,6 +13,7 @@ use crate::cli::ConvertArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
+use crate::html::{self, HtmlOptions, Viewport};
 use crate::imageconv::{self, ImageOptions, Orientation};
 use crate::pdf::image::{self as pdf_image, Selection};
 use crate::{output, pdf};
@@ -19,6 +21,7 @@ use crate::{output, pdf};
 #[derive(Debug)]
 enum Plan {
     Image(PathBuf),
+    Html(PathBuf),
     Tiff,
     Pdf(Option<String>),
 }
@@ -28,6 +31,8 @@ struct Converter<'a> {
     force: bool,
     render: bool,
     image_options: ImageOptions,
+    html: HtmlOptions,
+    viewport: Viewport,
     registry: Mutex<OutputRegistry>,
 }
 
@@ -41,6 +46,8 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
         image_options.jpeg_quality = quality;
         image_options.force_reencode = true;
     }
+
+    let viewport = Viewport::parse(args.viewport.as_deref().unwrap_or(&config.html_viewport))?;
 
     let output_dir = args.out.as_deref();
     if let Some(directory) = output_dir {
@@ -58,6 +65,11 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
         force: args.force,
         render: args.render,
         image_options,
+        html: HtmlOptions {
+            browser: config.browser.clone(),
+            timeout: Duration::from_secs(config.html_timeout_seconds),
+        },
+        viewport,
         registry: Mutex::new(registry),
     };
     let results = batch(&plans, fail_fast, |(input, plan)| {
@@ -109,6 +121,14 @@ fn build_plans(
                     Ok(Plan::Image(output))
                 }
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
+                Some(Format::Html) => {
+                    if spec.pages.is_some() {
+                        return Err(err_pdf_only_page_ranges(&input));
+                    }
+                    let output = output_for_suffix(&input, output_dir, "jpg")?;
+                    registry.reserve(&input, &output, force)?;
+                    Ok(Plan::Html(output))
+                }
                 _ => bail!("unsupported convert input: {}", input.display()),
             })();
             (input, plan)
@@ -124,6 +144,20 @@ impl Converter<'_> {
                 write_output(
                     output,
                     &imageconv::to_jpeg(input, &self.image_options, None)?,
+                )?;
+                Ok(1)
+            }
+            Plan::Html(output) => {
+                output::info(format!(
+                    "Rendering {} at {}x{}",
+                    input.display(),
+                    self.viewport.width,
+                    self.viewport.height
+                ));
+                let png = html::screenshot(input, &self.html, self.viewport)?;
+                write_output(
+                    output,
+                    &imageconv::bytes_to_jpeg(&png, &self.image_options, None)?,
                 )?;
                 Ok(1)
             }
@@ -269,6 +303,7 @@ mod tests {
             orient: None,
             quality: None,
             render: false,
+            viewport: None,
         }
     }
 

@@ -102,6 +102,11 @@ pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
         }
     }
 
+    match crate::html::find_browser(config.browser.as_deref()) {
+        Ok(path) => check("browser", true, path.display().to_string(), &mut failures),
+        Err(error) => check("browser", false, format!("{error:#}"), &mut failures),
+    }
+
     match textpdf::find_font(config.font_path.as_deref()) {
         Ok(path) => check("font", true, path.display().to_string(), &mut failures),
         Err(error) => check("font", false, format!("{error:#}"), &mut failures),
