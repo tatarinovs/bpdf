@@ -492,7 +492,7 @@ pub fn add_text_marks(
 
         // Centre of the text box on the displayed page, then the baseline
         // start rotated around it.
-        let (left, bottom) = transform::stamp_position(&style.position, display, width, height)?;
+        let (left, bottom) = transform::stamp_position(&style.position, display, width, height, 1.0)?;
         let (center_x, center_y) = (left + width / 2.0, bottom + height / 2.0);
         let (dx, dy) = (-width / 2.0, -height / 2.0);
         let (origin_x, origin_y) = geometry.display_to_page(

@@ -333,6 +333,8 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     let natural_width = f64::from(pixel_width) * 72.0 / dpi;
     let natural_height = f64::from(pixel_height) * 72.0 / dpi;
     for (_, page_id, geometry) in pages {
+        // Measured before the stamp joins the page's images.
+        let paper = scan_paper_factor(document, page_id, geometry);
         let mut resources = vec![(b"XObject".as_slice(), stamp_name.as_bytes(), image_id)];
         if let Some(gstate_id) = gstate_id {
             resources.push((b"ExtGState", state_name.as_bytes(), gstate_id));
@@ -342,15 +344,15 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
         // Explicit scale wins; 0 or an uncalibrated image auto-fits up to a
         // quarter of the page.
         let scale = match options.scale {
-            Some(scale) if scale > 0.0 => scale,
-            None if is_calibrated => 1.0,
-            _ => 1.0f64
+            Some(scale) if scale > 0.0 => scale * paper,
+            None if is_calibrated => paper,
+            _ => paper
                 .min(geometry.raw_width() * 0.25 / natural_width)
                 .min(geometry.raw_height() * 0.25 / natural_height),
         };
         let width = natural_width * scale;
         let height = natural_height * scale;
-        let (x, y) = stamp_position(&options.position, geometry, width, height)?;
+        let (x, y) = stamp_position(&options.position, geometry, width, height, paper)?;
 
         let gstate = if gstate_id.is_some() {
             format!("/{state_name} gs\n")
@@ -888,20 +890,61 @@ fn transform_annotation_rectangles(
     }
 }
 
+/// Pages that are a single low-resolution scan with an oversized MediaBox
+/// (phone scanners write e.g. 2400x3376 pt for an A4 sheet) get a factor
+/// that makes stamp sizes and mm offsets behave as on the real paper.
+/// Returns 1.0 for every other page.
+fn scan_paper_factor(document: &Document, page_id: ObjectId, geometry: PageGeometry) -> f64 {
+    const A3_SHORT: f64 = 841.89;
+    const PAPERS: [(f64, f64); 2] = [(595.28, 841.89), (612.0, 792.0)];
+    let short = geometry.raw_width().min(geometry.raw_height());
+    let long = geometry.raw_width().max(geometry.raw_height());
+    if short <= A3_SHORT * 1.2
+        || document
+            .get_page_fonts(page_id)
+            .is_ok_and(|fonts| !fonts.is_empty())
+    {
+        return 1.0;
+    }
+    let Ok(images) = document.get_page_images(page_id) else {
+        return 1.0;
+    };
+    let [image] = images.as_slice() else {
+        return 1.0;
+    };
+    let image_long = image.width.max(image.height) as f64;
+    if image_long / (long / 72.0) >= 100.0 {
+        return 1.0;
+    }
+    let aspect = long / short;
+    let (paper_short, _) = PAPERS
+        .into_iter()
+        .min_by(|a, b| {
+            ((a.1 / a.0) - aspect)
+                .abs()
+                .total_cmp(&((b.1 / b.0) - aspect).abs())
+        })
+        .unwrap_or(PAPERS[0]);
+    short / paper_short
+}
+
+/// `unit` scales the 10 mm margin and the X,Y mm offset (see
+/// `scan_paper_factor`).
 pub(crate) fn stamp_position(
     value: &str,
     page: PageGeometry,
     width: f64,
     height: f64,
+    unit: f64,
 ) -> Result<(f64, f64)> {
-    const MM_TO_POINTS: f64 = 72.0 / 25.4;
-    let margin = 10.0 * MM_TO_POINTS;
+    let mm_to_points = 72.0 / 25.4 * unit;
+    let margin = 10.0 * mm_to_points;
     let mut position = value.trim().to_ascii_lowercase();
     let mut offset_x = 0.0;
     let mut offset_y = 0.0;
     if let Some((x, y)) = position.split_once(',') {
-        offset_x = x.trim().parse::<f64>().context("invalid stamp X offset")? * MM_TO_POINTS;
-        offset_y = y.trim().parse::<f64>().context("invalid stamp Y offset")? * MM_TO_POINTS;
+        offset_x = x.trim().parse::<f64>().context("invalid stamp X offset")? * mm_to_points;
+        offset_y = y.trim().parse::<f64>().context("invalid stamp Y offset")? * mm_to_points;
         position = "br".to_owned();
     }
     let position = match position.as_str() {
@@ -1308,6 +1351,26 @@ mod tests {
         .unwrap();
         let page_id = *document.get_pages().get(&1).unwrap();
         assert_eq!(document.get_page_images(page_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn oversized_phone_scan_is_treated_as_paper() {
+        let mut document = placed_image(120, 169, 2400.0, 3376.0);
+        let page_id = *document.get_pages().get(&1).unwrap();
+        document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("MediaBox", vec![0.into(), 0.into(), 2400.into(), 3376.into()]);
+        let geometry = page_geometry(&document, page_id).unwrap();
+        let factor = scan_paper_factor(&document, page_id, geometry);
+        assert!((factor - 2400.0 / 595.28).abs() < 1e-6);
+
+        let a4 = one_page();
+        let a4_page = *a4.get_pages().get(&1).unwrap();
+        let a4_geometry = page_geometry(&a4, a4_page).unwrap();
+        assert_eq!(scan_paper_factor(&a4, a4_page, a4_geometry), 1.0);
     }
 
     #[test]

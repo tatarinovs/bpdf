@@ -19,6 +19,9 @@
 13 ICON "optimize.ico"
 14 ICON "metadata.ico"
 15 ICON "convert.ico"
+16 ICON "number.ico"
+17 ICON "watermark.ico"
+18 ICON "ocr-inplace.ico"
 
 1 RT_MANIFEST "bpdf.manifest"
 
