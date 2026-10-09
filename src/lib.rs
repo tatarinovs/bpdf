@@ -25,6 +25,7 @@ mod parallel;
 mod pdf;
 mod process;
 mod raw;
+mod stamp_picker;
 mod textpdf;
 mod wic;
 mod winocr;

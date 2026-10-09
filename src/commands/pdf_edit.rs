@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::output;
 use crate::pdf;
 use crate::pdf::transform::{self, StampMode, StampOptions};
+use crate::stamp_picker;
 use crate::textpdf::{self, TextMarkStyle};
 
 pub fn split(input: &Path, output_dir: Option<&Path>) -> Result<()> {
@@ -54,7 +55,7 @@ pub fn text(input: &Path, output_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-pub fn stamp(args: StampArgs) -> Result<()> {
+pub fn stamp(args: StampArgs, config: &Config) -> Result<()> {
     let StampArgs {
         input,
         stamp,
@@ -66,21 +67,30 @@ pub fn stamp(args: StampArgs) -> Result<()> {
         pages,
         mode,
         blend,
+        pick,
     } = args;
+    let mut options = StampOptions {
+        path: stamp,
+        position,
+        scale,
+        dpi,
+        opacity,
+        pages,
+        mode: StampMode::parse(&mode)?,
+        blend_mode: transform::BlendMode::parse(&blend)?,
+        placements: Vec::new(),
+    };
+    if pick {
+        match stamp_picker::pick(&input, &options, config.browser.as_deref())? {
+            Some(placements) => options.placements = placements,
+            None => {
+                output::info("Stamp placement cancelled; nothing was written");
+                return Ok(());
+            }
+        }
+    }
     edit_pdf(&input, out, "stamped", |document| {
-        transform::apply_stamp(
-            document,
-            &StampOptions {
-                path: stamp,
-                position,
-                scale,
-                dpi,
-                opacity,
-                pages,
-                mode: StampMode::parse(&mode)?,
-                blend_mode: transform::BlendMode::parse(&blend)?,
-            },
-        )
+        transform::apply_stamp(document, &options)
     })
 }
 

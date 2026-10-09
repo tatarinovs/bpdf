@@ -205,6 +205,9 @@ pub struct StampArgs {
     /// Blend mode: normal, multiply, screen, overlay, darken, lighten, colordodge, colorburn, hardlight, softlight, difference, exclusion.
     #[arg(long, default_value = "normal")]
     pub blend: String,
+    /// Place the stamp interactively in a browser window; --position, --scale and --pages set the starting point.
+    #[arg(long)]
+    pub pick: bool,
 }
 
 #[derive(Debug, Args)]

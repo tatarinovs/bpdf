@@ -123,6 +123,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
                 pages: args.stamp_pages,
                 mode: StampMode::parse(&args.stamp_mode)?,
                 blend_mode: transform::BlendMode::parse(&args.stamp_blend)?,
+                placements: Vec::new(),
             },
         )?;
     }

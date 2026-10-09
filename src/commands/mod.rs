@@ -69,7 +69,7 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
         ),
         Command::Text { input, out } => pdf_edit::text(&input, out.as_deref()),
         Command::Doctor(args) => doctor::run(&config, &args),
-        Command::Stamp(args) => pdf_edit::stamp(args),
+        Command::Stamp(args) => pdf_edit::stamp(args, &config),
         Command::Number(args) => pdf_edit::number(args, &config),
         Command::Watermark(args) => pdf_edit::watermark(args, &config),
         Command::Optimize {

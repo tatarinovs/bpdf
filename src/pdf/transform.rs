@@ -84,6 +84,54 @@ pub struct StampOptions {
     pub pages: String,
     pub mode: StampMode,
     pub blend_mode: BlendMode,
+    /// Explicit placements; when non-empty they replace position, scale and
+    /// pages.
+    pub placements: Vec<StampPlacement>,
+}
+
+/// One stamp copy: the `cm` matrix mapping the unit image square into the
+/// user space of page `page` (1-based).
+#[derive(Clone, Copy, Debug)]
+pub struct StampPlacement {
+    pub page: u32,
+    pub matrix: [f64; 6],
+}
+
+/// Natural stamp size in points, from the given or embedded DPI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StampSize {
+    pub width: f64,
+    pub height: f64,
+    calibrated: bool,
+}
+
+impl StampSize {
+    pub(crate) fn new(
+        bytes: &[u8],
+        (pixel_width, pixel_height): (u32, u32),
+        dpi: Option<f64>,
+    ) -> Self {
+        let detected = crate::metadata::image_dpi(bytes);
+        let effective = dpi.or(detected).unwrap_or(96.0);
+        Self {
+            width: f64::from(pixel_width) * 72.0 / effective,
+            height: f64::from(pixel_height) * 72.0 / effective,
+            calibrated: dpi.is_some() || detected.is_some(),
+        }
+    }
+
+    /// Size on a page. Explicit scale wins; 0 or an uncalibrated image
+    /// auto-fits up to a quarter of the page.
+    pub(crate) fn fitted(self, scale: Option<f64>, page: PageGeometry, paper: f64) -> (f64, f64) {
+        let scale = match scale {
+            Some(scale) if scale > 0.0 => scale * paper,
+            None if self.calibrated => paper,
+            _ => paper
+                .min(page.raw_width() * 0.25 / self.width)
+                .min(page.raw_height() * 0.25 / self.height),
+        };
+        (self.width * scale, self.height * scale)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -282,14 +330,36 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
 
     let bytes = std::fs::read(&options.path)
         .with_context(|| format!("failed to read stamp {}", options.path.display()))?;
-    let detected_dpi = crate::metadata::image_dpi(&bytes);
-    let is_calibrated = options.dpi.is_some() || detected_dpi.is_some();
-    let dpi = options.dpi.or(detected_dpi).unwrap_or(96.0);
-
     let image = image::load_from_memory(&bytes)
         .with_context(|| format!("failed to decode stamp {}", options.path.display()))?
         .to_rgba8();
     let (pixel_width, pixel_height) = image.dimensions();
+    let size = StampSize::new(&bytes, (pixel_width, pixel_height), options.dpi);
+
+    // Placement is resolved before the stamp joins the pages' images, which
+    // `scan_paper_factor` inspects.
+    let targets = if options.placements.is_empty() {
+        let mut targets = Vec::new();
+        for (_, page_id, geometry) in selected_pages(document, &options.pages)? {
+            let paper = scan_paper_factor(document, page_id, geometry);
+            let (width, height) = size.fitted(options.scale, geometry, paper);
+            let (x, y) = stamp_position(&options.position, geometry, width, height, paper)?;
+            targets.push((page_id, [width, 0.0, 0.0, height, x, y]));
+        }
+        targets
+    } else {
+        let pages = document.get_pages();
+        options
+            .placements
+            .iter()
+            .map(|placement| {
+                pages
+                    .get(&placement.page)
+                    .map(|page_id| (*page_id, placement.matrix))
+                    .with_context(|| format!("stamp page {} does not exist", placement.page))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     let pixel_count = image.len() / 4;
     let mut rgb = Vec::with_capacity(pixel_count * 3);
     let mut alpha = Vec::with_capacity(pixel_count);
@@ -325,34 +395,16 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
         })
     });
     let isolation = ContentIsolation::new(document);
-    let pages = selected_pages(document, &options.pages)?;
-    let page_ids = pages.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
+    let page_ids = targets.iter().map(|(id, _)| *id).collect::<Vec<_>>();
     let stamp_name = free_resource_name(document, &page_ids, b"XObject", "BpdfStamp");
     let state_name = free_resource_name(document, &page_ids, b"ExtGState", "BpdfExtGState");
 
-    let natural_width = f64::from(pixel_width) * 72.0 / dpi;
-    let natural_height = f64::from(pixel_height) * 72.0 / dpi;
-    for (_, page_id, geometry) in pages {
-        // Measured before the stamp joins the page's images.
-        let paper = scan_paper_factor(document, page_id, geometry);
+    for (page_id, [a, b, c, d, e, f]) in targets {
         let mut resources = vec![(b"XObject".as_slice(), stamp_name.as_bytes(), image_id)];
         if let Some(gstate_id) = gstate_id {
             resources.push((b"ExtGState", state_name.as_bytes(), gstate_id));
         }
         install_resources(document, page_id, &resources)?;
-
-        // Explicit scale wins; 0 or an uncalibrated image auto-fits up to a
-        // quarter of the page.
-        let scale = match options.scale {
-            Some(scale) if scale > 0.0 => scale * paper,
-            None if is_calibrated => paper,
-            _ => paper
-                .min(geometry.raw_width() * 0.25 / natural_width)
-                .min(geometry.raw_height() * 0.25 / natural_height),
-        };
-        let width = natural_width * scale;
-        let height = natural_height * scale;
-        let (x, y) = stamp_position(&options.position, geometry, width, height, paper)?;
 
         let gstate = if gstate_id.is_some() {
             format!("/{state_name} gs\n")
@@ -360,7 +412,7 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             String::new()
         };
         let content = format!(
-            "q\n{gstate}{width:.6} 0 0 {height:.6} {x:.6} {y:.6} cm\n/{stamp_name} Do\nQ\n"
+            "q\n{gstate}{a:.6} {b:.6} {c:.6} {d:.6} {e:.6} {f:.6} cm\n/{stamp_name} Do\nQ\n"
         );
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
 
@@ -699,6 +751,29 @@ pub fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeome
     })
 }
 
+/// The visible page area: the CropBox when present, otherwise the MediaBox.
+pub(crate) fn page_crop_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry> {
+    let mut geometry = page_geometry(document, page_id)?;
+    if let Some(crop) = inherited_value(document, page_id, b"CropBox")
+        && let Ok([left, bottom, right, top]) = crop.as_array().map(Vec::as_slice)
+        && let (Ok(left), Ok(bottom), Ok(right), Ok(top)) = (
+            object_number(left),
+            object_number(bottom),
+            object_number(right),
+            object_number(top),
+        )
+    {
+        geometry = PageGeometry {
+            left,
+            bottom,
+            right,
+            top,
+            ..geometry
+        };
+    }
+    Ok(geometry)
+}
+
 pub(crate) fn inherited_value(
     document: &Document,
     page_id: ObjectId,
@@ -894,7 +969,11 @@ fn transform_annotation_rectangles(
 /// (phone scanners write e.g. 2400x3376 pt for an A4 sheet) get a factor
 /// that makes stamp sizes and mm offsets behave as on the real paper.
 /// Returns 1.0 for every other page.
-fn scan_paper_factor(document: &Document, page_id: ObjectId, geometry: PageGeometry) -> f64 {
+pub(crate) fn scan_paper_factor(
+    document: &Document,
+    page_id: ObjectId,
+    geometry: PageGeometry,
+) -> f64 {
     const A3_SHORT: f64 = 841.89;
     const PAPERS: [(f64, f64); 2] = [(595.28, 841.89), (612.0, 792.0)];
     let short = geometry.raw_width().min(geometry.raw_height());
@@ -909,7 +988,8 @@ fn scan_paper_factor(document: &Document, page_id: ObjectId, geometry: PageGeome
     let Ok(images) = document.get_page_images(page_id) else {
         return 1.0;
     };
-    let [image] = images.as_slice() else {
+    // The scan is the largest image; earlier stamps are much smaller.
+    let Some(image) = images.iter().max_by_key(|image| image.width * image.height) else {
         return 1.0;
     };
     let image_long = image.width.max(image.height) as f64;
@@ -1346,6 +1426,7 @@ mod tests {
                 pages: "all".to_owned(),
                 mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
+                placements: Vec::new(),
             },
         )
         .unwrap();
@@ -1362,10 +1443,35 @@ mod tests {
             .unwrap()
             .as_dict_mut()
             .unwrap()
-            .set("MediaBox", vec![0.into(), 0.into(), 2400.into(), 3376.into()]);
+            .set(
+                "MediaBox",
+                vec![0.into(), 0.into(), 2400.into(), 3376.into()],
+            );
         let geometry = page_geometry(&document, page_id).unwrap();
         let factor = scan_paper_factor(&document, page_id, geometry);
         assert!((factor - 2400.0 / 595.28).abs() < 1e-6);
+
+        // A stamp already on the scan does not hide it.
+        let stamp = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 4, Rgba([255, 0, 0, 128])))
+            .save_with_format(stamp.path(), ImageFormat::Png)
+            .unwrap();
+        apply_stamp(
+            &mut document,
+            &StampOptions {
+                path: stamp.path().to_path_buf(),
+                position: "br".to_owned(),
+                scale: Some(1.0),
+                dpi: Some(96.0),
+                opacity: 1.0,
+                pages: "all".to_owned(),
+                mode: StampMode::Over,
+                blend_mode: BlendMode::Normal,
+                placements: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(scan_paper_factor(&document, page_id, geometry), factor);
 
         let a4 = one_page();
         let a4_page = *a4.get_pages().get(&1).unwrap();
@@ -1468,6 +1574,7 @@ mod tests {
                 pages: "all".to_owned(),
                 mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
+                placements: Vec::new(),
             },
         )
         .unwrap();
