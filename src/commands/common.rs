@@ -10,7 +10,6 @@ use crate::atomic::write_atomic;
 use crate::cli::OutputArgs;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
-use crate::imageconv::{self, ImageOptions};
 use crate::{output, parallel, pdf};
 
 pub const DOCUMENT_SEPARATOR: &str = "\n\n---\n\n";
@@ -221,20 +220,21 @@ pub fn join_numbers(values: &[u32]) -> String {
 
 /// Shared driver for commands that edit PDFs page-wise and JPEGs pixel-wise
 /// (`rotate`, `resize`).
-pub struct PdfOrJpegEdit<'a, F> {
+pub struct PdfOrJpegEdit<'a, F, J> {
     pub operation: &'a str,
     pub suffix: &'a str,
     pub formats: InputFormatSet,
     pub pages: &'a str,
     pub output: &'a OutputArgs,
-    /// How JPEGs are re-encoded, or the reason they cannot be edited.
-    pub jpeg: std::result::Result<ImageOptions, &'a str>,
     pub edit_pdf: F,
+    /// The edited JPEG, from the source path.
+    pub edit_jpeg: J,
 }
 
-impl<F> PdfOrJpegEdit<'_, F>
+impl<F, J> PdfOrJpegEdit<'_, F, J>
 where
     F: Fn(&mut Document, &str) -> Result<()> + Sync,
+    J: Fn(&Path) -> Result<Vec<u8>> + Sync,
 {
     pub fn run(&self, inputs: &[String], fail_fast: bool) -> Result<()> {
         let specs = expand(inputs, self.formats)?;
@@ -267,11 +267,7 @@ where
                 if self.pages != "all" {
                     bail!("--pages is only valid for PDF inputs: {}", input.display());
                 }
-                let options = self
-                    .jpeg
-                    .as_ref()
-                    .map_err(|reason| anyhow::anyhow!("{reason}"))?;
-                imageconv::to_jpeg(input, options, None)?
+                (self.edit_jpeg)(input)?
             }
             _ => bail!("unsupported input: {}", input.display()),
         };

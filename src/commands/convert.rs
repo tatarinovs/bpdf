@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -101,10 +100,7 @@ fn build_plans(
             let plan = (|| match formats::detect(&input) {
                 Some(format) if format.is_image() => {
                     spec.reject_pages()?;
-                    let is_tiff = input.extension().and_then(OsStr::to_str).is_some_and(|e| {
-                        e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
-                    });
-                    if is_tiff {
+                    if formats::is_tiff(&input) {
                         return Ok(Plan::Tiff);
                     }
                     let file_name = input
@@ -119,7 +115,7 @@ fn build_plans(
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
                 Some(Format::Html) => {
                     spec.reject_pages()?;
-                    let output = output_for_suffix(&input, output_dir, "jpg")?;
+                    let output = output_name(&input, output_dir, None)?;
                     registry.reserve(&input, &output, force)?;
                     Ok(Plan::Html(output))
                 }
@@ -166,12 +162,8 @@ impl Converter<'_> {
                     .into_iter()
                     .enumerate()
                     .map(|(index, bytes)| {
-                        let suffix = if single {
-                            "jpg".to_owned()
-                        } else {
-                            format!("page_{}.jpg", index + 1)
-                        };
-                        Ok((self.sibling_output(input, &suffix)?, bytes))
+                        let tag = (!single).then(|| format!("page_{}", index + 1));
+                        Ok((self.sibling_output(input, tag.as_deref())?, bytes))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 self.write_all(input, outputs, "Saving page to")
@@ -200,8 +192,8 @@ impl Converter<'_> {
                     .zip(&numbers)
                     .map(|(bytes, number)| {
                         Ok((
-                            self.sibling_output(input, &format!("page_{number}.jpg"))?,
-                            bytes,
+                            self.sibling_output(input, Some(&format!("page_{number}")))?,
+                            self.adjust(bytes)?,
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -220,8 +212,8 @@ impl Converter<'_> {
         .into_iter()
         .flat_map(|(_, images)| images)
         .map(|image| {
-            let output = self.sibling_output(input, &format!("{}.jpg", image.label))?;
-            Ok((output, image.bytes))
+            let output = self.sibling_output(input, Some(&image.label))?;
+            Ok((output, self.adjust(image.bytes)?))
         })
         .collect::<Result<Vec<_>>>()?;
         if outputs.is_empty() {
@@ -230,8 +222,18 @@ impl Converter<'_> {
         self.write_all(input, outputs, "Saving extracted image to")
     }
 
-    fn sibling_output(&self, input: &Path, suffix: &str) -> Result<PathBuf> {
-        output_for_suffix(input, self.output_dir, suffix)
+    fn sibling_output(&self, input: &Path, tag: Option<&str>) -> Result<PathBuf> {
+        output_name(input, self.output_dir, tag)
+    }
+
+    /// Apply `--long-edge`, `--short-edge`, `--orient` and `-q` to a page
+    /// image that was rendered or extracted as-is.
+    fn adjust(&self, jpeg: Vec<u8>) -> Result<Vec<u8>> {
+        if self.image_options.needs_reencode() {
+            imageconv::bytes_to_jpeg(&jpeg, &self.image_options, None)
+        } else {
+            Ok(jpeg)
+        }
     }
 
     /// Reserve every destination first, so a name clash writes nothing.
@@ -258,14 +260,17 @@ impl Converter<'_> {
     }
 }
 
-/// `<stem>.<suffix>` next to the input or inside `output_dir`.
-fn output_for_suffix(input: &Path, output_dir: Option<&Path>, suffix: &str) -> Result<PathBuf> {
+/// `<stem>.jpg` or `<stem>_<tag>.jpg` next to the input or inside `output_dir`.
+fn output_name(input: &Path, output_dir: Option<&Path>, tag: Option<&str>) -> Result<PathBuf> {
     let stem = input
         .file_stem()
         .with_context(|| format!("{} has no file stem", input.display()))?;
     let mut name = stem.to_os_string();
-    name.push(".");
-    name.push(suffix);
+    if let Some(tag) = tag {
+        name.push("_");
+        name.push(tag);
+    }
+    name.push(".jpg");
     let directory = output_dir.unwrap_or_else(|| input.parent().unwrap_or(Path::new("")));
     Ok(directory.join(name))
 }

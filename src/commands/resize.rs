@@ -1,21 +1,20 @@
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Result, bail};
 
 use super::common::PdfOrJpegEdit;
 use crate::cli::ResizeArgs;
 use crate::config::Config;
 use crate::formats::InputFormatSet;
+use crate::imageconv;
 use crate::pdf::transform;
 
 pub fn run(args: ResizeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     // Paper sizes apply to PDF pages only; a JPEG needs explicit pixel edges.
-    let jpeg = if args.long_edge.is_some() || args.short_edge.is_some() {
-        let mut options = config.image_options();
-        options.long_edge = args.long_edge;
-        options.short_edge = args.short_edge;
-        Ok(options)
-    } else {
-        Err("resizing a JPEG needs --long-edge or --short-edge")
-    };
+    let mut image_options = config.image_options();
+    image_options.long_edge = args.long_edge;
+    image_options.short_edge = args.short_edge;
+    let has_edges = args.long_edge.is_some() || args.short_edge.is_some();
 
     PdfOrJpegEdit {
         operation: "resize",
@@ -23,9 +22,14 @@ pub fn run(args: ResizeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         formats: InputFormatSet::Resize,
         pages: &args.pages,
         output: &args.output,
-        jpeg,
         edit_pdf: |document: &mut lopdf::Document, pages: &str| {
             transform::resize_pages(document, &args.size, pages)
+        },
+        edit_jpeg: |path: &Path| {
+            if !has_edges {
+                bail!("resizing a JPEG needs --long-edge or --short-edge");
+            }
+            imageconv::to_jpeg(path, &image_options, None)
         },
     }
     .run(&args.inputs, fail_fast)
@@ -33,8 +37,6 @@ pub fn run(args: ResizeArgs, config: &Config, fail_fast: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use image::GenericImageView;
 
     use super::*;

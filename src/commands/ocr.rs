@@ -40,7 +40,7 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
         return searchable_in_place(&engine, &specs, config, fail_fast);
     }
     match &args.out {
-        Some(path) if has_extension(path, "pdf") => {
+        Some(path) if formats::has_extension(path, "pdf") => {
             searchable_pdf(&engine, &specs, path, config, fail_fast)
         }
         out => markdown(&engine, &specs, out.as_deref(), fail_fast),
@@ -188,11 +188,6 @@ fn markdown_paths(specs: &[InputSpec]) -> Vec<PathBuf> {
         .iter()
         .map(|spec| registry.unique(spec.path.with_extension("md")))
         .collect()
-}
-
-fn has_extension(path: &Path, extension: &str) -> bool {
-    path.extension()
-        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
 fn describe(spec: &InputSpec) -> String {

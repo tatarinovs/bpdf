@@ -203,33 +203,110 @@ impl OcrEngine {
     }
 
     pub fn extract_spec(&self, spec: &InputSpec) -> Result<String> {
-        self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), true)
+        self.extract_many_specs(std::slice::from_ref(spec))
+            .pop()
+            .expect("one result per input")
     }
 
-    fn extract_text_with_mode(
-        &self,
-        path: &Path,
-        pages_filter: Option<&str>,
-        parallel_pdf_images: bool,
-    ) -> Result<String> {
+    /// Text of every input. The images of all inputs share one queue of
+    /// `jobs` workers, so a long PDF next to small files keeps them all busy;
+    /// inputs are prepared in chunks to bound the memory held by images.
+    pub fn extract_many_specs(&self, specs: &[InputSpec]) -> Vec<Result<String>> {
+        let chunk = (self.options.jobs * 4).max(8);
+        specs
+            .chunks(chunk)
+            .flat_map(|chunk| self.extract_chunk(chunk))
+            .collect()
+    }
+
+    fn extract_chunk(&self, specs: &[InputSpec]) -> Vec<Result<String>> {
+        let jobs = parallel::map(specs, parallel::cpu_jobs(), |spec| self.prepare_text(spec));
+        let tasks = jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, job)| Some((index, job.as_ref().ok()?)))
+            .flat_map(|(index, job)| (0..job.images.len()).map(move |image| (index, image)))
+            .collect::<Vec<_>>();
+        let mut results = parallel::map(&tasks, self.options.jobs, |&(index, image)| {
+            let Ok(job) = &jobs[index] else {
+                unreachable!("tasks come from prepared jobs")
+            };
+            let image = &job.images[image].1;
+            output::info(format!("OCR {}...", image.label));
+            self.recognize_image(&image.bytes, &image.label)
+        })
+        .into_iter();
+        jobs.into_iter()
+            .zip(specs)
+            .map(|(job, spec)| {
+                let job = job?;
+                let recognised = results.by_ref().take(job.images.len()).collect();
+                job.finish(recognised, &spec.path)
+            })
+            .collect()
+    }
+
+    /// Known text and the images still to recognise for one input.
+    fn prepare_text(&self, spec: &InputSpec) -> Result<TextJob> {
+        let path = &spec.path;
         match formats::detect(path) {
-            Some(Format::Pdf) => self.process_pdf(path, pages_filter, parallel_pdf_images),
+            Some(Format::Pdf) => {
+                let mut document = pdf::load(path)?;
+                if let Some(pages) = &spec.pages {
+                    pdf::select_pages(&mut document, pages)?;
+                }
+                // Every page contributes its own text layer, or the
+                // recognised text of its largest image when it has none.
+                let texts = document
+                    .get_pages()
+                    .into_keys()
+                    .map(|number| (number, page_text(&document, number)))
+                    .collect::<BTreeMap<_, _>>();
+                let pending = self.pages_to_recognise(&document);
+                if pending.is_empty() {
+                    output::info(format!(
+                        "Text layer found on all {} pages of {}, skipping image OCR",
+                        texts.len(),
+                        path.display()
+                    ));
+                }
+                let images = pending
+                    .iter()
+                    .flat_map(|&(number, page_id)| {
+                        pdf_image::page_images(
+                            &document,
+                            number,
+                            page_id,
+                            Selection::Largest,
+                            self.options.image.jpeg_quality,
+                        )
+                        .into_iter()
+                        .map(move |image| (number, image))
+                    })
+                    .collect();
+                Ok(TextJob {
+                    texts,
+                    images,
+                    is_pdf: true,
+                })
+            }
             Some(format) if format.is_image() => {
-                reject_pages(path, pages_filter)?;
-                let image = imageconv::for_ocr(path, &self.options.image)?;
-                Ok(self.recognize_image(&image, file_label(path))?.text)
+                spec.reject_pages()?;
+                let bytes = imageconv::for_ocr(path, &self.options.image)?;
+                let image = ExtractedImage {
+                    label: file_label(path).to_owned(),
+                    bytes,
+                    width: 0,
+                    height: 0,
+                };
+                Ok(TextJob {
+                    texts: BTreeMap::new(),
+                    images: vec![(1, image)],
+                    is_pdf: false,
+                })
             }
             _ => bail!("unsupported OCR input: {}", path.display()),
         }
-    }
-
-    pub fn extract_many_specs(&self, specs: &[InputSpec]) -> Vec<Result<String>> {
-        if specs.len() <= 1 {
-            return specs.iter().map(|spec| self.extract_spec(spec)).collect();
-        }
-        parallel::map(specs, self.options.jobs, |spec| {
-            self.extract_text_with_mode(&spec.path, spec.pages.as_deref(), false)
-        })
     }
 
     /// A PDF with an invisible text layer: existing PDF pages keep their
@@ -284,7 +361,7 @@ impl OcrEngine {
                 Ok(document)
             }
             Some(format) if format.is_image() => {
-                reject_pages(&spec.path, spec.pages.as_deref())?;
+                spec.reject_pages()?;
                 let mut jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
                 // Word boxes refer to the pixels the engine sees, so a photo
                 // rotated only by its EXIF tag is made upright first.
@@ -400,79 +477,6 @@ impl OcrEngine {
             bail!("Groq API returned HTTP {status}");
         }
         Ok(())
-    }
-
-    fn process_pdf(
-        &self,
-        path: &Path,
-        pages_filter: Option<&str>,
-        parallel_images: bool,
-    ) -> Result<String> {
-        let mut document = pdf::load(path)?;
-        if let Some(pages) = pages_filter {
-            pdf::select_pages(&mut document, pages)?;
-        }
-        // Every page contributes its own text layer, or the recognised text
-        // of its largest image when it has none.
-        let mut texts = document
-            .get_pages()
-            .into_keys()
-            .map(|number| (number, page_text(&document, number)))
-            .collect::<BTreeMap<_, _>>();
-        let pending = self.pages_to_recognise(&document);
-        if pending.is_empty() {
-            output::info(format!(
-                "Text layer found on all {} pages, skipping image OCR",
-                texts.len()
-            ));
-        }
-        let images = pending
-            .iter()
-            .flat_map(|&(number, page_id)| {
-                pdf_image::page_images(
-                    &document,
-                    number,
-                    page_id,
-                    Selection::Largest,
-                    self.options.image.jpeg_quality,
-                )
-                .into_iter()
-                .map(move |image| (number, image))
-            })
-            .collect::<Vec<_>>();
-        let jobs = if parallel_images {
-            self.options.jobs
-        } else {
-            1
-        };
-        let results = parallel::map(&images, jobs, |(_, image)| {
-            output::info(format!("OCR {}...", image.label));
-            self.recognize_image(&image.bytes, &image.label)
-        });
-        let mut failures = 0usize;
-        for ((number, image), result) in images.iter().zip(results) {
-            match result {
-                Ok(result) if !result.text.trim().is_empty() => {
-                    texts.insert(*number, result.text.trim().to_owned());
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    failures += 1;
-                    output::warn(format!("{}: {error:#}", image.label));
-                }
-            }
-        }
-        let parts = texts
-            .into_values()
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>();
-        if parts.is_empty() {
-            if failures != 0 {
-                bail!("all {failures} embedded images failed OCR");
-            }
-            bail!("no extractable images or text found in {}", path.display());
-        }
-        Ok(parts.join("\n\n"))
     }
 
     /// Pages (number, id) that need OCR: all with `--force-ocr`, otherwise
@@ -706,14 +710,45 @@ impl OcrEngine {
     }
 }
 
-fn reject_pages(path: &Path, pages: Option<&str>) -> Result<()> {
-    if pages.is_some() {
-        bail!(
-            "page ranges are only valid for PDF inputs: {}",
-            path.display()
-        );
+/// Text work for one input: text already known per page number and the
+/// images of the pages still to recognise.
+struct TextJob {
+    texts: BTreeMap<u32, String>,
+    images: Vec<(u32, ExtractedImage)>,
+    is_pdf: bool,
+}
+
+impl TextJob {
+    /// Pages in order, recognised text replacing the page's own.
+    fn finish(mut self, recognised: Vec<Result<OcrPageResult>>, path: &Path) -> Result<String> {
+        let mut first_error = None;
+        for ((number, image), result) in self.images.iter().zip(recognised) {
+            match result {
+                Ok(result) if !result.text.trim().is_empty() => {
+                    self.texts.insert(*number, result.text.trim().to_owned());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    if self.images.len() > 1 {
+                        output::warn(format!("{}: {error:#}", image.label));
+                    }
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        let parts = self
+            .texts
+            .into_values()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        match first_error {
+            Some(error) if parts.is_empty() => Err(error),
+            None if parts.is_empty() && self.is_pdf => {
+                bail!("no extractable images or text found in {}", path.display())
+            }
+            _ => Ok(parts.join("\n\n")),
+        }
     }
-    Ok(())
 }
 
 fn models_endpoint(endpoint: &str) -> Result<String> {
@@ -930,7 +965,10 @@ mod tests {
         let engine = OcrEngine::new(options_without_api_key()).unwrap();
 
         let extracted = engine
-            .extract_text_with_mode(temporary.path(), None, false)
+            .extract_spec(&InputSpec {
+                path: temporary.path().to_path_buf(),
+                pages: None,
+            })
             .unwrap();
 
         assert!(!extracted.trim().is_empty());

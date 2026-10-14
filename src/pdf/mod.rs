@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use crate::atomic::write_atomic;
 pub(crate) mod image;
 pub mod transform;
+
+/// Page attributes a page may inherit from its page-tree ancestors.
+const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
 pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
@@ -235,7 +238,6 @@ pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
 /// page can reach. Other pages and page-tree nodes are cut off (replaced by
 /// null) so a link to another page does not drag the whole document along.
 fn page_document(source: &Document, page_id: ObjectId) -> Result<Document> {
-    const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
     const CATALOG_SKIP: [&[u8]; 8] = [
         b"Type",
         b"Pages",
@@ -400,80 +402,100 @@ pub fn save_to_bytes(document: &mut Document) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Keep the pages named by `expression` in its order; a page listed twice
+/// appears twice. The kept pages move under one new page-tree root, taking
+/// their inherited attributes along, and the others are removed.
 pub(crate) fn select_pages(document: &mut Document, expression: &str) -> Result<()> {
-    let page_count = document.get_pages().len();
-    if page_count == 0 {
+    let pages = document.get_pages();
+    if pages.is_empty() {
         bail!("PDF contains no pages");
     }
-
-    let selected = parse_page_selection(expression, page_count)?;
-    let to_delete = (1..=page_count)
-        .filter(|page| !selected.contains(page))
-        .map(|page| page as u32)
-        .collect::<Vec<_>>();
-    document.delete_pages(&to_delete);
-    document.prune_objects();
-
-    let remaining = document.get_pages().len();
-    if remaining != selected.len() {
-        bail!(
-            "page selection produced {remaining} pages, expected {}",
-            selected.len()
-        );
+    let list = parse_page_list(expression, pages.len())?;
+    let root_id = document.new_object_id();
+    let mut kept = HashSet::with_capacity(list.len());
+    let mut kids = Vec::with_capacity(list.len());
+    for number in &list {
+        let page_id = pages[&(*number as u32)];
+        let mut page = document.get_dictionary(page_id)?.clone();
+        for key in INHERITABLE {
+            if page.get(key).is_err()
+                && let Some(value) = transform::inherited_value(document, page_id, key)
+            {
+                page.set(key, value);
+            }
+        }
+        page.set("Parent", root_id);
+        let id = if kept.insert(page_id) {
+            document.objects.insert(page_id, Object::Dictionary(page));
+            page_id
+        } else {
+            document.add_object(page)
+        };
+        kids.push(Object::Reference(id));
     }
+    let count = kids.len() as i64;
+    document.objects.insert(
+        root_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }),
+    );
+    document.catalog_mut()?.set("Pages", root_id);
+    // Outlines and links may still point at dropped pages; without the page
+    // objects those references read as null instead of keeping them alive.
+    for page_id in pages.into_values().filter(|id| !kept.contains(id)) {
+        document.objects.remove(&page_id);
+    }
+    document.prune_objects();
     Ok(())
 }
 
+/// Pages named by `expression`, as a set (selection for an edit).
 pub(crate) fn parse_page_selection(expression: &str, page_count: usize) -> Result<BTreeSet<usize>> {
+    Ok(parse_page_list(expression, page_count)?
+        .into_iter()
+        .collect())
+}
+
+/// Pages named by `expression`, in order and with repeats: comma-separated
+/// numbers, `first`, `last` (`l`), ranges such as `2-5`, `5-` (to the end) or
+/// `5-1` (backwards), and the words `all`, `even`, `odd` and `reverse`.
+pub(crate) fn parse_page_list(expression: &str, page_count: usize) -> Result<Vec<usize>> {
     let expression = expression.trim().to_ascii_lowercase();
-    if expression == "all" {
-        return Ok((1..=page_count).collect());
-    }
-    if expression == "first" {
-        return Ok(BTreeSet::from([1]));
-    }
-    if expression == "even" {
-        return Ok((1..=page_count).filter(|page| page % 2 == 0).collect());
-    }
-    if expression == "odd" {
-        return Ok((1..=page_count).filter(|page| page % 2 == 1).collect());
-    }
-
-    let mut selected = BTreeSet::new();
+    let mut pages = Vec::new();
     for part in expression.split(',').map(str::trim) {
-        if part.is_empty() {
-            bail!("empty page selection");
-        }
-        if part == "first" {
-            selected.insert(1);
-            continue;
-        }
-        if part == "l" || part == "last" {
-            selected.insert(page_count);
-            continue;
-        }
-
-        if let Some((start, end)) = part.split_once('-') {
-            let start = parse_page_number(start, page_count)?;
-            let end = parse_page_number(end, page_count)?;
-            if start > end {
-                bail!("descending page range {part} is not supported");
-            }
-            selected.extend(start..=end);
-        } else {
-            selected.insert(parse_page_number(part, page_count)?);
+        match part {
+            "" => bail!("empty page selection"),
+            "all" => pages.extend(1..=page_count),
+            "reverse" => pages.extend((1..=page_count).rev()),
+            "even" => pages.extend((2..=page_count).step_by(2)),
+            "odd" => pages.extend((1..=page_count).step_by(2)),
+            _ => match part.split_once('-') {
+                Some((start, end)) => {
+                    let bound = |value: &str, open: usize| match value.trim() {
+                        "" => Ok(open),
+                        value => parse_page_number(value, page_count),
+                    };
+                    let (start, end) = (bound(start, 1)?, bound(end, page_count)?);
+                    if start <= end {
+                        pages.extend(start..=end);
+                    } else {
+                        pages.extend((end..=start).rev());
+                    }
+                }
+                None => pages.push(parse_page_number(part, page_count)?),
+            },
         }
     }
-
-    if selected.is_empty() {
+    if pages.is_empty() {
         bail!("no pages selected");
     }
-    Ok(selected)
+    Ok(pages)
 }
 
 fn parse_page_number(value: &str, page_count: usize) -> Result<usize> {
-    if value == "l" || value == "last" {
-        return Ok(page_count);
+    match value {
+        "first" => return Ok(1),
+        "l" | "last" => return Ok(page_count),
+        _ => {}
     }
     let page = value
         .parse::<usize>()
@@ -702,6 +724,37 @@ mod tests {
         );
         assert!(parse_page_selection("0", 5).is_err());
         assert!(parse_page_selection("6", 5).is_err());
+    }
+
+    #[test]
+    fn page_lists_keep_order_and_repeats() {
+        assert_eq!(parse_page_list("3,1-2,3", 4).unwrap(), [3, 1, 2, 3]);
+        assert_eq!(parse_page_list("3-", 4).unwrap(), [3, 4]);
+        assert_eq!(parse_page_list("-2,last-3", 4).unwrap(), [1, 2, 4, 3]);
+        assert_eq!(parse_page_list("reverse", 3).unwrap(), [3, 2, 1]);
+        assert_eq!(parse_page_list("first,even", 5).unwrap(), [1, 2, 4]);
+        assert!(parse_page_list(" , ", 3).is_err());
+    }
+
+    #[test]
+    fn selection_reorders_and_duplicates_pages() {
+        // Page 1 is landscape (3x2 image), page 2 portrait (2x3).
+        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let mut merged = merge_documents(vec![first, second]).unwrap();
+        select_pages(&mut merged, "2,1,2").unwrap();
+        let bytes = save_to_bytes(&mut merged).unwrap();
+        let loaded = Document::load_mem(&bytes).unwrap();
+        let landscape = loaded
+            .get_pages()
+            .into_values()
+            .map(|page_id| {
+                transform::page_geometry(&loaded, page_id)
+                    .unwrap()
+                    .is_landscape()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(landscape, [false, true, false]);
     }
 
     #[test]

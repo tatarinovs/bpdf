@@ -157,10 +157,7 @@ fn should_merge_as_text(specs: &[InputSpec], output: &Path) -> bool {
     specs
         .iter()
         .all(|spec| formats::detect(&spec.path) == Some(Format::Text))
-        && !output
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+        && !formats::has_extension(output, "pdf")
 }
 
 #[cfg(test)]

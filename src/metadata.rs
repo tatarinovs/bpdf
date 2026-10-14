@@ -314,6 +314,73 @@ fn exif_dpi(payload: &[u8]) -> Option<f64> {
     })
 }
 
+/// EXIF orientations as (clockwise rotation, mirrored before rotating).
+const ORIENTATIONS: [(u16, (i64, bool)); 8] = [
+    (1, (0, false)),
+    (6, (90, false)),
+    (3, (180, false)),
+    (8, (270, false)),
+    (2, (0, true)),
+    (7, (90, true)),
+    (4, (180, true)),
+    (5, (270, true)),
+];
+
+/// Clockwise rotation (0, 90, 180, 270) an EXIF orientation applies.
+pub fn orientation_rotation(orientation: u16) -> i64 {
+    ORIENTATIONS
+        .iter()
+        .find(|(value, _)| *value == orientation)
+        .map_or(0, |(_, (rotation, _))| *rotation)
+}
+
+/// The orientation that shows the image turned `degrees` further clockwise.
+pub fn rotated_orientation(orientation: u16, degrees: i64) -> u16 {
+    let (rotation, mirrored) = ORIENTATIONS
+        .iter()
+        .find(|(value, _)| *value == orientation)
+        .map_or((0, false), |(_, parts)| *parts);
+    let target = ((rotation + degrees).rem_euclid(360), mirrored);
+    ORIENTATIONS
+        .iter()
+        .find(|(_, parts)| *parts == target)
+        .map_or(1, |(value, _)| *value)
+}
+
+/// The JPEG with its EXIF orientation set, pixel data untouched: the tag is
+/// rewritten in place, or a minimal EXIF segment is added when the file has
+/// none. `None` when EXIF exists without an orientation tag.
+pub fn with_jpeg_orientation(bytes: &[u8], orientation: u16) -> Option<Vec<u8>> {
+    let mut segments = jpeg_segments(bytes).peekable();
+    let after_app0 = match segments.peek() {
+        Some((0xE0, data)) => data.as_ptr() as usize - bytes.as_ptr() as usize + data.len(),
+        _ => 2,
+    };
+    let Some((_, segment)) =
+        segments.find(|(marker, data)| *marker == 0xE1 && exif_payload(data).is_some())
+    else {
+        let mut output = Vec::with_capacity(bytes.len() + 36);
+        output.extend_from_slice(&bytes[..after_app0]);
+        output.extend_from_slice(&orientation_segment(orientation));
+        output.extend_from_slice(&bytes[after_app0..]);
+        return Some(output);
+    };
+    let payload = exif_payload(segment)?;
+    let exif = Exif::parse(payload)?;
+    let (_, value) = exif.ifd0().find(|(tag, _)| *tag == 0x0112)?;
+    let position = payload.as_ptr() as usize - bytes.as_ptr() as usize + value;
+    let mut output = bytes.to_vec();
+    let encoded = if exif.little_endian {
+        orientation.to_le_bytes()
+    } else {
+        orientation.to_be_bytes()
+    };
+    output
+        .get_mut(position..position + 2)?
+        .copy_from_slice(&encoded);
+    Some(output)
+}
+
 /// A minimal big-endian APP1 segment holding only the orientation tag.
 fn orientation_segment(orientation: u16) -> Vec<u8> {
     let mut segment = vec![0xFF, 0xE1, 0x00, 0x22];
@@ -492,6 +559,32 @@ mod tests {
         tagged.extend_from_slice(&exif);
         tagged.extend_from_slice(&original[2..]);
         (original, tagged)
+    }
+
+    #[test]
+    fn orientations_compose_with_rotation() {
+        assert_eq!(rotated_orientation(1, 90), 6);
+        assert_eq!(rotated_orientation(6, 90), 3);
+        assert_eq!(rotated_orientation(8, 90), 1);
+        assert_eq!(rotated_orientation(1, -90), 8);
+        assert_eq!(rotated_orientation(2, 90), 7);
+        assert_eq!(rotated_orientation(5, 180), 7);
+        assert_eq!(orientation_rotation(8), 270);
+    }
+
+    #[test]
+    fn orientation_is_written_without_touching_pixels() {
+        let (original, tagged) = jpeg_with_orientation(1);
+        // Existing tag: rewritten in place, camera data kept.
+        let rotated = with_jpeg_orientation(&tagged, 6).unwrap();
+        assert_eq!(rotated.len(), tagged.len());
+        assert_eq!(jpeg_orientation(&rotated), 6);
+        assert!(memchr::memmem::find(&rotated, b"Cam").is_some());
+        // No EXIF at all: a minimal segment is added.
+        let added = with_jpeg_orientation(&original, 3).unwrap();
+        assert_eq!(jpeg_orientation(&added), 3);
+        assert!(added.ends_with(&original[original.len() - 64..]));
+        assert!(image::load_from_memory(&added).is_ok());
     }
 
     #[test]

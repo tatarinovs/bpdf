@@ -1,7 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use image::GenericImageView;
+use image::imageops::FilterType;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
 use super::{image as pdf_image, object_number, paper_size, parse_page_selection};
@@ -396,12 +401,13 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     let stamp_name = free_resource_name(document, &page_ids, b"XObject", "BpdfStamp");
     let state_name = free_resource_name(document, &page_ids, b"ExtGState", "BpdfExtGState");
 
+    let mut resources = vec![(b"XObject".as_slice(), stamp_name.as_bytes(), image_id)];
+    if let Some(gstate_id) = gstate_id {
+        resources.push((b"ExtGState", state_name.as_bytes(), gstate_id));
+    }
+    let mut installer = ResourceInstaller::new(resources);
     for (page_id, [a, b, c, d, e, f]) in targets {
-        let mut resources = vec![(b"XObject".as_slice(), stamp_name.as_bytes(), image_id)];
-        if let Some(gstate_id) = gstate_id {
-            resources.push((b"ExtGState", state_name.as_bytes(), gstate_id));
-        }
-        install_resources(document, page_id, &resources)?;
+        installer.install(document, page_id)?;
 
         let gstate = if gstate_id.is_some() {
             format!("/{state_name} gs\n")
@@ -525,7 +531,11 @@ fn downsample_images(
     });
 
     for (candidate, result) in candidates.iter().zip(encoded) {
-        match result.and_then(|jpeg| replace_image(document, *candidate, jpeg)) {
+        let replaced = result.and_then(|encoded| match encoded {
+            Some(encoded) => replace_image(document, *candidate, encoded),
+            None => Ok(false),
+        });
+        match replaced {
             Ok(true) => report.resized_images += 1,
             Ok(false) => {}
             Err(error) => {
@@ -546,60 +556,33 @@ fn collect_image_resizes(
     recompress_all: bool,
     warnings: &mut Vec<String>,
 ) -> Vec<ImageResize> {
-    let mut targets = BTreeMap::<ObjectId, (u32, u32)>::new();
-    for (page_number, page_id) in document.get_pages() {
-        let geometry = match page_geometry(document, page_id) {
-            Ok(geometry) => geometry,
-            Err(error) => {
-                warnings.push(format!(
-                    "page {page_number}: cannot read page size: {error:#}"
-                ));
-                continue;
+    let pages = document.get_pages().into_iter().collect::<Vec<_>>();
+    let per_page = crate::parallel::map(&pages, crate::parallel::cpu_jobs(), |&(_, page_id)| {
+        page_image_targets(document, page_id, image_dpi)
+    });
+    // An image shown on several pages keeps the largest size any of them needs.
+    let mut targets = BTreeMap::<ObjectId, ((u32, u32), (u32, u32))>::new();
+    for ((page_number, _), result) in pages.iter().zip(per_page) {
+        match result {
+            Ok(images) => {
+                for (id, original, target) in images {
+                    targets
+                        .entry(id)
+                        .and_modify(|(_, current)| {
+                            if target.0 > current.0 {
+                                *current = target;
+                            }
+                        })
+                        .or_insert((original, target));
+                }
             }
-        };
-        let user_unit = inherited_value(document, page_id, b"UserUnit")
-            .and_then(|value| object_number(&value).ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(1.0);
-        let page_width = geometry.display_width() * user_unit;
-        let page_height = geometry.display_height() * user_unit;
-        let images = match document.get_page_images(page_id) {
-            Ok(images) => images,
-            Err(error) => {
-                warnings.push(format!(
-                    "page {page_number}: cannot inspect images: {error:#}"
-                ));
-                continue;
-            }
-        };
-        for image in images {
-            let (Ok(width), Ok(height)) = (u32::try_from(image.width), u32::try_from(image.height))
-            else {
-                continue;
-            };
-            let Some(target) = imageconv::fit_dimensions_for_dpi(
-                width,
-                height,
-                page_width,
-                page_height,
-                image_dpi,
-            )
-            .or(recompress_all.then_some((width, height))) else {
-                continue;
-            };
-            targets
-                .entry(image.id)
-                .and_modify(|current| {
-                    if target.0 > current.0 {
-                        *current = target;
-                    }
-                })
-                .or_insert(target);
+            Err(error) => warnings.push(format!("page {page_number}: {error:#}")),
         }
     }
     targets
         .into_iter()
-        .map(|(id, (target_width, target_height))| ImageResize {
+        .filter(|(_, (original, target))| recompress_all || target != original)
+        .map(|(id, (_, (target_width, target_height)))| ImageResize {
             id,
             target_width,
             target_height,
@@ -607,39 +590,166 @@ fn collect_image_resizes(
         .collect()
 }
 
+/// An image with its original and target pixel size.
+type ImageTarget = (ObjectId, (u32, u32), (u32, u32));
+
+/// Original and target size of every image on a page. An image is sized for
+/// `image_dpi` where it is drawn; one the content does not draw directly
+/// (patterns, annotations, unreadable content) is sized for the whole page.
+fn page_image_targets(
+    document: &Document,
+    page_id: ObjectId,
+    image_dpi: u32,
+) -> Result<Vec<ImageTarget>> {
+    let geometry = page_geometry(document, page_id).context("cannot read page size")?;
+    let user_unit = inherited_value(document, page_id, b"UserUnit")
+        .and_then(|value| object_number(&value).ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(1.0);
+    let page_width = geometry.display_width() * user_unit;
+    let page_height = geometry.display_height() * user_unit;
+    let placed = if image_dpi == 0 {
+        HashMap::new()
+    } else {
+        pdf_image::placements(document, page_id).unwrap_or_default()
+    };
+
+    let mut images = document
+        .get_page_images(page_id)
+        .context("cannot inspect images")?
+        .into_iter()
+        .filter_map(|image| {
+            let size = (
+                u32::try_from(image.width).ok()?,
+                u32::try_from(image.height).ok()?,
+            );
+            Some((image.id, size))
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Images drawn only from inside forms.
+    for &id in placed.keys() {
+        if let Ok(stream) = document.get_object(id).and_then(Object::as_stream)
+            && let (Ok(width), Ok(height)) = (
+                pdf_image::dimension(stream, b"Width"),
+                pdf_image::dimension(stream, b"Height"),
+            )
+        {
+            images.entry(id).or_insert((width, height));
+        }
+    }
+
+    Ok(images
+        .into_iter()
+        .map(|(id, (width, height))| {
+            let target = match placed.get(&id) {
+                Some(&(placed_width, placed_height))
+                    if placed_width >= 1.0 && placed_height >= 1.0 =>
+                {
+                    imageconv::fit_dimensions_for_placement(
+                        width,
+                        height,
+                        (placed_width * user_unit, placed_height * user_unit),
+                        image_dpi,
+                    )
+                }
+                _ => imageconv::fit_dimensions_for_dpi(
+                    width,
+                    height,
+                    page_width,
+                    page_height,
+                    image_dpi,
+                ),
+            };
+            (id, (width, height), target.unwrap_or((width, height)))
+        })
+        .collect())
+}
+
+/// A re-encoded image: JPEG for photographs, Flate for graphics.
+struct EncodedImage {
+    content: Vec<u8>,
+    filter: &'static str,
+    gray: bool,
+}
+
+/// Decode, resample and re-encode one image, or `None` when there is
+/// nothing to gain. Lossless sources with few colours (charts, drawings,
+/// screenshots) stay lossless: JPEG would blur their edges.
 fn encode_downsampled(
     document: &Document,
     resize: ImageResize,
     jpeg_quality: u8,
-) -> Result<Vec<u8>> {
+) -> Result<Option<EncodedImage>> {
     let original = document.get_object(resize.id)?.as_stream()?;
     reject_unsafe_image_features(original)?;
     let decoded = pdf_image::decode(document, original)?;
-    imageconv::resize_to_jpeg(
-        &decoded,
-        Some((resize.target_width, resize.target_height)),
-        jpeg_quality,
-    )
+    let target = (resize.target_width, resize.target_height);
+    let is_jpeg = original
+        .filters()
+        .ok()
+        .and_then(|filters| {
+            filters
+                .last()
+                .map(|filter| matches!(*filter, b"DCTDecode" | b"DCT"))
+        })
+        .unwrap_or(false);
+    if is_jpeg || !imageconv::has_few_colours(&decoded) {
+        let jpeg = imageconv::resize_to_jpeg(&decoded, Some(target), jpeg_quality)?;
+        let gray = super::jpeg_info(&jpeg)?.components == 1;
+        return Ok(Some(EncodedImage {
+            content: jpeg,
+            filter: "DCTDecode",
+            gray,
+        }));
+    }
+    if target == decoded.dimensions() {
+        return Ok(None);
+    }
+    let resized = imageconv::resize(&decoded, target.0, target.1, FilterType::Lanczos3);
+    let rgb = resized.to_rgb8();
+    let gray = rgb
+        .pixels()
+        .all(|pixel| pixel.0[0] == pixel.0[1] && pixel.0[1] == pixel.0[2]);
+    let samples = if gray {
+        resized.to_luma8().into_raw()
+    } else {
+        rgb.into_raw()
+    };
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&samples)?;
+    Ok(Some(EncodedImage {
+        content: encoder.finish()?,
+        filter: "FlateDecode",
+        gray,
+    }))
 }
 
-/// Returns false (and keeps the original) when the JPEG would not be smaller.
-fn replace_image(document: &mut Document, resize: ImageResize, jpeg: Vec<u8>) -> Result<bool> {
-    let color_space = match super::jpeg_info(&jpeg)?.components {
-        1 => "DeviceGray",
-        _ => "DeviceRGB",
-    };
+/// Returns false (and keeps the original) when the new stream would not be
+/// smaller.
+fn replace_image(
+    document: &mut Document,
+    resize: ImageResize,
+    encoded: EncodedImage,
+) -> Result<bool> {
     let stream = document.get_object_mut(resize.id)?.as_stream_mut()?;
-    if jpeg.len() >= stream.content.len() {
+    if encoded.content.len() >= stream.content.len() {
         return Ok(false);
     }
     stream.dict.set("Width", i64::from(resize.target_width));
     stream.dict.set("Height", i64::from(resize.target_height));
-    stream.dict.set("ColorSpace", color_space);
+    stream.dict.set(
+        "ColorSpace",
+        if encoded.gray {
+            "DeviceGray"
+        } else {
+            "DeviceRGB"
+        },
+    );
     stream.dict.set("BitsPerComponent", 8);
-    stream.dict.set("Filter", "DCTDecode");
+    stream.dict.set("Filter", encoded.filter);
     stream.dict.remove(b"DecodeParms");
     stream.dict.remove(b"Decode");
-    stream.set_content(jpeg);
+    stream.set_content(encoded.content);
     Ok(true)
 }
 
@@ -717,24 +827,34 @@ pub(crate) fn info_string(value: &str) -> Object {
 pub fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry> {
     let media_box =
         inherited_value(document, page_id, b"MediaBox").context("page has no MediaBox")?;
-    let values = media_box.as_array().context("MediaBox is not an array")?;
-    let [left, bottom, right, top] = values.as_slice() else {
-        bail!("MediaBox must contain four numbers");
-    };
+    let [left, bottom, right, top] =
+        parse_box(&media_box).context("MediaBox must be an array of four numbers")?;
     let rotation = inherited_value(document, page_id, b"Rotate")
         .and_then(|value| value.as_i64().ok())
         .unwrap_or(0)
         .rem_euclid(360);
     Ok(PageGeometry {
-        left: object_number(left)?,
-        bottom: object_number(bottom)?,
-        right: object_number(right)?,
-        top: object_number(top)?,
+        left,
+        bottom,
+        right,
+        top,
         rotation,
     })
 }
 
-/// The visible page area: the CropBox when present, otherwise the MediaBox.
+/// A page box `[left bottom right top]`.
+fn parse_box(object: &Object) -> Option<[f64; 4]> {
+    let [left, bottom, right, top] = object.as_array().ok()?.as_slice() else {
+        return None;
+    };
+    Some([
+        object_number(left).ok()?,
+        object_number(bottom).ok()?,
+        object_number(right).ok()?,
+        object_number(top).ok()?,
+    ])
+}
+
 /// The `cm` matrix drawing the unit image square as the `width` x `height`
 /// box at (`left`, `bottom`) of the displayed `crop`, upright whatever the
 /// page rotation.
@@ -758,16 +878,11 @@ pub(crate) fn upright_stamp_matrix(
     ]
 }
 
+/// The visible page area: the CropBox when present, otherwise the MediaBox.
 pub(crate) fn page_crop_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry> {
     let mut geometry = page_geometry(document, page_id)?;
-    if let Some(crop) = inherited_value(document, page_id, b"CropBox")
-        && let Ok([left, bottom, right, top]) = crop.as_array().map(Vec::as_slice)
-        && let (Ok(left), Ok(bottom), Ok(right), Ok(top)) = (
-            object_number(left),
-            object_number(bottom),
-            object_number(right),
-            object_number(top),
-        )
+    if let Some([left, bottom, right, top]) =
+        inherited_value(document, page_id, b"CropBox").and_then(|crop| parse_box(&crop))
     {
         geometry = PageGeometry {
             left,
@@ -875,32 +990,57 @@ pub(crate) fn free_resource_name(
         .expect("an unused resource name exists")
 }
 
-/// Add named resources (category, name, object) to a page. The effective
-/// (possibly inherited or shared) Resources dictionary is copied once into a
-/// page-owned object so other pages are unaffected.
-pub(crate) fn install_resources(
-    document: &mut Document,
-    page_id: ObjectId,
-    entries: &[(&[u8], &[u8], ObjectId)],
-) -> Result<()> {
-    let mut resources = inherited_value(document, page_id, b"Resources")
-        .and_then(|value| resolve_dictionary(document, &value))
-        .unwrap_or_default();
-    for (category, name, id) in entries {
-        let mut group = resources
-            .get(category)
-            .ok()
-            .and_then(|value| resolve_dictionary(document, value))
-            .unwrap_or_default();
-        group.set(name.to_vec(), *id);
-        resources.set(category.to_vec(), group);
+/// Adds the same named resources (category, name, object) to many pages.
+/// A page's effective (possibly inherited or shared) Resources dictionary is
+/// copied into a new object so pages outside the edit are unaffected; pages
+/// that shared one Resources object keep sharing one copy.
+pub(crate) struct ResourceInstaller<'a> {
+    entries: Vec<(&'a [u8], &'a [u8], ObjectId)>,
+    copies: HashMap<ObjectId, ObjectId>,
+}
+
+impl<'a> ResourceInstaller<'a> {
+    pub(crate) fn new(entries: Vec<(&'a [u8], &'a [u8], ObjectId)>) -> Self {
+        Self {
+            entries,
+            copies: HashMap::new(),
+        }
     }
-    let resources_id = document.add_object(resources);
-    document
-        .get_object_mut(page_id)?
-        .as_dict_mut()?
-        .set("Resources", resources_id);
-    Ok(())
+
+    pub(crate) fn install(&mut self, document: &mut Document, page_id: ObjectId) -> Result<()> {
+        let source = inherited_value(document, page_id, b"Resources");
+        let shared = match source {
+            Some(Object::Reference(id)) => Some(id),
+            _ => None,
+        };
+        let resources_id = match shared.and_then(|id| self.copies.get(&id)) {
+            Some(copy) => *copy,
+            None => {
+                let mut resources = source
+                    .and_then(|value| resolve_dictionary(document, &value))
+                    .unwrap_or_default();
+                for (category, name, id) in &self.entries {
+                    let mut group = resources
+                        .get(category)
+                        .ok()
+                        .and_then(|value| resolve_dictionary(document, value))
+                        .unwrap_or_default();
+                    group.set(name.to_vec(), *id);
+                    resources.set(category.to_vec(), group);
+                }
+                let copy = document.add_object(resources);
+                if let Some(id) = shared {
+                    self.copies.insert(id, copy);
+                }
+                copy
+            }
+        };
+        document
+            .get_object_mut(page_id)?
+            .as_dict_mut()?
+            .set("Resources", resources_id);
+        Ok(())
+    }
 }
 
 fn resolve_dictionary(document: &Document, object: &Object) -> Option<Dictionary> {
@@ -944,30 +1084,18 @@ fn transform_annotation_rectangles(
         else {
             continue;
         };
-        let Ok(values) = annotation
-            .get(b"Rect")
-            .and_then(Object::as_array)
-            .map_err(anyhow::Error::from)
-            .and_then(|rectangle| {
-                rectangle
-                    .iter()
-                    .map(object_number)
-                    .collect::<Result<Vec<_>>>()
-            })
-        else {
+        let Some([x1, y1, x2, y2]) = annotation.get(b"Rect").ok().and_then(parse_box) else {
             continue;
         };
-        if let [x1, y1, x2, y2] = values.as_slice() {
-            annotation.set(
-                "Rect",
-                vec![
-                    (x1 * scale + translate_x).into(),
-                    (y1 * scale + translate_y).into(),
-                    (x2 * scale + translate_x).into(),
-                    (y2 * scale + translate_y).into(),
-                ],
-            );
-        }
+        annotation.set(
+            "Rect",
+            vec![
+                (x1 * scale + translate_x).into(),
+                (y1 * scale + translate_y).into(),
+                (x2 * scale + translate_x).into(),
+                (y2 * scale + translate_y).into(),
+            ],
+        );
     }
 }
 
@@ -1277,24 +1405,24 @@ mod tests {
     }
 
     #[test]
-    fn optimize_downsamples_image_to_page_dpi() {
+    fn optimize_downsamples_image_to_its_placed_size() {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
         let report = optimize(&mut document, 36, 82, false);
 
         assert_eq!(report.resized_images, 1);
         assert_eq!(report.skipped_images, 0);
         assert!(report.warnings.is_empty());
-        assert_eq!(first_image_dimensions(&document), (421, 211));
+        assert_eq!(first_image_dimensions(&document), (72, 36));
 
         let page_id = *document.get_pages().get(&1).unwrap();
         let embedded = document.get_page_images(page_id).unwrap().remove(0);
         let decoded = image::load_from_memory(embedded.content).unwrap();
-        assert_eq!(decoded.dimensions(), (421, 211));
+        assert_eq!(decoded.dimensions(), (72, 36));
 
         let bytes = super::super::save_to_bytes(&mut document).unwrap();
         let parsed = Document::load_mem(&bytes).unwrap();
         assert_eq!(parsed.get_pages().len(), 1);
-        assert_eq!(first_image_dimensions(&parsed), (421, 211));
+        assert_eq!(first_image_dimensions(&parsed), (72, 36));
     }
 
     #[test]
@@ -1318,8 +1446,81 @@ mod tests {
         assert_eq!(document.get_pages().len(), 2);
         for page_id in document.get_pages().into_values() {
             let image = document.get_page_images(page_id).unwrap().remove(0);
-            assert_eq!((image.width, image.height), (421, 211));
+            assert_eq!((image.width, image.height), (72, 36));
         }
+    }
+
+    fn redraw_second_page(document: &mut Document, content: &str) {
+        let page_id = *document.get_pages().get(&2).unwrap();
+        let content_id =
+            document.add_object(Stream::new(Dictionary::new(), content.as_bytes().to_vec()));
+        document
+            .get_dictionary_mut(page_id)
+            .unwrap()
+            .set("Contents", content_id);
+    }
+
+    #[test]
+    fn optimize_keeps_the_largest_size_an_image_is_drawn_at() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        duplicate_first_page(&mut document);
+        redraw_second_page(&mut document, "q 576 0 0 288 0 0 cm /Im0 Do Q");
+        optimize(&mut document, 36, 82, false);
+        assert_eq!(first_image_dimensions(&document), (288, 144));
+
+        // Drawn at full resolution on one page: nothing to downsample.
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        duplicate_first_page(&mut document);
+        redraw_second_page(&mut document, "q 2400 0 0 1200 0 0 cm /Im0 Do Q");
+        let report = optimize(&mut document, 36, 82, false);
+        assert_eq!(report.resized_images, 0);
+        assert_eq!(first_image_dimensions(&document), (1200, 600));
+    }
+
+    #[test]
+    fn optimize_follows_images_into_forms() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let image_id = document.get_page_images(page_id).unwrap().remove(0).id;
+        let form_id = document.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 1.into(), 1.into()],
+                "Matrix" => vec![2.into(), 0.into(), 0.into(), 2.into(), 0.into(), 0.into()],
+                "Resources" => dictionary! {"XObject" => dictionary! {"Im0" => image_id}},
+            },
+            b"72 0 0 36 0 0 cm /Im0 Do".to_vec(),
+        ));
+        let page = document.get_dictionary_mut(page_id).unwrap();
+        page.set(
+            "Resources",
+            dictionary! {"XObject" => dictionary! {"Fm0" => form_id}},
+        );
+        let content_id = page.get(b"Contents").unwrap().as_reference().unwrap();
+        document
+            .get_object_mut(content_id)
+            .unwrap()
+            .as_stream_mut()
+            .unwrap()
+            .set_content(b"q 0.5 0 0 0.5 0 0 cm /Fm0 Do Q".to_vec());
+
+        let report = optimize(&mut document, 36, 82, false);
+        assert_eq!(report.resized_images, 1);
+        // Objects are renumbered: find the image by its type.
+        let image = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_stream().ok())
+            .find(|stream| stream.dict.has(b"Width"))
+            .unwrap();
+        // 72x36 points at 36 dpi.
+        assert_eq!(
+            (
+                image.dict.get(b"Width").unwrap().as_i64().unwrap(),
+                image.dict.get(b"Height").unwrap().as_i64().unwrap()
+            ),
+            (36, 18)
+        );
     }
 
     #[test]
@@ -1333,8 +1534,8 @@ mod tests {
         let pixels = (0..1200 * 600)
             .flat_map(|_| {
                 seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                let noise = (seed >> 16) as u8 % 16;
-                [222 + noise, 112 + noise, 12 + noise]
+                let noise = |shift: u32| (seed >> shift) as u8 % 16;
+                [222 + noise(16), 112 + noise(20), 12 + noise(24)]
             })
             .collect::<Vec<_>>();
         let mut stream = Stream::new(
@@ -1371,6 +1572,44 @@ mod tests {
                 .all(|(actual, expected)| (actual - expected).abs() < 4.0),
             "{means:?}"
         );
+    }
+
+    #[test]
+    fn optimize_keeps_graphics_lossless() {
+        let mut document = placed_image(1200, 600, 144.0, 72.0);
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let image_id = document.get_page_images(page_id).unwrap().remove(0).id;
+        // A two-colour chart: red bars on white, stored losslessly.
+        let pixels = (0..1200 * 600)
+            .flat_map(|index| {
+                if (index % 1200) / 100 % 2 == 0 {
+                    [200, 0, 0]
+                } else {
+                    [255, 255, 255]
+                }
+            })
+            .collect::<Vec<u8>>();
+        let mut stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 1200, "Height" => 600,
+                "BitsPerComponent" => 8, "ColorSpace" => "DeviceRGB",
+            },
+            pixels,
+        );
+        stream.compress().unwrap();
+        document.objects.insert(image_id, Object::Stream(stream));
+
+        let report = optimize(&mut document, 36, 90, false);
+
+        assert_eq!(report.resized_images, 1, "{:?}", report.warnings);
+        let stream = document.get_object(image_id).unwrap().as_stream().unwrap();
+        assert_eq!(stream.filters().unwrap(), [b"FlateDecode".as_slice()]);
+        let decoded = super::super::image::decode(&document, stream)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(decoded.dimensions(), (72, 36));
+        assert_eq!(decoded.get_pixel(2, 18).0, [200, 0, 0]);
     }
 
     #[test]

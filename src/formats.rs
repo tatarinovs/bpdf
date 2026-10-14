@@ -120,10 +120,14 @@ pub fn detect_by_extension(path: &Path) -> Option<Format> {
     }
 }
 
-fn has_extension(path: &Path, expected: &str) -> bool {
+/// Case-insensitive extension check.
+pub fn has_extension(path: &Path, expected: &str) -> bool {
     path.extension()
-        .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+}
+
+pub fn is_tiff(path: &Path) -> bool {
+    has_extension(path, "tif") || has_extension(path, "tiff")
 }
 
 fn is_fb2_zip(path: &Path) -> bool {

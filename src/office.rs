@@ -80,11 +80,8 @@ pub fn probe(options: &OfficeOptions) -> Result<OfficeAvailability> {
 
 #[cfg(windows)]
 fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
-    let script = match formats::detect(path) {
-        Some(Format::Word) => WORD_SCRIPT,
-        Some(Format::Excel) => EXCEL_SCRIPT,
-        Some(Format::PowerPoint) => POWERPOINT_SCRIPT,
-        _ => bail!("unsupported Office format: {}", path.display()),
+    let Some(script) = formats::detect(path).and_then(office_script) else {
+        bail!("unsupported Office format: {}", path.display());
     };
     let extension = path
         .extension()
@@ -121,7 +118,7 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
             "-ExecutionPolicy",
             "Bypass",
             "-EncodedCommand",
-            &powershell_encoded_command(script),
+            &powershell_encoded_command(&script),
         ])
         .env("BPDF_OFFICE_INPUT", &absolute_input)
         .env("BPDF_OFFICE_OUTPUT", &output_path);
@@ -159,8 +156,11 @@ fn convert_to_pdf_windows(path: &Path, options: &OfficeOptions) -> Result<Vec<u8
     Ok(pdf)
 }
 
+/// Shared PowerShell frame of every Office export: unblock the temporary
+/// copy, start the application hidden, run `__BODY__` (which opens `$doc`
+/// and saves it as PDF) and always close and release both COM objects.
 #[cfg(windows)]
-const WORD_SCRIPT: &str = r#"
+const OFFICE_FRAME: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -168,114 +168,80 @@ $ProgressPreference = 'SilentlyContinue'
 if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
     Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
 }
-$word = $null
-$document = $null
+$app = $null
+$doc = $null
 try {
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    $word.AutomationSecurity = 3
-    $document = $word.Documents.Open($env:BPDF_OFFICE_INPUT, $false, $true)
-    if ($null -eq $document) {
+    $app = New-Object -ComObject __PROGID__
+    $app.AutomationSecurity = 3
+__BODY__
+} finally {
+    if ($null -ne $doc) {
+        __CLOSE__
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($doc)
+    }
+    if ($null -ne $app) {
+        $app.Quit()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($app)
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"#;
+
+/// The export script for one Office application.
+#[cfg(windows)]
+fn office_script(format: Format) -> Option<String> {
+    let (prog_id, body, close) = match format {
+        Format::Word => (
+            "Word.Application",
+            r#"    $app.Visible = $false
+    $app.DisplayAlerts = 0
+    $doc = $app.Documents.Open($env:BPDF_OFFICE_INPUT, $false, $true)
+    if ($null -eq $doc) {
         # Some Word/PowerShell combinations perform Open successfully but do
         # not marshal its return value. ActiveDocument is then authoritative.
-        $document = $word.ActiveDocument
+        $doc = $app.ActiveDocument
     }
-    if ($null -eq $document) {
+    if ($null -eq $doc) {
         $exists = Test-Path -LiteralPath $env:BPDF_OFFICE_INPUT
-        $count = $word.Documents.Count
+        $count = $app.Documents.Count
         throw "Word opened no active document (input exists: $exists, open documents: $count)"
     }
-    $document.SaveAs2($env:BPDF_OFFICE_OUTPUT, 17)
-} finally {
-    if ($null -ne $document) {
-        $document.Close($false)
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($document)
-    }
-    if ($null -ne $word) {
-        $word.Quit()
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($word)
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}
-"#;
-
-#[cfg(windows)]
-const EXCEL_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-
-if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
-    Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
-}
-$excel = $null
-$workbook = $null
-try {
-    $excel = New-Object -ComObject Excel.Application
-    $excel.Visible = $false
-    $excel.DisplayAlerts = $false
-    $excel.AutomationSecurity = 3
-    $workbook = $excel.Workbooks.Open($env:BPDF_OFFICE_INPUT, 0, $true)
-    if ($null -eq $workbook) {
+    $doc.SaveAs2($env:BPDF_OFFICE_OUTPUT, 17)"#,
+            "$doc.Close($false)",
+        ),
+        Format::Excel => (
+            "Excel.Application",
+            r#"    $app.Visible = $false
+    $app.DisplayAlerts = $false
+    $doc = $app.Workbooks.Open($env:BPDF_OFFICE_INPUT, 0, $true)
+    if ($null -eq $doc) {
         throw 'Excel returned no workbook object'
     }
-    $workbook.ExportAsFixedFormat(0, $env:BPDF_OFFICE_OUTPUT, 0, $true, $false)
-} finally {
-    if ($null -ne $workbook) {
-        $workbook.Close($false)
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($workbook)
-    }
-    if ($null -ne $excel) {
-        $excel.Quit()
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel)
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}
-"#;
-
-#[cfg(windows)]
-const POWERPOINT_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-
-if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
-    Unblock-File -LiteralPath $env:BPDF_OFFICE_INPUT -ErrorAction SilentlyContinue
-}
-$powerpoint = $null
-$presentation = $null
-try {
-    $powerpoint = New-Object -ComObject PowerPoint.Application
-    $powerpoint.DisplayAlerts = 1
-    $powerpoint.AutomationSecurity = 3
-    $presentation = $powerpoint.Presentations.Open(
-        $env:BPDF_OFFICE_INPUT,
-        $true,
-        $false,
-        $false
-    )
-    if ($null -eq $presentation) {
+    $doc.ExportAsFixedFormat(0, $env:BPDF_OFFICE_OUTPUT, 0, $true, $false)"#,
+            "$doc.Close($false)",
+        ),
+        Format::PowerPoint => (
+            "PowerPoint.Application",
+            r#"    $app.DisplayAlerts = 1
+    $doc = $app.Presentations.Open($env:BPDF_OFFICE_INPUT, $true, $false, $false)
+    if ($null -eq $doc) {
         throw 'PowerPoint returned no presentation object'
     }
     # ppSaveAsPDF = 32. SaveAs avoids PowerShell's ambiguous late-bound
     # ExportAsFixedFormat overload with its many optional COM arguments.
-    $presentation.SaveAs($env:BPDF_OFFICE_OUTPUT, 32)
-} finally {
-    if ($null -ne $presentation) {
-        $presentation.Close()
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($presentation)
-    }
-    if ($null -ne $powerpoint) {
-        $powerpoint.Quit()
-        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($powerpoint)
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
+    $doc.SaveAs($env:BPDF_OFFICE_OUTPUT, 32)"#,
+            "$doc.Close()",
+        ),
+        _ => return None,
+    };
+    Some(
+        OFFICE_FRAME
+            .replace("__PROGID__", prog_id)
+            .replace("__BODY__", body)
+            .replace("__CLOSE__", close),
+    )
 }
-"#;
 
 #[cfg(windows)]
 const OFFICE_PROBE_SCRIPT: &str = r#"

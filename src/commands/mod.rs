@@ -58,8 +58,13 @@ fn optimize_document(document: &mut lopdf::Document, config: &Config) {
     }
 }
 
-/// Serialise a document, lowering image resolution and JPEG quality step by
-/// step until it fits `max_size`. Without a limit the document is saved as is.
+/// Serialise a document, lowering image resolution and JPEG quality until it
+/// fits `max_size`. Without a limit the document is saved as is.
+///
+/// Steps get smaller monotonically, so the best fitting step is searched:
+/// the gentlest one first (often enough), then the strongest (is it possible
+/// at all?), then bisection in between. Each attempt re-encodes every image,
+/// so this needs about four attempts instead of up to nine.
 fn pdf_bytes(document: lopdf::Document, config: &Config, max_size: Option<u64>) -> Result<Vec<u8>> {
     let mut document = document;
     let Some(limit) = max_size else {
@@ -88,27 +93,53 @@ fn pdf_bytes(document: lopdf::Document, config: &Config, max_size: Option<u64>) 
         (72, 35),
     ]
     .into_iter()
-    .filter(|(dpi, quality)| *dpi <= base_dpi && *quality <= config.jpeg_quality);
+    .filter(|(dpi, quality)| *dpi <= base_dpi && *quality <= config.jpeg_quality)
+    .collect::<Vec<_>>();
+    if steps.is_empty() {
+        bail!(
+            "cannot reduce the PDF to {}; image_dpi and jpeg_quality are already below every step",
+            human_size(limit)
+        );
+    }
 
-    let mut smallest = original.len();
-    for (dpi, quality) in steps {
-        let mut attempt = document.clone();
-        transform::optimize(&mut attempt, dpi, quality, true);
-        let bytes = pdf::save_to_bytes(&mut attempt)?;
+    let attempt = |index: usize| -> Result<Vec<u8>> {
+        let (dpi, quality) = steps[index];
+        let mut candidate = document.clone();
+        transform::optimize(&mut candidate, dpi, quality, true);
+        let bytes = pdf::save_to_bytes(&mut candidate)?;
         output::info(format!(
             "Size fitting: {dpi} DPI, JPEG quality {quality}: {}",
             human_size(bytes.len() as u64)
         ));
-        if fits(&bytes) {
-            return Ok(bytes);
-        }
-        smallest = smallest.min(bytes.len());
+        Ok(bytes)
+    };
+
+    let first = attempt(0)?;
+    if fits(&first) {
+        return Ok(first);
     }
-    bail!(
-        "cannot reduce the PDF to {}; the smallest result was {} (text, fonts and vector content are not reduced)",
-        human_size(limit),
-        human_size(smallest as u64)
-    )
+    let last_index = steps.len() - 1;
+    let mut best = attempt(last_index)?;
+    if !fits(&best) {
+        bail!(
+            "cannot reduce the PDF to {}; the smallest result was {} (text, fonts and vector content are not reduced)",
+            human_size(limit),
+            human_size(best.len().min(first.len()) as u64)
+        );
+    }
+    // Invariant: step `low` does not fit, step `high` does (its bytes in `best`).
+    let (mut low, mut high) = (0, last_index);
+    while high - low > 1 {
+        let middle = (low + high) / 2;
+        let bytes = attempt(middle)?;
+        if fits(&bytes) {
+            high = middle;
+            best = bytes;
+        } else {
+            low = middle;
+        }
+    }
+    Ok(best)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -116,5 +147,38 @@ fn human_size(bytes: u64) -> String {
         0..1024 => format!("{bytes} B"),
         1024..1_048_576 => format!("{:.1} KB", bytes as f64 / 1024.0),
         _ => format!("{:.2} MB", bytes as f64 / 1_048_576.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+
+    use super::*;
+
+    fn noisy_page() -> lopdf::Document {
+        let mut seed = 7u32;
+        let image = RgbImage::from_fn(700, 990, |_, _| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let value = (seed >> 16) as u8;
+            Rgb([value, value.wrapping_mul(3), value.wrapping_add(90)])
+        });
+        let mut jpeg = Vec::new();
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+        pdf::jpeg_document(jpeg, "A4").unwrap()
+    }
+
+    #[test]
+    fn size_fitting_finds_a_step_within_the_limit() {
+        let config = Config::default();
+        let full = pdf_bytes(noisy_page(), &config, None).unwrap().len() as u64;
+        let limit = full * 2 / 5;
+        let fitted = pdf_bytes(noisy_page(), &config, Some(limit)).unwrap();
+        assert!(fitted.len() as u64 <= limit, "{} > {limit}", fitted.len());
+        assert!(pdf_bytes(noisy_page(), &config, Some(1000)).is_err());
     }
 }

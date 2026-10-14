@@ -1,6 +1,8 @@
 //! Decoding of PDF image XObjects into `DynamicImage`, shared by optimize,
 //! OCR and image extraction.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
@@ -78,8 +80,8 @@ pub(crate) fn page_images(
             continue;
         };
         let label = match selection {
-            Selection::Largest => format!("page-{page_number}"),
-            Selection::AllFrom(_) => format!("page-{page_number}-image-{}", index + 1),
+            Selection::Largest => format!("page_{page_number}"),
+            Selection::AllFrom(_) => format!("page_{page_number}_image_{}", index + 1),
         };
         match extract_one(document, stream, rotation, jpeg_quality, label) {
             Ok(extracted) => output.push(extracted),
@@ -132,6 +134,139 @@ fn extract_one(
         width: image.width(),
         height: image.height(),
     })
+}
+
+/// Largest size in points at which each image XObject is drawn on a page,
+/// following `cm`, `q`/`Q` and nested forms. Images the content never draws
+/// directly (patterns, annotations) are absent.
+pub(crate) fn placements(
+    document: &Document,
+    page_id: ObjectId,
+) -> Result<HashMap<ObjectId, (f64, f64)>> {
+    let mut found = HashMap::new();
+    let Some(resources) = super::transform::inherited_value(document, page_id, b"Resources") else {
+        return Ok(found);
+    };
+    let resources = resolve(document, &resources)?.as_dict()?;
+    if !has_xobjects(document, resources) {
+        return Ok(found);
+    }
+    let content = document.get_page_content_with_limit(page_id, MAX_DECOMPRESSED_BYTES)?;
+    walk_placements(document, &content, resources, IDENTITY, 0, &mut found)?;
+    Ok(found)
+}
+
+type Matrix = [f64; 6];
+
+const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `first` applied, then `then`.
+fn multiply(first: Matrix, then: Matrix) -> Matrix {
+    [
+        first[0] * then[0] + first[1] * then[2],
+        first[0] * then[1] + first[1] * then[3],
+        first[2] * then[0] + first[3] * then[2],
+        first[2] * then[1] + first[3] * then[3],
+        first[4] * then[0] + first[5] * then[2] + then[4],
+        first[4] * then[1] + first[5] * then[3] + then[5],
+    ]
+}
+
+fn matrix(operands: &[Object]) -> Option<Matrix> {
+    let values = operands
+        .iter()
+        .map(|operand| super::object_number(operand).ok())
+        .collect::<Option<Vec<_>>>()?;
+    <[f64; 6]>::try_from(values).ok()
+}
+
+fn sub_dictionary<'a>(
+    document: &'a Document,
+    dictionary: &'a Dictionary,
+    key: &[u8],
+) -> Option<&'a Dictionary> {
+    resolve(document, dictionary.get(key).ok()?)
+        .ok()?
+        .as_dict()
+        .ok()
+}
+
+fn has_xobjects(document: &Document, resources: &Dictionary) -> bool {
+    sub_dictionary(document, resources, b"XObject").is_some_and(|xobjects| !xobjects.is_empty())
+}
+
+fn walk_placements(
+    document: &Document,
+    content: &[u8],
+    resources: &Dictionary,
+    base: Matrix,
+    depth: u8,
+    found: &mut HashMap<ObjectId, (f64, f64)>,
+) -> Result<()> {
+    if depth > 8 {
+        bail!("form XObjects are nested too deeply");
+    }
+    let xobjects = sub_dictionary(document, resources, b"XObject");
+    let mut current = base;
+    let mut saved = Vec::new();
+    for operation in lopdf::content::Content::decode(content)?.operations {
+        match operation.operator.as_str() {
+            "q" => saved.push(current),
+            "Q" => current = saved.pop().unwrap_or(base),
+            "cm" => {
+                if let Some(applied) = matrix(&operation.operands) {
+                    current = multiply(applied, current);
+                }
+            }
+            "Do" => {
+                let Some(id) = operation
+                    .operands
+                    .first()
+                    .and_then(|name| name.as_name().ok())
+                    .and_then(|name| xobjects?.get(name).ok()?.as_reference().ok())
+                else {
+                    continue;
+                };
+                let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
+                    continue;
+                };
+                match stream.dict.get(b"Subtype").and_then(Object::as_name) {
+                    Ok(b"Image") => {
+                        let width = current[0].hypot(current[1]);
+                        let height = current[2].hypot(current[3]);
+                        let size = found.entry(id).or_insert((0.0, 0.0));
+                        *size = (size.0.max(width), size.1.max(height));
+                    }
+                    Ok(b"Form") => {
+                        let form_matrix = stream
+                            .dict
+                            .get(b"Matrix")
+                            .and_then(Object::as_array)
+                            .ok()
+                            .and_then(|values| matrix(values))
+                            .unwrap_or(IDENTITY);
+                        let form_resources = sub_dictionary(document, &stream.dict, b"Resources")
+                            .unwrap_or(resources);
+                        if has_xobjects(document, form_resources) {
+                            let form_content =
+                                stream.decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)?;
+                            walk_placements(
+                                document,
+                                &form_content,
+                                form_resources,
+                                multiply(form_matrix, current),
+                                depth + 1,
+                                found,
+                            )?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Colour space of the decoded samples, resolved through references,

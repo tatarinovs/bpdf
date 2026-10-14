@@ -14,15 +14,9 @@ pub fn load(path: &Path, format: Format) -> Result<String> {
     match format {
         Format::Epub => load_epub(path),
         Format::Htmlz => load_htmlz(path),
-        Format::Fb2 if is_zip(path) => load_fb2_zip(path),
+        Format::Fb2 if crate::formats::has_extension(path, "zip") => load_fb2_zip(path),
         _ => load_fb2_raw(path),
     }
-}
-
-fn is_zip(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
 }
 
 /// Load `.htmlz` archive containing an `index.html` or html file.

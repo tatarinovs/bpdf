@@ -414,13 +414,14 @@ pub fn overlay_searchable_text(
     }
 
     let font_id = font.embed(document);
+    let mut installer = crate::pdf::transform::ResourceInstaller::new(vec![(
+        b"Font".as_slice(),
+        font_name.as_bytes(),
+        font_id,
+    )]);
     for (page_id, content) in page_contents {
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        crate::pdf::transform::install_resources(
-            document,
-            page_id,
-            &[(b"Font", font_name.as_bytes(), font_id)],
-        )?;
+        installer.install(document, page_id)?;
         let old = document
             .get_dictionary(page_id)?
             .get(b"Contents")
@@ -542,12 +543,13 @@ pub fn add_text_marks(
         })
     });
     let isolation = ContentIsolation::new(document);
+    let mut resources = vec![(b"Font".as_slice(), font_name.as_bytes(), font_id)];
+    if let Some(state_id) = state_id {
+        resources.push((b"ExtGState", state_name.as_bytes(), state_id));
+    }
+    let mut installer = transform::ResourceInstaller::new(resources);
     for (page_id, content) in contents {
-        let mut resources = vec![(b"Font".as_slice(), font_name.as_bytes(), font_id)];
-        if let Some(state_id) = state_id {
-            resources.push((b"ExtGState", state_name.as_bytes(), state_id));
-        }
-        transform::install_resources(document, page_id, &resources)?;
+        installer.install(document, page_id)?;
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
         isolation.add_overlay(document, page_id, content_id)?;
     }
@@ -674,6 +676,33 @@ mod tests {
             text.contains("0.000000 1.000000 -1.000000 0.000000"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn pages_sharing_resources_share_one_edited_copy() {
+        let Ok(mut document) = render(&"строка\n".repeat(200), &TextOptions::default())
+        else {
+            return;
+        };
+        let style = TextMarkStyle {
+            font_size: 10.0,
+            position: "bc".to_owned(),
+            angle: 0.0,
+            opacity: 0.5,
+            color: [0.0, 0.0, 0.0],
+            pages: "all".to_owned(),
+        };
+        add_text_marks(&mut document, &style, None, |n, _| n.to_string()).unwrap();
+        let resources = document
+            .get_pages()
+            .into_values()
+            .map(|page_id| {
+                let page = document.get_dictionary(page_id).unwrap();
+                page.get(b"Resources").unwrap().as_reference().unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(document.get_pages().len() > 1);
+        assert_eq!(resources.len(), 1);
     }
 
     #[test]

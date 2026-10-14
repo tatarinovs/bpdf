@@ -86,9 +86,8 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 
 ## Verification
 
-`tools/compare-v1.ps1` compares the public CLI and deterministic output hashes
-for merge, optimize, rotate, resize, metadata, strip, convert, and split.
-`tools/benchmark-v1.ps1` compares split timings over the same source PDF.
+`cargo test` covers the CLI definition (including clap's consistency checks),
+the commands and the PDF transforms. `tools/benchmark-v1.ps1` compares split timings over the same source PDF.
 
 Live Groq OCR and Microsoft Office COM calls depend on external credentials and
 installed applications. Their internal unit tests remain part of the normal

@@ -59,27 +59,17 @@ pub struct ImageOptions {
     pub raw_develop: bool,
 }
 
+/// The built-in configuration's image settings.
 impl Default for ImageOptions {
     fn default() -> Self {
-        Self {
-            keep_icc: false,
-            ffmpeg: PathBuf::from("ffmpeg"),
-            jpeg_quality: 95,
-            image_dpi: 150,
-            long_edge: None,
-            short_edge: None,
-            orient: None,
-            rotation_degrees: None,
-            force_reencode: false,
-            raw_develop: false,
-        }
+        crate::config::Config::default().image_options()
     }
 }
 
 impl ImageOptions {
     /// True when pixels must be decoded even if the source already is a JPEG
     /// that fits the page.
-    fn needs_reencode(&self) -> bool {
+    pub(crate) fn needs_reencode(&self) -> bool {
         self.force_reencode
             || self.long_edge.is_some()
             || self.short_edge.is_some()
@@ -100,7 +90,7 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
         }
         Some(Format::CameraRaw) => return raw_to_jpeg(path, options, page_size),
         #[cfg(windows)]
-        Some(Format::Raster) if is_tiff(path) => {
+        Some(Format::Raster) if formats::is_tiff(path) => {
             return apply_transformations(crate::wic::decode(path)?, options, page_size);
         }
         _ => {}
@@ -166,15 +156,6 @@ pub(crate) fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
     let mut image = DynamicImage::from_decoder(decoder).context("failed to decode image")?;
     image.apply_orientation(orientation);
     Ok(image)
-}
-
-#[cfg(windows)]
-fn is_tiff(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| {
-            value.eq_ignore_ascii_case("tif") || value.eq_ignore_ascii_case("tiff")
-        })
 }
 
 /// Decode every logical page/frame for PDF construction. Single-image callers
@@ -431,6 +412,23 @@ pub(crate) fn encode_jpeg_on_white(image: &DynamicImage, quality: u8) -> Result<
     }
 }
 
+/// True for graphics rather than photographs: a sample of the pixels has at
+/// most 256 distinct colours (charts, drawings, screenshots, line art).
+pub(crate) fn has_few_colours(image: &DynamicImage) -> bool {
+    const SAMPLE: u64 = 65_536;
+    let (width, height) = image.dimensions();
+    let total = u64::from(width) * u64::from(height);
+    let step = (total / SAMPLE).max(1);
+    let mut colours = std::collections::HashSet::new();
+    (0..total).step_by(step as usize).all(|index| {
+        let x = (index % u64::from(width)) as u32;
+        let y = (index / u64::from(width)) as u32;
+        let pixel = image.get_pixel(x, y).0;
+        colours.insert([pixel[0], pixel[1], pixel[2]]);
+        colours.len() <= 256
+    })
+}
+
 /// True when at most one pixel in 5000 has visibly different channels.
 /// The bound is strict on purpose: a small coloured stamp or signature keeps
 /// the image in colour, while scanner and JPEG chroma noise does not.
@@ -502,6 +500,20 @@ pub(crate) fn fit_dimensions_for_dpi(
         std::mem::swap(&mut max_width, &mut max_height);
     }
     fit_dimensions(width, height, max_width, max_height)
+}
+
+/// Smallest size that still gives `dpi` where the image is drawn at
+/// `placed` points, or `None` when the image is not larger than that.
+pub(crate) fn fit_dimensions_for_placement(
+    width: u32,
+    height: u32,
+    placed: (f64, f64),
+    dpi: u32,
+) -> Option<(u32, u32)> {
+    let (needed_width, needed_height) = pixel_dimensions_for_dpi(placed.0, placed.1, dpi)?;
+    let scale = (f64::from(needed_width) / f64::from(width))
+        .max(f64::from(needed_height) / f64::from(height));
+    (width > 0 && height > 0 && scale < 1.0).then(|| scaled(width, height, scale))
 }
 
 pub(crate) fn resize_to_jpeg(

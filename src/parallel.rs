@@ -1,5 +1,6 @@
 //! Order-preserving parallel map over a slice using scoped threads.
 
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,6 +14,13 @@ pub fn cpu_jobs() -> usize {
         .min(8)
 }
 
+thread_local! {
+    /// Set on worker threads: a map started inside a worker runs inline, so
+    /// nested parallel stages (a CBZ inside a parallel merge) cannot multiply
+    /// the thread count and the decoded images held at once.
+    static IN_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Apply `work` to every item with at most `jobs` threads; results keep the
 /// input order.
 pub fn map<'a, T, R, F>(items: &'a [T], jobs: usize, work: F) -> Vec<R>
@@ -21,7 +29,7 @@ where
     R: Send,
     F: Fn(&'a T) -> R + Sync,
 {
-    if items.len() <= 1 || jobs <= 1 {
+    if items.len() <= 1 || jobs <= 1 || IN_WORKER.get() {
         return items.iter().map(work).collect();
     }
 
@@ -34,6 +42,7 @@ where
     thread::scope(|scope| {
         for _ in 0..jobs.min(items.len()) {
             scope.spawn(|| {
+                IN_WORKER.set(true);
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
@@ -61,5 +70,14 @@ mod tests {
             super::map(&[3, 1, 2, 4], 3, |value| value * 2),
             vec![6, 2, 4, 8]
         );
+    }
+
+    #[test]
+    fn nested_maps_run_inline_on_workers() {
+        let outer = super::map(&[0, 1, 2, 3], 4, |_| {
+            let id = std::thread::current().id();
+            super::map(&[0, 1, 2], 3, |_| std::thread::current().id() == id)
+        });
+        assert!(outer.into_iter().flatten().all(|same| same));
     }
 }

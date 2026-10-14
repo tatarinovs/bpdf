@@ -43,7 +43,7 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 | **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | — | Uses Windows Imaging Component. |
 | **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or the `ffmpeg` path in `config.toml`. |
 | **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
-| **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. The paper follows the layout: a page that fits one sheet of `page_size` proportions becomes a single PDF page of its exact size (a 1200×1600 card is one uncropped page), a longer one is split into sheets of its width; an explicit CSS `@page { size }` wins. `--size original` keeps that size instead of fitting `page_size`. Without a browser, the page text is extracted and rendered as a text PDF. |
+| **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. The paper follows the layout: a page that fits one sheet of `page_size` proportions becomes a single PDF page of its exact size (a 1200×1600 card is one uncropped page), a longer one is split into sheets of its width; an explicit CSS `@page { size }` wins. `--size keep` keeps that size instead of fitting `page_size`. Without a browser, the page text is extracted and rendered as a text PDF. |
 | **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |
 | **HTML to JPEG (`convert page.html`)** | Edge / Chrome | Chrome / Chromium | Viewport-sized screenshot; no fallback without a browser. |
 | **PDF page rendering (`convert --render`)** | Native Windows renderer | — | Image extraction from PDFs works everywhere. |
@@ -141,7 +141,7 @@ Model, prompt, proxy, endpoint and parallel requests are configured in `config.t
 `bpdf split <INPUT> [-o <DIR>]` — one PDF per page (`<name>_01.pdf`, …), in the source folder by default.
 
 ### 4. `bpdf extract`
-`bpdf extract <INPUT> <PAGES> [-o <OUT>]` — selected pages into `<name>_extracted.pdf`; never overwrites the source.
+`bpdf extract <INPUT> <PAGES> [-o <OUT>]` — selected pages, in the given order and with repeats (`5,1-4`, `1,1`, `reverse`), into `<name>_extracted.pdf`; never overwrites the source.
 
 ### 5. `bpdf info`
 `bpdf info <INPUT>` — PDF version, size (pt and mm), rotation, font and image counts of every page, and the document properties.
@@ -159,6 +159,8 @@ bpdf rotate <INPUTS>... -a <ANGLE> [-p <PAGES>] [-o <OUT> | -i]
 - `-a, --angle` — Clockwise `90`, `180`, `270`, `-90`, or `portrait` / `landscape` to turn only pages of the other orientation.
 - `-p, --pages` — PDF pages (default `all`).
 
+JPEGs are rotated **losslessly** through the EXIF orientation tag; pixels and other metadata stay untouched. They are re-encoded only when EXIF exists without an orientation tag.
+
 ### 9. `bpdf resize`
 ```powershell
 bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-p <PAGES>] [-o <OUT> | -i]
@@ -166,7 +168,7 @@ bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-p <
 PDF: the visible page area is fitted and centred on A4 (default) or Letter, keeping each page's orientation; pages already of that size are untouched. JPEG: `--long-edge` (longest side at most) or `--short-edge` (shortest side exactly) is required.
 
 ### 10. `bpdf optimize`
-`bpdf optimize <INPUT> [--max-size <SIZE>] [-o <OUT> | -i]` — tidy the structure and downsample images to `image_dpi` at `jpeg_quality`; `--max-size` steps down from 300 DPI / 85 to 72 DPI / 35 until the file fits.
+`bpdf optimize <INPUT> [--max-size <SIZE>] [-o <OUT> | -i]` — tidy the structure and downsample images to `image_dpi` at `jpeg_quality`, measured at the size each image is drawn on the page (a large photo in a small frame shrinks to the frame) (lossless graphics with up to 256 colours stay lossless); `--max-size` steps down from 300 DPI / 85 to 72 DPI / 35 until the file fits.
 
 ### 11. `bpdf stamp`
 ```powershell
@@ -192,14 +194,14 @@ The stamp is always drawn over the page. Placement follows the visible, upright 
 `bpdf metadata <INPUT> [--title] [--author] [--subject] [--keywords] [--creator] [-o <OUT> | -i]` — set document properties; an empty value removes a field. `bpdf info` shows the current values.
 
 ### 15. `bpdf convert`
-`bpdf convert <INPUTS>... [-o <DIR>] [--force] [--long-edge PX] [--short-edge PX] [--orient MODE] [-q 1-100] [--render] [--viewport WxH]` — images, PDF pages/images and HTML pages to JPEG. Multipage TIFF gives one JPEG per page; PDFs give the largest image of each page, or rendered pages for text pages and with `--render` (Windows only).
+`bpdf convert <INPUTS>... [-o <DIR>] [--force] [--long-edge PX] [--short-edge PX] [--orient MODE] [-q 1-100] [--render] [--viewport WxH]` — images, PDF pages/images and HTML pages to JPEG. Multipage TIFF gives one JPEG per page; PDFs give the largest image of each page, or rendered pages for text pages and with `--render` (Windows only), named `doc_page_3.jpg`; size, orientation and quality options apply to them too.
 
 ### 16. `bpdf doctor`
 Checks the configuration and integrations. Required parts (font, OCR cache, the configured OCR engine) report `FAIL` and a non-zero exit code; missing optional ones (FFmpeg, Office, browser, an unused engine) report `WARN`.
 
 ## Page Selection Syntax
 
-`all`, `first`, `last` (`l`), `even`, `odd`, and lists such as `1-5,8,last` or `2-last`. Used by `-p/--pages`, `extract`, and per-input specifiers (`doc.pdf:1-3`) in `merge`, `ocr`, `convert`, `rotate` and `resize`.
+`all`, `first`, `last` (`l`), `even`, `odd`, `reverse`, and lists such as `1-5,8,last`, `2-last`, `5-` (to the end) or `5-1` (backwards). `extract` and per-input specifiers keep the given order and repeats. Used by `-p/--pages`, `extract`, and per-input specifiers (`doc.pdf:1-3`) in `merge`, `ocr`, `convert`, `rotate` and `resize`.
 
 ### Per-Input Page Specifier
 ```powershell

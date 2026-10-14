@@ -1,11 +1,15 @@
+use std::fs;
+use std::path::Path;
+
 use anyhow::{Result, bail};
 
 use super::common::PdfOrJpegEdit;
 use crate::cli::RotateArgs;
 use crate::config::Config;
 use crate::formats::InputFormatSet;
-use crate::imageconv::Orientation;
+use crate::imageconv::{self, Orientation};
 use crate::pdf::transform;
+use crate::{metadata, pdf};
 
 /// A rotation by a multiple of 90 degrees or to a target orientation.
 #[derive(Clone, Copy, Debug)]
@@ -41,26 +45,62 @@ pub fn run(args: RotateArgs, config: &Config, fail_fast: bool) -> Result<()> {
         formats: InputFormatSet::Rotate,
         pages: &args.pages,
         output: &args.output,
-        jpeg: Ok(image_options),
         edit_pdf: |document: &mut lopdf::Document, pages: &str| match turn {
             Turn::By(degrees) => transform::rotate_pages(document, pages, degrees),
             Turn::To(orientation) => transform::orient_pages(document, pages, orientation),
+        },
+        edit_jpeg: |path: &Path| {
+            let bytes = fs::read(path)?;
+            match rotate_jpeg_losslessly(&bytes, turn)? {
+                Some(rotated) => Ok(rotated),
+                None => imageconv::to_jpeg(path, &image_options, None),
+            }
         },
     }
     .run(&args.inputs, fail_fast)
 }
 
+/// Turn a JPEG through its EXIF orientation tag, keeping every pixel as it
+/// was. `None` when the tag cannot be written (EXIF without one); the image
+/// is then re-encoded.
+fn rotate_jpeg_losslessly(bytes: &[u8], turn: Turn) -> Result<Option<Vec<u8>>> {
+    let orientation = metadata::jpeg_orientation(bytes);
+    let degrees = match turn {
+        Turn::By(degrees) => degrees,
+        Turn::To(target) => {
+            let info = pdf::jpeg_info(bytes)?;
+            let quarter = metadata::orientation_rotation(orientation) % 180 == 90;
+            let (width, height) = if quarter {
+                (info.height, info.width)
+            } else {
+                (info.width, info.height)
+            };
+            if width == height || (width > height) == target.is_landscape() {
+                return Ok(Some(bytes.to_vec()));
+            }
+            90
+        }
+    };
+    let target = metadata::rotated_orientation(orientation, degrees);
+    Ok(metadata::with_jpeg_orientation(bytes, target))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use image::GenericImageView;
 
     use super::*;
     use crate::cli::OutputArgs;
     use crate::commands::common::test_utils::*;
-    use crate::pdf;
+
+    /// Size as shown, after the EXIF orientation.
+    fn shown(path: &Path) -> (u32, u32) {
+        imageconv::decode_bytes(&fs::read(path).unwrap())
+            .unwrap()
+            .dimensions()
+    }
 
     fn rotate(inputs: &[&Path], angle: &str, pages: &str, out: Option<PathBuf>) -> Result<()> {
         run(
@@ -106,7 +146,7 @@ mod tests {
         let out = dir.path().join("out");
         fs::create_dir(&out).unwrap();
         rotate(&[&first, &second], "90", "all", Some(out.clone())).unwrap();
-        assert_eq!(image::open(out.join("b.jpg")).unwrap().dimensions(), (2, 4));
+        assert_eq!(shown(&out.join("b.jpg")), (2, 4));
     }
 
     #[test]
@@ -128,9 +168,9 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(image::open(&input).unwrap().dimensions(), (4, 2));
+        assert_eq!(shown(&input), (4, 2));
         let rotated = dir.path().join("photo_rotated.jpg");
-        assert_eq!(image::open(rotated).unwrap().dimensions(), (2, 4));
+        assert_eq!(shown(&rotated), (2, 4));
     }
 
     #[test]
@@ -150,11 +190,14 @@ mod tests {
         let input = dir.path().join("photo.jpg");
         sample_jpeg(&input, 200, 100);
         rotate(&[&input], "-90", "all", None).unwrap();
-        assert_eq!(image::open(&input).unwrap().dimensions(), (100, 200));
+        assert_eq!(shown(&input), (100, 200));
         rotate(&[&input], "portrait", "all", None).unwrap();
-        assert_eq!(image::open(&input).unwrap().dimensions(), (100, 200));
+        assert_eq!(shown(&input), (100, 200));
         rotate(&[&input], "landscape", "all", None).unwrap();
+        assert_eq!(shown(&input), (200, 100));
+        // Lossless: the stored pixels never changed.
         assert_eq!(image::open(&input).unwrap().dimensions(), (200, 100));
+        assert_eq!(metadata::jpeg_orientation(&fs::read(&input).unwrap()), 1);
     }
 
     #[test]
@@ -179,7 +222,7 @@ mod tests {
         sample_pdf(&dir.path().join("document.pdf"));
         fs::write(&txt, "hello world").unwrap();
         rotate(&[dir.path()], "90", "all", None).unwrap();
-        assert_eq!(image::open(&jpeg).unwrap().dimensions(), (100, 200));
+        assert_eq!(shown(&jpeg), (100, 200));
         assert_eq!(fs::read_to_string(&txt).unwrap(), "hello world");
     }
 
