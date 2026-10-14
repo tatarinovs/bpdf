@@ -342,9 +342,16 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
         let mut targets = Vec::new();
         for (_, page_id, geometry) in selected_pages(document, &options.pages)? {
             let paper = scan_paper_factor(document, page_id, geometry);
-            let (width, height) = size.fitted(options.scale, geometry, paper);
-            let (x, y) = stamp_position(&options.position, geometry, width, height, paper)?;
-            targets.push((page_id, [width, 0.0, 0.0, height, x, y]));
+            // Position and size refer to the page as shown: its visible
+            // area, upright after /Rotate.
+            let crop = page_crop_geometry(document, page_id)?;
+            let display = crop.displayed();
+            let (width, height) = size.fitted(options.scale, display, paper);
+            let (left, bottom) = stamp_position(&options.position, display, width, height, paper)?;
+            targets.push((
+                page_id,
+                upright_stamp_matrix(crop, left, bottom, width, height),
+            ));
         }
         targets
     } else {
@@ -752,6 +759,29 @@ pub fn page_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeome
 }
 
 /// The visible page area: the CropBox when present, otherwise the MediaBox.
+/// The `cm` matrix drawing the unit image square as the `width` x `height`
+/// box at (`left`, `bottom`) of the displayed `crop`, upright whatever the
+/// page rotation.
+pub(crate) fn upright_stamp_matrix(
+    crop: PageGeometry,
+    left: f64,
+    bottom: f64,
+    width: f64,
+    height: f64,
+) -> [f64; 6] {
+    let (origin_x, origin_y) = crop.display_to_page(left, bottom);
+    let (right_x, right_y) = crop.display_to_page(left + width, bottom);
+    let (top_x, top_y) = crop.display_to_page(left, bottom + height);
+    [
+        right_x - origin_x,
+        right_y - origin_y,
+        top_x - origin_x,
+        top_y - origin_y,
+        origin_x,
+        origin_y,
+    ]
+}
+
 pub(crate) fn page_crop_geometry(document: &Document, page_id: ObjectId) -> Result<PageGeometry> {
     let mut geometry = page_geometry(document, page_id)?;
     if let Some(crop) = inherited_value(document, page_id, b"CropBox")
@@ -1540,6 +1570,80 @@ mod tests {
         );
         let title_bytes = last_item.get(b"Title").unwrap().as_str().unwrap();
         assert!(title_bytes.starts_with(&[0xfe, 0xff]));
+    }
+
+    #[test]
+    fn stamp_position_follows_crop_and_rotation() {
+        let temporary = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 4, Rgba([255, 0, 0, 128])))
+            .save_with_format(temporary.path(), ImageFormat::Png)
+            .unwrap();
+        let mut document = one_page();
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let page = document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap();
+        page.set("MediaBox", vec![0.into(), 0.into(), 600.into(), 800.into()]);
+        page.set(
+            "CropBox",
+            vec![50.into(), 100.into(), 550.into(), 700.into()],
+        );
+        page.set("Rotate", 90);
+
+        apply_stamp(
+            &mut document,
+            &StampOptions {
+                path: temporary.path().to_path_buf(),
+                position: "br".to_owned(),
+                scale: Some(1.0),
+                dpi: Some(96.0),
+                opacity: 1.0,
+                pages: "all".to_owned(),
+                mode: StampMode::Over,
+                blend_mode: BlendMode::Normal,
+                placements: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let contents = document.get_page_contents(page_id);
+        let stamp = document
+            .get_object(*contents.last().unwrap())
+            .unwrap()
+            .as_stream()
+            .unwrap();
+        let text = String::from_utf8_lossy(&stamp.content);
+        let matrix: Vec<f64> = text
+            .split(" cm")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .rev()
+            .take(6)
+            .map(|value| value.parse().unwrap())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        // The displayed page is 600x500 pt; a 6x3 pt stamp 10 mm from its
+        // bottom-right corner, kept upright: image X runs along the raw Y axis.
+        let margin = 10.0 * 72.0 / 25.4;
+        let expected = [
+            0.0,
+            6.0,
+            -3.0,
+            0.0,
+            550.0 - margin,
+            100.0 + 600.0 - margin - 6.0,
+        ];
+        for (value, expected) in matrix.iter().zip(expected) {
+            assert!(
+                (value - expected).abs() < 1e-3,
+                "{matrix:?} != {expected:?}"
+            );
+        }
     }
 
     #[test]

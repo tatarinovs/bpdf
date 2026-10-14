@@ -20,8 +20,8 @@
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    display: grid; grid-template-rows: auto 1fr auto; grid-template-columns: 132px 1fr;
-    grid-template-areas: "bar bar" "thumbs main" "hint hint";
+    display: grid; grid-template-rows: auto 1fr auto auto; grid-template-columns: 132px 1fr;
+    grid-template-areas: "bar bar" "thumbs main" "cli cli" "hint hint";
     background: var(--bg); color: var(--text);
     font: 14px/1.4 "Segoe UI", system-ui, sans-serif; user-select: none;
   }
@@ -68,6 +68,16 @@
   .handle.sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
   .handle.se { right: -7px; bottom: -7px; cursor: nwse-resize; }
   #loading { position: absolute; color: var(--muted); }
+  #cli {
+    grid-area: cli; display: flex; align-items: flex-start; gap: 8px; padding: 6px 12px;
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  #cli .label { color: var(--muted); font-size: 12.5px; padding-top: 2px; white-space: nowrap; }
+  #cliText {
+    flex: 1; margin: 0; font: 12.5px/1.5 Consolas, "Cascadia Mono", monospace;
+    white-space: pre-wrap; word-break: break-all; user-select: text; padding-top: 1px;
+  }
+  #cli button { padding: 2px 9px; font-size: 12.5px; }
   footer { grid-area: hint; padding: 6px 12px; color: var(--muted); font-size: 12.5px; background: var(--panel); border-top: 1px solid var(--line); }
   #done {
     position: fixed; inset: 0; display: none; place-items: center; background: var(--bg);
@@ -75,7 +85,7 @@
   }
   #done.show { display: grid; }
   @media (max-width: 700px) {
-    body { grid-template-columns: 1fr; grid-template-areas: "bar" "main" "hint"; }
+    body { grid-template-columns: 1fr; grid-template-areas: "bar" "main" "cli" "hint"; }
     #thumbs { display: none; }
   }
 </style>
@@ -98,6 +108,7 @@
 </header>
 <nav id="thumbs"></nav>
 <main id="main"><span id="loading">Загрузка…</span><div id="sheet" hidden><img class="page" id="pageImg" alt=""></div></main>
+<div id="cli" title="Выделенная печать без окна: подставьте вместо --pick"><span class="label">Параметры:</span><pre id="cliText"></pre><button id="copy" title="Скопировать параметры выделенной печати">Копировать</button></div>
 <footer>Перетаскивайте печать мышью · колесо или уголки — размер (Shift — точнее) · двойной клик — поставить печать в это место · стрелки — сдвиг · Del — удалить · Enter — применить · Esc — отмена</footer>
 <div id="done"><div id="doneText">Готово. Окно можно закрыть.</div></div>
 <script>
@@ -233,6 +244,81 @@ function updateControls() {
   } else {
     $("size").textContent = stamps.length ? `печатей: ${stamps.length}` : "нет печатей";
   }
+  updateCli();
+}
+
+// The same placement as command-line options. Mirrors stamp_position
+// (X,Y mm from the bottom-right with a 10 mm margin) and StampSize::fitted
+// (scale relative to the stamp at its DPI); the paper factor scales both.
+const MARGIN_MM = 10;
+function stampOptions(stamp) {
+  const page = pageInfo(stamp.page);
+  const unit = page.paper / MM_PER_PT;   // points per "paper" millimetre
+  const left = stamp.x * page.width;
+  const width = stamp.w * page.width;
+  const bottom = (1 - stamp.y - heightOf(stamp)) * page.height;
+  const x = (left + width - page.width) / unit + MARGIN_MM;
+  const y = bottom / unit - MARGIN_MM;
+  const num = (value, digits) => {
+    const text = value.toFixed(digits).replace(/\.?0+$/, "");
+    return text === "-0" ? "0" : text;
+  };
+  const position = `${num(x, 1)},${num(y, 1)}`;
+  // A leading minus would read as an option name.
+  const parts = [position.startsWith("-") ? `--position=${position}` : `--position ${position}`,
+    `--scale ${num(width / (info.native * page.paper), 3)}`];
+  if (info.dpi) parts.push(`--dpi ${num(info.dpi, 2)}`);
+  return parts.join(" ");
+}
+
+// Pages as ranges: 1,3-5,8.
+function pageList(pages) {
+  const ranges = [];
+  for (const page of pages) {
+    const last = ranges[ranges.length - 1];
+    if (last && page === last[1] + 1) last[1] = page;
+    else ranges.push([page, page]);
+  }
+  return ranges.map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`)).join(",");
+}
+
+// Options for the selected stamp; --pages lists every page where a stamp
+// sits exactly the same way.
+function cliText() {
+  if (!selected) return null;
+  const options = stampOptions(selected);
+  const pages = [...new Set(stamps.filter((s) => stampOptions(s) === options).map((s) => s.page + 1))]
+    .sort((a, b) => a - b);
+  const all = pages.length === info.pages.length;
+  return `${options} --pages ${all ? "all" : pageList(pages)}`;
+}
+
+function updateCli() {
+  const text = $("cliText");
+  const line = cliText();
+  $("copy").disabled = !line;
+  if (!line) {
+    text.textContent = stamps.length ? "выберите печать" : "—";
+    return;
+  }
+  text.textContent = line;
+}
+
+async function copyCli() {
+  const text = cliText();
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+  $("copy").textContent = "Скопировано";
+  setTimeout(() => { $("copy").textContent = "Копировать"; }, 1200);
 }
 
 function select(stamp) {
@@ -387,6 +473,7 @@ $("all").onclick = stampAllPages;
 $("remove").onclick = removeSelected;
 $("apply").onclick = apply;
 $("cancel").onclick = cancel;
+$("copy").onclick = copyCli;
 
 $("sheet").addEventListener("pointerdown", (event) => {
   if (event.target.closest(".stamp")) return;

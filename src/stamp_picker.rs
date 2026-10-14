@@ -70,6 +70,9 @@ pub fn pick(
         })).collect::<Vec<_>>(),
         "stamps": initial,
         "aspect": size.width / size.height,
+        // For the equivalent --position/--scale shown in the window.
+        "native": size.width,
+        "dpi": options.dpi,
         "opacity": options.opacity,
         "blend": css_blend(&format!("{:?}", options.blend_mode)),
     });
@@ -143,24 +146,13 @@ fn describe_pages(
     Ok((pages, initial))
 }
 
-/// The `cm` matrix drawing the unit image square upright on the displayed
-/// page, whatever the page rotation.
+/// The `cm` matrix for a stamp of the displayed page.
 fn placement_matrix(page: &PickerPage, stamp: &PickedStamp) -> [f64; 6] {
     let left = stamp.x * page.width;
     let width = stamp.w * page.width;
     let height = stamp.h * page.height;
     let bottom = (1.0 - stamp.y) * page.height - height;
-    let (origin_x, origin_y) = page.crop.display_to_page(left, bottom);
-    let (right_x, right_y) = page.crop.display_to_page(left + width, bottom);
-    let (top_x, top_y) = page.crop.display_to_page(left, bottom + height);
-    [
-        right_x - origin_x,
-        right_y - origin_y,
-        top_x - origin_x,
-        top_y - origin_y,
-        origin_x,
-        origin_y,
-    ]
+    transform::upright_stamp_matrix(page.crop, left, bottom, width, height)
 }
 
 fn css_blend(mode: &str) -> String {
