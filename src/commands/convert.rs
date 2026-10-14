@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::common::{
-    OutputRegistry, batch, err_pdf_only_page_ranges, finish_batch, handle_results, write_output,
-};
+use super::common::{OutputRegistry, batch, finish_batch, handle_results, write_output};
 use crate::cli::ConvertArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -38,7 +36,7 @@ struct Converter<'a> {
 
 pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Convert)?;
-    let mut image_options = config.image_options(args.keep_icc, args.ffmpeg);
+    let mut image_options = config.image_options();
     image_options.long_edge = args.long_edge;
     image_options.short_edge = args.short_edge;
     image_options.orient = args.orient.as_deref().map(Orientation::parse).transpose()?;
@@ -102,9 +100,7 @@ fn build_plans(
             let input = spec.path.clone();
             let plan = (|| match formats::detect(&input) {
                 Some(format) if format.is_image() => {
-                    if spec.pages.is_some() {
-                        return Err(err_pdf_only_page_ranges(&input));
-                    }
+                    spec.reject_pages()?;
                     let is_tiff = input.extension().and_then(OsStr::to_str).is_some_and(|e| {
                         e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
                     });
@@ -122,9 +118,7 @@ fn build_plans(
                 }
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
                 Some(Format::Html) => {
-                    if spec.pages.is_some() {
-                        return Err(err_pdf_only_page_ranges(&input));
-                    }
+                    spec.reject_pages()?;
                     let output = output_for_suffix(&input, output_dir, "jpg")?;
                     registry.reserve(&input, &output, force)?;
                     Ok(Plan::Html(output))
@@ -295,8 +289,6 @@ mod tests {
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
             out,
-            keep_icc: None,
-            ffmpeg: None,
             force,
             long_edge: None,
             short_edge: None,

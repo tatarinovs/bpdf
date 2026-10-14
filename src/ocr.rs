@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,7 +16,8 @@ use crate::formats::{self, Format};
 use crate::hash::sha256_hex;
 use crate::imageconv::{self, ImageOptions};
 use crate::pdf::image::{self as pdf_image, ExtractedImage, Selection};
-use crate::textpdf::{PageTextOverlay, overlay_searchable_text};
+use crate::pdf::transform::PageGeometry;
+use crate::textpdf::{OCR_FONT_NAME, PageTextOverlay, overlay_searchable_text};
 use crate::winocr::{OcrPageResult, OcrWordBox};
 use crate::{atomic, output, parallel, pdf};
 
@@ -80,7 +81,7 @@ impl OcrOptions {
             endpoint: config.ocr_endpoint.clone(),
             timeout: Duration::from_secs(config.ocr_timeout_seconds),
             force_image_ocr: false,
-            image: config.image_options(None, None),
+            image: config.image_options(),
             jobs: 1,
             max_tokens: config.ocr_max_tokens,
             cache_dir: None,
@@ -232,7 +233,8 @@ impl OcrEngine {
     }
 
     /// A PDF with an invisible text layer: existing PDF pages keep their
-    /// content, images become single-page documents.
+    /// content, images become single-page documents. Pages that already
+    /// carry text are left alone unless OCR is forced.
     pub fn create_searchable_pdf_for_spec(
         &self,
         spec: &InputSpec,
@@ -245,28 +247,38 @@ impl OcrEngine {
                 if let Some(pages) = &spec.pages {
                     pdf::select_pages(&mut document, pages)?;
                 }
-                let pages = pdf_image::extract_images(
-                    &document,
-                    Selection::AllFrom(MIN_SEARCHABLE_IMAGE_AREA),
-                    self.options.image.jpeg_quality,
-                )
+                let pages = self.pages_to_recognise(&document);
+                let scans = parallel::map(&pages, parallel::cpu_jobs(), |&(number, page_id)| {
+                    let images = pdf_image::page_images(
+                        &document,
+                        number,
+                        page_id,
+                        Selection::AllFrom(MIN_SEARCHABLE_IMAGE_AREA),
+                        self.options.image.jpeg_quality,
+                    );
+                    (page_id, images)
+                })
                 .into_iter()
                 .filter(|(_, images)| !images.is_empty())
                 .map(|(page_id, images)| {
-                    let geometry = pdf::transform::page_geometry(&document, page_id).ok();
-                    let size = geometry.map_or((595.0, 842.0), |geometry| {
-                        (geometry.raw_width(), geometry.raw_height())
-                    });
-                    (page_id, size, images)
+                    let crop = pdf::transform::page_crop_geometry(&document, page_id)?;
+                    Ok((page_id, crop, images))
                 })
-                .collect::<Vec<_>>();
-                if pages.is_empty() {
+                .collect::<Result<Vec<_>>>()?;
+                if scans.is_empty() {
+                    if pages.is_empty() {
+                        output::info(format!(
+                            "{} already has a text layer on every page",
+                            spec.path.display()
+                        ));
+                        return Ok(document);
+                    }
                     bail!("no extractable images found in {}", spec.path.display());
                 }
 
                 let overlays =
-                    parallel::map(&pages, self.options.jobs, |(page_id, size, images)| {
-                        self.page_overlay(*page_id, *size, images)
+                    parallel::map(&scans, self.options.jobs, |(page_id, crop, images)| {
+                        self.page_overlay(*page_id, *crop, images)
                     });
                 overlay_searchable_text(&mut document, &overlays, font_path)?;
                 Ok(document)
@@ -311,6 +323,7 @@ impl OcrEngine {
                     .collect();
                 let overlay = PageTextOverlay {
                     page_id,
+                    matrix: crate::textpdf::IDENTITY,
                     page_width: placement.page_width,
                     page_height: placement.page_height,
                     scaled_words: words,
@@ -326,14 +339,16 @@ impl OcrEngine {
         }
     }
 
-    /// Recognise the images of one page and map their words onto the page,
-    /// assuming each image covers the whole page.
+    /// Recognise the images of one page and map their words onto the visible
+    /// page, assuming each image covers it. Extracted images are upright, so
+    /// words are placed on the displayed page and `matrix` turns them with it.
     fn page_overlay(
         &self,
         page_id: lopdf::ObjectId,
-        (page_width, page_height): (f64, f64),
+        crop: PageGeometry,
         images: &[ExtractedImage],
     ) -> PageTextOverlay {
+        let (page_width, page_height) = (crop.display_width(), crop.display_height());
         let mut words = Vec::new();
         let mut fallback = Vec::new();
         for image in images {
@@ -362,6 +377,7 @@ impl OcrEngine {
         }
         PageTextOverlay {
             page_id,
+            matrix: pdf::transform::upright_stamp_matrix(crop, 0.0, 0.0, 1.0, 1.0),
             page_width,
             page_height,
             scaled_words: words,
@@ -396,43 +412,49 @@ impl OcrEngine {
         if let Some(pages) = pages_filter {
             pdf::select_pages(&mut document, pages)?;
         }
-        let page_count = document.get_pages().len();
-        let native_text = pdf::extract_text(&document).unwrap_or_default();
-        let mut parts = Vec::new();
-        if !native_text.trim().is_empty() {
-            parts.push(native_text.trim().to_owned());
-        }
-
-        if !self.options.force_image_ocr && has_text_layer(&native_text, page_count) {
+        // Every page contributes its own text layer, or the recognised text
+        // of its largest image when it has none.
+        let mut texts = document
+            .get_pages()
+            .into_keys()
+            .map(|number| (number, page_text(&document, number)))
+            .collect::<BTreeMap<_, _>>();
+        let pending = self.pages_to_recognise(&document);
+        if pending.is_empty() {
             output::info(format!(
-                "Text layer found ({page_count} pages), skipping image OCR"
+                "Text layer found on all {} pages, skipping image OCR",
+                texts.len()
             ));
-            return Ok(parts.join("\n\n"));
         }
-
-        let images = extract_pdf_images(&document, &self.options.image);
-        if images.is_empty() {
-            if parts.is_empty() {
-                bail!("no extractable images or text found in {}", path.display());
-            }
-            return Ok(parts.join("\n\n"));
-        }
-
-        let recognize = |image: &ExtractedImage| {
-            output::info(format!("OCR {}...", image.label));
-            self.recognize_image(&image.bytes, &image.label)
-                .map(|result| result.text)
-        };
+        let images = pending
+            .iter()
+            .flat_map(|&(number, page_id)| {
+                pdf_image::page_images(
+                    &document,
+                    number,
+                    page_id,
+                    Selection::Largest,
+                    self.options.image.jpeg_quality,
+                )
+                .into_iter()
+                .map(move |image| (number, image))
+            })
+            .collect::<Vec<_>>();
         let jobs = if parallel_images {
             self.options.jobs
         } else {
             1
         };
-        let results = parallel::map(&images, jobs, recognize);
+        let results = parallel::map(&images, jobs, |(_, image)| {
+            output::info(format!("OCR {}...", image.label));
+            self.recognize_image(&image.bytes, &image.label)
+        });
         let mut failures = 0usize;
-        for (image, result) in images.iter().zip(results) {
+        for ((number, image), result) in images.iter().zip(results) {
             match result {
-                Ok(text) if !text.trim().is_empty() => parts.push(text.trim().to_owned()),
+                Ok(result) if !result.text.trim().is_empty() => {
+                    texts.insert(*number, result.text.trim().to_owned());
+                }
                 Ok(_) => {}
                 Err(error) => {
                     failures += 1;
@@ -440,10 +462,29 @@ impl OcrEngine {
                 }
             }
         }
-        if failures == images.len() && parts.is_empty() {
-            bail!("all {failures} embedded images failed OCR");
+        let parts = texts
+            .into_values()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            if failures != 0 {
+                bail!("all {failures} embedded images failed OCR");
+            }
+            bail!("no extractable images or text found in {}", path.display());
         }
-        Ok(parts.join("\n\n---\n\n"))
+        Ok(parts.join("\n\n"))
+    }
+
+    /// Pages (number, id) that need OCR: all with `--force-ocr`, otherwise
+    /// those without a meaningful text layer of their own.
+    fn pages_to_recognise(&self, document: &Document) -> Vec<(u32, lopdf::ObjectId)> {
+        document
+            .get_pages()
+            .into_iter()
+            .filter(|&(number, page_id)| {
+                self.options.force_image_ocr || !has_text_layer(document, number, page_id)
+            })
+            .collect()
     }
 
     pub fn recognize_image(&self, original: &[u8], label: &str) -> Result<OcrPageResult> {
@@ -667,7 +708,10 @@ impl OcrEngine {
 
 fn reject_pages(path: &Path, pages: Option<&str>) -> Result<()> {
     if pages.is_some() {
-        return Err(crate::commands::common::err_pdf_only_page_ranges(path));
+        bail!(
+            "page ranges are only valid for PDF inputs: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -680,23 +724,49 @@ fn models_endpoint(endpoint: &str) -> Result<String> {
     Ok(format!("{base}/models"))
 }
 
-/// The largest image of every page, oriented like the page.
-pub fn extract_pdf_images(document: &Document, options: &ImageOptions) -> Vec<ExtractedImage> {
-    pdf_image::extract_images(document, Selection::Largest, options.jpeg_quality)
-        .into_iter()
-        .flat_map(|(_, images)| images)
-        .collect()
+fn page_text(document: &Document, number: u32) -> String {
+    document
+        .extract_text_with_limit(&[number], pdf::MAX_DECOMPRESSED_BYTES)
+        .unwrap_or_default()
 }
 
-fn has_text_layer(text: &str, pages: usize) -> bool {
-    if pages == 0 {
-        return false;
-    }
-    let characters = text
-        .chars()
+/// A page has a text layer when bpdf already added its OCR layer, or when
+/// it carries a real amount of text (a page number alone does not count).
+fn has_text_layer(document: &Document, number: u32, page_id: lopdf::ObjectId) -> bool {
+    let has_bpdf_layer = document.get_page_fonts(page_id).is_ok_and(|fonts| {
+        fonts
+            .keys()
+            .any(|name| name.starts_with(OCR_FONT_NAME.as_bytes()))
+    });
+    has_bpdf_layer || has_enough_text(&page_text(document, number))
+}
+
+fn has_enough_text(text: &str) -> bool {
+    text.chars()
         .filter(|character| !character.is_whitespace())
-        .count();
-    characters / pages >= TEXT_LAYER_THRESHOLD
+        .nth(TEXT_LAYER_THRESHOLD - 1)
+        .is_some()
+}
+
+/// Delete every cached OCR response; returns (files, bytes) removed.
+pub fn clear_cache(directory: &Path) -> Result<(usize, u64)> {
+    if !directory.exists() {
+        return Ok((0, 0));
+    }
+    let mut removed_count = 0usize;
+    let mut bytes_freed = 0u64;
+    let entries = fs::read_dir(directory)
+        .with_context(|| format!("failed to read cache directory {}", directory.display()))?;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() && fs::remove_file(entry.path()).is_ok() {
+            removed_count += 1;
+            bytes_freed = bytes_freed.saturating_add(metadata.len());
+        }
+    }
+    Ok((removed_count, bytes_freed))
 }
 
 fn retry_after(header: Option<&str>, body: &str, attempt: usize) -> Duration {
@@ -761,9 +831,18 @@ mod tests {
     }
 
     #[test]
-    fn text_layer_threshold_is_per_page() {
-        assert!(has_text_layer(&"a".repeat(200), 2));
-        assert!(!has_text_layer(&"a".repeat(199), 2));
+    fn short_labels_are_no_text_layer() {
+        assert!(has_enough_text(&"a ".repeat(100)));
+        assert!(!has_enough_text(&"a ".repeat(99)));
+    }
+
+    #[test]
+    fn clears_cache_files_and_counts_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("a.json"), b"12345").unwrap();
+        fs::write(temp.path().join("b.md"), b"1234567").unwrap();
+        assert_eq!(clear_cache(temp.path()).unwrap(), (2, 12));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
     #[test]

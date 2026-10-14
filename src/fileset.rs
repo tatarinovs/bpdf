@@ -13,6 +13,19 @@ pub struct InputSpec {
     pub pages: Option<String>,
 }
 
+impl InputSpec {
+    /// Page ranges (`file.pdf:1-3`) only make sense for PDF inputs.
+    pub fn reject_pages(&self) -> Result<()> {
+        if self.pages.is_some() {
+            bail!(
+                "page ranges are only valid for PDF inputs: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<InputSpec>> {
     let mut files = Vec::new();
 

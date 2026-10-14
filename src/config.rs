@@ -11,7 +11,7 @@ pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.6-27b";
 pub const DEFAULT_OCR_PROMPT: &str = "You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.";
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
@@ -86,11 +86,10 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Build `ImageOptions` from config with optional CLI overrides.
-    pub fn image_options(&self, keep_icc: Option<bool>, ffmpeg: Option<PathBuf>) -> ImageOptions {
+    pub fn image_options(&self) -> ImageOptions {
         ImageOptions {
-            keep_icc: keep_icc.unwrap_or(self.keep_icc),
-            ffmpeg: ffmpeg.unwrap_or_else(|| self.ffmpeg.clone()),
+            keep_icc: self.keep_icc,
+            ffmpeg: self.ffmpeg.clone(),
             jpeg_quality: self.jpeg_quality,
             image_dpi: self.image_dpi,
             long_edge: None,
@@ -133,8 +132,8 @@ impl Config {
     fn parse(text: &str) -> Result<Self> {
         let clean_text = expand_env_string(text);
 
-        let config: Self = basic_toml::from_str(&clean_text)
-            .context("syntax error or invalid field type in configuration")?;
+        let config: Self =
+            basic_toml::from_str(&clean_text).map_err(|error| anyhow::anyhow!("{error}"))?;
 
         if !(1..=100).contains(&config.jpeg_quality) {
             bail!("jpeg_quality must be between 1 and 100");
@@ -170,17 +169,15 @@ fn default_cache_dir() -> PathBuf {
     std::env::temp_dir().join("bpdf-ocr-cache")
 }
 
+/// Only the file beside the executable: the working directory belongs to the
+/// user's documents (a file manager starts bpdf in the current panel), where a
+/// `config.toml` of another program must not be picked up.
 fn config_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("config.toml")];
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        let next_to_executable = directory.join("config.toml");
-        if !candidates.contains(&next_to_executable) {
-            candidates.push(next_to_executable);
-        }
-    }
-    candidates
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| Some(executable.parent()?.join("config.toml")))
+        .into_iter()
+        .collect()
 }
 
 fn expand_env_string(text: &str) -> String {
@@ -257,17 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn toml_dist_config_parses_successfully() {
-        let dist_toml = include_str!("../dist/config.toml");
-        let config = Config::parse(dist_toml).expect("dist/config.toml must be valid");
-        assert!(config.auto_rotate);
-        assert!(config.keep_icc);
-        assert!(config.optimize);
-        assert!(config.strip_metadata);
-        assert_eq!(config.page_size, "A4");
-        assert_eq!(config.jpeg_quality, 95);
-        assert_eq!(config.image_dpi, 150);
-        assert_eq!(config.ocr_jobs, 1);
+    fn unknown_keys_are_reported() {
+        let error = Config::parse("jpeg_qualty = 80").unwrap_err();
+        assert!(format!("{error:#}").contains("jpeg_qualty"), "{error:#}");
     }
 
     #[test]

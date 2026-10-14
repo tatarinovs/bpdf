@@ -5,11 +5,11 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use super::common::{edit_pdf, same_path, suffixed_output, write_output};
-use crate::cli::{MetadataCommand, NumberArgs, StampArgs, WatermarkArgs};
+use crate::cli::{MetadataArgs, NumberArgs, StampArgs, WatermarkArgs};
 use crate::config::Config;
 use crate::output;
 use crate::pdf;
-use crate::pdf::transform::{self, StampMode, StampOptions};
+use crate::pdf::transform::{self, StampOptions};
 use crate::stamp_picker;
 use crate::textpdf::{self, TextMarkStyle};
 
@@ -40,9 +40,21 @@ pub fn extract(input: &Path, pages: &str, output_path: Option<&Path>) -> Result<
     )
 }
 
+pub fn info(input: &Path) -> Result<()> {
+    let (report, data) = pdf::info(input)?;
+    output::data("info", &report, data);
+    Ok(())
+}
+
 pub fn text(input: &Path, output_path: Option<&Path>) -> Result<()> {
     let document = pdf::load(input)?;
     let text = pdf::extract_text(&document)?;
+    if text.trim().is_empty() {
+        output::warn(format!(
+            "{} has no text layer; use `bpdf ocr` to recognise it",
+            input.display()
+        ));
+    }
     if let Some(output_path) = output_path {
         write_output(output_path, text.as_bytes())?;
     } else {
@@ -56,32 +68,18 @@ pub fn text(input: &Path, output_path: Option<&Path>) -> Result<()> {
 }
 
 pub fn stamp(args: StampArgs, config: &Config) -> Result<()> {
-    let StampArgs {
-        input,
-        stamp,
-        out,
-        position,
-        scale,
-        dpi,
-        opacity,
-        pages,
-        mode,
-        blend,
-        pick,
-    } = args;
     let mut options = StampOptions {
-        path: stamp,
-        position,
-        scale,
-        dpi,
-        opacity,
-        pages,
-        mode: StampMode::parse(&mode)?,
-        blend_mode: transform::BlendMode::parse(&blend)?,
+        path: args.stamp,
+        position: args.position,
+        scale: args.scale,
+        dpi: args.dpi,
+        opacity: args.opacity,
+        pages: args.pages,
+        blend_mode: transform::BlendMode::parse(&args.blend)?,
         placements: Vec::new(),
     };
-    if pick {
-        match stamp_picker::pick(&input, &options, config.browser.as_deref())? {
+    if args.pick {
+        match stamp_picker::pick(&args.input, &options, config.browser.as_deref())? {
             Some(placements) => options.placements = placements,
             None => {
                 output::info("Stamp placement cancelled; nothing was written");
@@ -89,7 +87,7 @@ pub fn stamp(args: StampArgs, config: &Config) -> Result<()> {
             }
         }
     }
-    edit_pdf(&input, out, "stamped", |document| {
+    edit_pdf(&args.input, &args.output, "stamped", |document| {
         transform::apply_stamp(document, &options)
     })
 }
@@ -105,20 +103,15 @@ pub fn number(args: NumberArgs, config: &Config) -> Result<()> {
         opacity: args.opacity,
         color: args.color,
         pages: args.pages,
-        under: false,
     };
-    let offset = args.start - 1;
-    edit_pdf(&args.input, args.out, "numbered", |document| {
-        textpdf::add_text_marks(
-            document,
-            &style,
-            config.font_path.as_deref(),
-            |number, total| {
-                args.format
-                    .replace("{n}", &(number as i64 + offset).to_string())
-                    .replace("{total}", &(total as i64 + offset).to_string())
-            },
-        )
+    // The first numbered page gets `--start`; {total} is the last number.
+    let label = |ordinal: usize, count: usize| {
+        args.format
+            .replace("{n}", &(args.start + ordinal as i64 - 1).to_string())
+            .replace("{total}", &(args.start + count as i64 - 1).to_string())
+    };
+    edit_pdf(&args.input, &args.output, "numbered", |document| {
+        textpdf::add_text_marks(document, &style, config.font_path.as_deref(), label)
     })
 }
 
@@ -133,50 +126,28 @@ pub fn watermark(args: WatermarkArgs, config: &Config) -> Result<()> {
         opacity: args.opacity,
         color: args.color,
         pages: args.pages,
-        under: args.under,
     };
-    edit_pdf(&args.input, args.out, "watermarked", |document| {
+    edit_pdf(&args.input, &args.output, "watermarked", |document| {
         textpdf::add_text_marks(document, &style, config.font_path.as_deref(), |_, _| {
             args.text.clone()
         })
     })
 }
 
-pub fn metadata(command: MetadataCommand) -> Result<()> {
-    match command {
-        MetadataCommand::Show { input } => {
-            let report = pdf::metadata_report(&input)?;
-            let text = format!("{}\n", serde_json::to_string_pretty(&report)?);
-            output::data("metadata", &text, report);
-            Ok(())
-        }
-        MetadataCommand::Set {
-            input,
-            out,
-            title,
-            author,
-            subject,
-            keywords,
-            creator,
-        } => {
-            if [&title, &author, &subject, &keywords, &creator]
-                .iter()
-                .all(|value| value.is_none())
-            {
-                bail!("metadata set requires at least one field");
-            }
-            edit_pdf(&input, out, "metadata", |document| {
-                transform::set_info_fields(
-                    document,
-                    &[
-                        ("Title", title.as_deref()),
-                        ("Author", author.as_deref()),
-                        ("Subject", subject.as_deref()),
-                        ("Keywords", keywords.as_deref()),
-                        ("Creator", creator.as_deref()),
-                    ],
-                )
-            })
-        }
+pub fn metadata(args: MetadataArgs) -> Result<()> {
+    let fields = [
+        ("Title", args.title.as_deref()),
+        ("Author", args.author.as_deref()),
+        ("Subject", args.subject.as_deref()),
+        ("Keywords", args.keywords.as_deref()),
+        ("Creator", args.creator.as_deref()),
+    ];
+    if fields.iter().all(|(_, value)| value.is_none()) {
+        bail!(
+            "set at least one of --title, --author, --subject, --keywords, --creator; `bpdf info` shows the current values"
+        );
     }
+    edit_pdf(&args.input, &args.output, "metadata", |document| {
+        transform::set_info_fields(document, &fields)
+    })
 }

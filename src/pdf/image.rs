@@ -41,7 +41,7 @@ pub fn extract_images(
     })
 }
 
-fn page_images(
+pub(crate) fn page_images(
     document: &Document,
     page_number: u32,
     page_id: ObjectId,

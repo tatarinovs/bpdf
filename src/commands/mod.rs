@@ -8,7 +8,6 @@ mod rotate;
 mod strip;
 
 use anyhow::{Result, bail};
-use serde_json::json;
 
 use crate::cli::Command;
 use crate::config::Config;
@@ -19,71 +18,28 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
     match command {
         Command::Merge(args) => merge::run(args, &config, fail_fast),
         Command::Ocr(args) => ocr::run(args, &config, fail_fast),
-        Command::Split { input, output_dir } => pdf_edit::split(&input, output_dir.as_deref()),
-        Command::Extract {
-            input,
-            pages,
-            output,
-        } => pdf_edit::extract(&input, &pages, output.as_deref()),
-        Command::Inspect { input, text } => {
-            let report = pdf::inspect_file(&input, text)?;
-            output::data(
-                "inspect",
-                &report,
-                json!({"path": input.to_string_lossy(), "report": report}),
-            );
-            Ok(())
-        }
-        Command::Strip(args) => strip::run(args, &config, fail_fast),
-        Command::Rotate {
-            inputs,
-            degrees,
-            orient,
-            pages,
-            out,
-        } => rotate::run(
-            &inputs,
-            degrees,
-            orient.as_deref(),
-            &pages,
-            out.as_deref(),
-            &config,
-            fail_fast,
-        ),
-        Command::Resize {
-            inputs,
-            size,
-            long_edge,
-            short_edge,
-            pages,
-            out,
-        } => resize::run(
-            &inputs,
-            &size,
-            long_edge,
-            short_edge,
-            &pages,
-            out.as_deref(),
-            &config,
-            fail_fast,
-        ),
+        Command::Split { input, out } => pdf_edit::split(&input, out.as_deref()),
+        Command::Extract { input, pages, out } => pdf_edit::extract(&input, &pages, out.as_deref()),
+        Command::Info { input } => pdf_edit::info(&input),
         Command::Text { input, out } => pdf_edit::text(&input, out.as_deref()),
-        Command::Doctor(args) => doctor::run(&config, &args),
+        Command::Strip(args) => strip::run(args, &config, fail_fast),
+        Command::Rotate(args) => rotate::run(args, &config, fail_fast),
+        Command::Resize(args) => resize::run(args, &config, fail_fast),
+        Command::Optimize(args) => {
+            let mut document = pdf::load(&args.input)?;
+            optimize_document(&mut document, &config);
+            let bytes = pdf_bytes(document, &config, args.max_size)?;
+            common::write_output(
+                &common::edited_output(&args.input, &args.output, "optimized"),
+                &bytes,
+            )
+        }
         Command::Stamp(args) => pdf_edit::stamp(args, &config),
         Command::Number(args) => pdf_edit::number(args, &config),
         Command::Watermark(args) => pdf_edit::watermark(args, &config),
-        Command::Optimize {
-            input,
-            out,
-            max_size,
-        } => {
-            let output = out.unwrap_or_else(|| common::suffixed_output(&input, "optimized", "pdf"));
-            let mut document = pdf::load(&input)?;
-            optimize_document(&mut document, &config);
-            common::write_output(&output, &pdf_bytes(document, &config, max_size)?)
-        }
-        Command::Metadata { command } => pdf_edit::metadata(command),
+        Command::Metadata(args) => pdf_edit::metadata(args),
         Command::Convert(args) => convert::run(args, &config, fail_fast),
+        Command::Doctor => doctor::run(&config),
     }
 }
 

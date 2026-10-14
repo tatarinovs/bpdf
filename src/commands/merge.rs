@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::common::{
     DOCUMENT_SEPARATOR, batch, finish_batch, handle_results, join_numbers, reject_output_collision,
@@ -17,7 +17,7 @@ use crate::input::{self, LoadOptions};
 use crate::office::OfficeOptions;
 use crate::output;
 use crate::pdf;
-use crate::pdf::transform::{self, StampMode, StampOptions};
+use crate::pdf::transform;
 use crate::textpdf::TextOptions;
 
 pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
@@ -35,7 +35,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         "none" | "original" | "keep"
     );
     let options = LoadOptions {
-        image: config.image_options(args.keep_icc, args.ffmpeg),
+        image: config.image_options(),
         office: OfficeOptions {
             powershell: config.powershell.clone(),
             timeout: Duration::from_secs(config.office_timeout_seconds),
@@ -62,7 +62,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let mut documents = Vec::with_capacity(specs.len());
     let mut bookmarks = Vec::new();
     let mut current_page = 1u32;
-    let generate_bookmarks = args.bookmarks.unwrap_or(config.bookmarks);
+    let generate_bookmarks = MergeArgs::switch(args.bookmarks, args.no_bookmarks, config.bookmarks);
 
     let failures = handle_results(
         loads,
@@ -96,7 +96,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         output::info("Adding outline bookmarks...");
         transform::create_bookmarks(&mut document, &bookmarks)?;
     }
-    if !args.no_rotate && args.auto_rotate.unwrap_or(config.auto_rotate) {
+    if MergeArgs::switch(args.auto_rotate, args.no_auto_rotate, config.auto_rotate) {
         let pages = transform::auto_rotate(&mut document)?;
         if !pages.is_empty() {
             output::info(format!("Auto-rotated pages: {}", join_numbers(&pages)));
@@ -104,84 +104,49 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     }
     if !keep_original_size {
         output::info(format!("Resizing pages to {page_size}..."));
-        if args.no_rotate {
-            transform::resize_pages_preserving_orientation(&mut document, &page_size, "all")?;
-        } else {
-            transform::resize_pages(&mut document, &page_size, "all")?;
-        }
+        transform::resize_pages(&mut document, &page_size, "all")?;
     }
-    if let Some(path) = args.stamp {
-        output::info(format!("Applying stamp {}...", path.display()));
-        transform::apply_stamp(
-            &mut document,
-            &StampOptions {
-                path,
-                position: args.stamp_pos,
-                scale: args.stamp_scale,
-                dpi: args.stamp_dpi,
-                opacity: args.stamp_op,
-                pages: args.stamp_pages,
-                mode: StampMode::parse(&args.stamp_mode)?,
-                blend_mode: transform::BlendMode::parse(&args.stamp_blend)?,
-                placements: Vec::new(),
-            },
-        )?;
-    }
-    if args.optimize.unwrap_or(config.optimize) {
+    if MergeArgs::switch(args.optimize, args.no_optimize, config.optimize) {
         output::info("Optimizing document...");
         optimize_document(&mut document, config);
     }
-    if args.strip_meta.unwrap_or(config.strip_metadata) {
+    if MergeArgs::switch(args.strip_meta, args.no_strip_meta, config.strip_metadata) {
         output::info("Stripping document metadata...");
         pdf::strip_document_metadata(&mut document);
     }
-    transform::set_info_properties(
-        &mut document,
-        args.author.as_deref().unwrap_or(&config.author),
-        args.creator.as_deref().unwrap_or(&config.creator),
-    )?;
+    transform::set_info_properties(&mut document, &config.author, &config.creator)?;
 
     write_output(&output, &super::pdf_bytes(document, config, args.max_size)?)?;
     finish_batch("merge", specs.len(), failures, 1)
 }
 
 fn merge_text(specs: &[InputSpec], output_path: &Path, fail_fast: bool) -> Result<()> {
-    let mut result = String::new();
-    let mut count = 0;
-    for spec in specs {
-        match crate::encoding::read_text(&spec.path) {
-            Ok(content) => {
-                if count != 0 {
-                    result.push_str(DOCUMENT_SEPARATOR);
-                }
-                result.push_str(&content);
-                count += 1;
-            }
-            Err(error) if fail_fast => {
-                return Err(error)
-                    .with_context(|| format!("failed to read {}", spec.path.display()));
-            }
-            Err(error) => output::warn(format!("Skipping {}: {error:#}", spec.path.display())),
-        }
+    let texts = specs
+        .iter()
+        .map(|spec| (&spec.path, crate::encoding::read_text(&spec.path)));
+    let mut parts = Vec::with_capacity(specs.len());
+    let failures = handle_results(texts, fail_fast, "failed to read", "Skipping", |text| {
+        parts.push(text);
+    })?;
+    if parts.is_empty() {
+        return finish_batch("merge", specs.len(), failures, 0);
     }
-    if count == 0 {
-        return finish_batch("merge", specs.len(), specs.len(), 0);
-    }
-    write_output(output_path, result.as_bytes())?;
-    finish_batch("merge", specs.len(), specs.len() - count, 1)
+    write_output(output_path, parts.join(DOCUMENT_SEPARATOR).as_bytes())?;
+    finish_batch("merge", specs.len(), failures, 1)
 }
 
+/// `first.pdf` for a single non-PDF input, otherwise `first_merged.pdf`;
+/// a name already on disk or among the inputs moves on to `_merged_2`, ...
 fn default_output(specs: &[InputSpec]) -> PathBuf {
     let first = &specs[0].path;
+    let taken = |path: &Path| path.exists() || specs.iter().any(|spec| same_path(path, &spec.path));
     let candidate = first.with_extension("pdf");
-    if specs.len() == 1 && !same_path(first, &candidate) {
+    if specs.len() == 1 && !taken(&candidate) {
         return candidate;
     }
-    // A previous result selected together with its sources must not block the merge.
-    let is_input = |path: &Path| specs.iter().any(|spec| same_path(path, &spec.path));
     let mut output = suffixed_output(first, "merged", "pdf");
     let mut index = 2;
-    while is_input(&output) {
+    while taken(&output) {
         output = suffixed_output(first, &format!("merged_{index}"), "pdf");
         index += 1;
     }

@@ -8,24 +8,6 @@ use super::{image as pdf_image, object_number, paper_size, parse_page_selection}
 use crate::imageconv::{self, Orientation};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StampMode {
-    Auto,
-    Over,
-    Under,
-}
-
-impl StampMode {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "over" => Ok(Self::Over),
-            "under" => Ok(Self::Under),
-            _ => bail!("stamp mode must be auto, over or under"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlendMode {
     Normal,
     Multiply,
@@ -72,6 +54,19 @@ impl BlendMode {
             .find(|(mode, _)| *mode == self)
             .map_or(b"Normal", |(_, name)| name.as_bytes())
     }
+
+    /// CSS `mix-blend-mode` value, for the stamp picker preview.
+    pub fn css_name(self) -> String {
+        let name = String::from_utf8_lossy(self.to_pdf_name());
+        let mut css = String::with_capacity(name.len() + 1);
+        for (index, character) in name.char_indices() {
+            if index > 0 && character.is_ascii_uppercase() {
+                css.push('-');
+            }
+            css.push(character.to_ascii_lowercase());
+        }
+        css
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +77,6 @@ pub struct StampOptions {
     pub dpi: Option<f64>,
     pub opacity: f64,
     pub pages: String,
-    pub mode: StampMode,
     pub blend_mode: BlendMode,
     /// Explicit placements; when non-empty they replace position, scale and
     /// pages.
@@ -237,33 +231,16 @@ pub fn orient_pages(document: &mut Document, pages: &str, orient: Orientation) -
     Ok(())
 }
 
+/// Fit the visible area (CropBox) of every selected page onto the paper,
+/// keeping each page's orientation; pages already of that size stay as is.
 pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<()> {
-    resize_pages_with_orientation(document, size, pages, false)
-}
-
-pub fn resize_pages_preserving_orientation(
-    document: &mut Document,
-    size: &str,
-    pages: &str,
-) -> Result<()> {
-    resize_pages_with_orientation(document, size, pages, true)
-}
-
-fn resize_pages_with_orientation(
-    document: &mut Document,
-    size: &str,
-    pages: &str,
-    preserve_orientation: bool,
-) -> Result<()> {
     let (portrait_width, portrait_height) = paper_size(size)?;
     let pages = selected_pages(document, pages)?;
-    let common_landscape = (!preserve_orientation)
-        .then(|| dominant_landscape(pages.iter().map(|(_, _, geometry)| *geometry)));
     let suffix_id = document.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec()));
 
-    for (_, page_id, geometry) in pages {
-        let landscape = common_landscape.unwrap_or_else(|| geometry.is_landscape());
-        let (display_width, display_height) = if landscape {
+    for (_, page_id, _) in pages {
+        let geometry = page_crop_geometry(document, page_id)?;
+        let (display_width, display_height) = if geometry.is_landscape() {
             (portrait_height, portrait_width)
         } else {
             (portrait_width, portrait_height)
@@ -274,12 +251,25 @@ fn resize_pages_with_orientation(
             (display_width, display_height)
         };
 
+        let (left, bottom) = (
+            geometry.left.min(geometry.right),
+            geometry.bottom.min(geometry.top),
+        );
+        let fits = |actual: f64, target: f64| (actual - target).abs() < 0.5;
+        let media = page_geometry(document, page_id)?;
+        if left == 0.0
+            && bottom == 0.0
+            && fits(geometry.raw_width(), target_width)
+            && fits(geometry.raw_height(), target_height)
+            && fits(media.raw_width(), target_width)
+            && fits(media.raw_height(), target_height)
+        {
+            continue;
+        }
         let scale =
             (target_width / geometry.raw_width()).min(target_height / geometry.raw_height());
-        let translate_x =
-            (target_width - geometry.raw_width() * scale) / 2.0 - geometry.left * scale;
-        let translate_y =
-            (target_height - geometry.raw_height() * scale) / 2.0 - geometry.bottom * scale;
+        let translate_x = (target_width - geometry.raw_width() * scale) / 2.0 - left * scale;
+        let translate_y = (target_height - geometry.raw_height() * scale) / 2.0 - bottom * scale;
         let prefix = format!("q\n{scale:.8} 0 0 {scale:.8} {translate_x:.8} {translate_y:.8} cm\n");
         let prefix_id = document.add_object(Stream::new(dictionary! {}, prefix.into_bytes()));
         wrap_page_contents(document, page_id, prefix_id, suffix_id)?;
@@ -422,15 +412,7 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
             "q\n{gstate}{a:.6} {b:.6} {c:.6} {d:.6} {e:.6} {f:.6} cm\n/{stamp_name} Do\nQ\n"
         );
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-
-        let under = match options.mode {
-            StampMode::Under => true,
-            StampMode::Over => false,
-            StampMode::Auto => document
-                .get_page_fonts(page_id)
-                .is_ok_and(|fonts| !fonts.is_empty()),
-        };
-        isolation.add_overlay(document, page_id, content_id, under)?;
+        isolation.add_overlay(document, page_id, content_id)?;
     }
     Ok(())
 }
@@ -450,13 +432,12 @@ impl ContentIsolation {
         }
     }
 
-    /// Draw `content_id` beneath (`under`) or above the page content.
+    /// Draw `content_id` above the page content.
     pub(crate) fn add_overlay(
         &self,
         document: &mut Document,
         page_id: ObjectId,
         content_id: ObjectId,
-        under: bool,
     ) -> Result<()> {
         let old = document
             .get_dictionary(page_id)?
@@ -464,17 +445,12 @@ impl ContentIsolation {
             .ok()
             .cloned();
         let mut contents = Vec::new();
-        if under {
-            contents.push(Object::Reference(content_id));
-        }
         if old.is_some() {
             contents.push(Object::Reference(self.push));
             append_content_objects(document, &mut contents, old);
             contents.push(Object::Reference(self.pop));
         }
-        if !under {
-            contents.push(Object::Reference(content_id));
-        }
+        contents.push(Object::Reference(content_id));
         document
             .get_object_mut(page_id)?
             .as_dict_mut()?
@@ -1008,11 +984,8 @@ pub(crate) fn scan_paper_factor(
     const PAPERS: [(f64, f64); 2] = [(595.28, 841.89), (612.0, 792.0)];
     let short = geometry.raw_width().min(geometry.raw_height());
     let long = geometry.raw_width().max(geometry.raw_height());
-    if short <= A3_SHORT * 1.2
-        || document
-            .get_page_fonts(page_id)
-            .is_ok_and(|fonts| !fonts.is_empty())
-    {
+    // Fonts are no criterion: an OCR text layer must not change the result.
+    if short <= A3_SHORT * 1.2 {
         return 1.0;
     }
     let Ok(images) = document.get_page_images(page_id) else {
@@ -1285,27 +1258,13 @@ mod tests {
     }
 
     #[test]
-    fn resize_uses_majority_instead_of_first_page() {
+    fn resize_keeps_each_page_orientation() {
         let mut document = one_page();
         duplicate_first_page(&mut document);
         duplicate_first_page(&mut document);
         rotate_pages(&mut document, "2-3", 90).unwrap();
 
         resize_pages(&mut document, "A4", "all").unwrap();
-        assert!(document.get_pages().into_values().all(|page_id| {
-            let geometry = page_geometry(&document, page_id).unwrap();
-            geometry.display_width() < geometry.display_height()
-        }));
-    }
-
-    #[test]
-    fn resize_can_preserve_each_page_orientation() {
-        let mut document = one_page();
-        duplicate_first_page(&mut document);
-        duplicate_first_page(&mut document);
-        rotate_pages(&mut document, "2-3", 90).unwrap();
-
-        resize_pages_preserving_orientation(&mut document, "A4", "all").unwrap();
         let orientations = document
             .get_pages()
             .into_values()
@@ -1454,7 +1413,6 @@ mod tests {
                 dpi: Some(96.0),
                 opacity: 0.5,
                 pages: "all".to_owned(),
-                mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
                 placements: Vec::new(),
             },
@@ -1495,7 +1453,6 @@ mod tests {
                 dpi: Some(96.0),
                 opacity: 1.0,
                 pages: "all".to_owned(),
-                mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
                 placements: Vec::new(),
             },
@@ -1601,7 +1558,6 @@ mod tests {
                 dpi: Some(96.0),
                 opacity: 1.0,
                 pages: "all".to_owned(),
-                mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
                 placements: Vec::new(),
             },
@@ -1676,7 +1632,6 @@ mod tests {
                 dpi: Some(96.0),
                 opacity: 0.5,
                 pages: "all".to_owned(),
-                mode: StampMode::Over,
                 blend_mode: BlendMode::Normal,
                 placements: Vec::new(),
             },

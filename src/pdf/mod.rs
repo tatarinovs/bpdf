@@ -113,86 +113,95 @@ pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
     Ok(result)
 }
 
-pub fn inspect_file(path: &Path, include_text: bool) -> Result<String> {
+/// Human-readable report and JSON data describing a PDF: version, page
+/// geometry, fonts, images and document properties.
+pub fn info(path: &Path) -> Result<(String, Value)> {
     let document = load(path)?;
     let pages = document.get_pages();
     let mut report = format!(
-        "PDF version: {}\nPages: {}\n",
+        "File: {}
+PDF version: {}
+Pages: {}
+",
+        path.display(),
         document.version,
         pages.len()
     );
-
+    let mut page_data = Vec::with_capacity(pages.len());
     for (number, page_id) in &pages {
-        let fonts = document
-            .get_page_fonts(*page_id)
-            .map(|items| items.len())
-            .unwrap_or_default();
-        let images = document
-            .get_page_images(*page_id)
-            .map(|items| items.len())
-            .unwrap_or_default();
-        report.push_str(&format!("Page {number}: fonts={fonts}, images={images}\n"));
+        let count = |items: Result<usize, lopdf::Error>| items.unwrap_or_default();
+        let fonts = count(document.get_page_fonts(*page_id).map(|items| items.len()));
+        let images = count(document.get_page_images(*page_id).map(|items| items.len()));
+        let crop = transform::page_crop_geometry(&document, *page_id).ok();
+        let (width, height, rotation) = crop.map_or((0.0, 0.0, 0), |geometry| {
+            (
+                geometry.display_width(),
+                geometry.display_height(),
+                geometry.rotation,
+            )
+        });
+        let millimetres = |points: f64| points * 25.4 / 72.0;
+        report.push_str(&format!(
+            "Page {number}: {width:.0}x{height:.0} pt ({:.0}x{:.0} mm), rotate={rotation}, fonts={fonts}, images={images}
+",
+            millimetres(width),
+            millimetres(height),
+        ));
+        page_data.push(json!({
+            "page": number,
+            "width": width,
+            "height": height,
+            "rotate": rotation,
+            "fonts": fonts,
+            "images": images,
+        }));
     }
 
-    if include_text {
-        let text = extract_text(&document)?;
-        report.push_str("\n--- text ---\n");
-        report.push_str(&text);
-        if !text.ends_with('\n') {
-            report.push('\n');
-        }
-    }
-
-    Ok(report)
-}
-
-pub fn metadata_report(path: &Path) -> Result<Value> {
-    let document = load(path)?;
     let mut fields = serde_json::Map::new();
-    if let Ok(info_object) = document.trailer.get(b"Info") {
-        let info = match info_object {
-            Object::Reference(id) => document.get_dictionary(*id).ok(),
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        };
-        if let Some(info) = info {
-            for key in [
-                "Title",
-                "Author",
-                "Subject",
-                "Keywords",
-                "Creator",
-                "Producer",
-                "CreationDate",
-                "ModDate",
-            ] {
-                if let Ok(value) = info.get(key.as_bytes()) {
-                    fields.insert(key.to_owned(), Value::String(pdf_text(value)));
-                }
+    let info = match document.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) => document.get_dictionary(*id).ok(),
+        Ok(Object::Dictionary(dictionary)) => Some(dictionary),
+        _ => None,
+    };
+    if let Some(info) = info {
+        for key in [
+            "Title",
+            "Author",
+            "Subject",
+            "Keywords",
+            "Creator",
+            "Producer",
+            "CreationDate",
+            "ModDate",
+        ] {
+            if let Ok(value) = info.get(key.as_bytes()) {
+                let value = pdf_text(value);
+                report.push_str(&format!(
+                    "{key}: {value}
+"
+                ));
+                fields.insert(key.to_owned(), Value::String(value));
             }
         }
     }
-
     let has_xmp = document
         .catalog()
         .ok()
         .is_some_and(|catalog| catalog.get(b"Metadata").is_ok());
-    let page_metadata = document
-        .get_pages()
-        .into_values()
-        .filter(|page_id| {
-            document
-                .get_dictionary(*page_id)
-                .ok()
-                .is_some_and(|page| page.get(b"Metadata").is_ok())
-        })
-        .count();
-    Ok(json!({
+    if has_xmp {
+        report.push_str(
+            "XMP metadata: present
+",
+        );
+    }
+    let data = json!({
         "path": path.to_string_lossy(),
+        "version": document.version,
+        "pages": page_data,
         "fields": fields,
         "xmp": has_xmp,
-        "pages_with_metadata": page_metadata,
-    }))
+    });
+    Ok((report, data))
 }
 
 pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -355,48 +364,29 @@ impl ObjectCopier<'_> {
     }
 }
 
+/// Remove document properties, XMP packets and private application data
+/// from every object, and EXIF/XMP segments from embedded JPEG images
+/// (their pixels and colour profiles are kept as they are).
 pub fn strip_document_metadata(document: &mut Document) {
-    if let Ok(root_id) = document.trailer.get(b"Root").and_then(Object::as_reference)
-        && let Ok(catalog) = document
-            .get_object_mut(root_id)
-            .and_then(Object::as_dict_mut)
-    {
-        remove_keys(catalog, &[b"Metadata", b"PieceInfo"]);
-    }
-
-    let page_ids = document.get_pages().into_values().collect::<Vec<_>>();
-    for page_id in page_ids {
-        if let Ok(page) = document
-            .get_object_mut(page_id)
-            .and_then(Object::as_dict_mut)
-        {
-            remove_keys(page, &[b"Metadata", b"PieceInfo"]);
+    for object in document.objects.values_mut() {
+        match object {
+            Object::Dictionary(dictionary) => remove_keys(dictionary, &[b"Metadata", b"PieceInfo"]),
+            Object::Stream(stream) => {
+                remove_keys(&mut stream.dict, &[b"Metadata", b"PieceInfo"]);
+                if let Some(jpeg) = image::embedded_jpeg(stream)
+                    && let Ok(clean) = crate::metadata::strip_jpeg(jpeg, true)
+                    && clean.len() < jpeg.len()
+                {
+                    stream.set_content(clean);
+                }
+            }
+            _ => {}
         }
     }
-
-    if let Ok(info_id) = document.trailer.get(b"Info").and_then(Object::as_reference)
-        && let Ok(info) = document
-            .get_object_mut(info_id)
-            .and_then(Object::as_dict_mut)
-    {
-        remove_keys(
-            info,
-            &[
-                b"Title",
-                b"Author",
-                b"Subject",
-                b"Keywords",
-                b"Creator",
-                b"Producer",
-                b"CreationDate",
-                b"ModDate",
-                b"Trapped",
-            ],
-        );
+    document.trailer.remove(b"Info");
+    if !document.trailer.has(b"Encrypt") {
+        document.trailer.remove(b"ID");
     }
-
-    document.prune_objects();
-    document.renumber_objects();
 }
 
 pub fn save_to_bytes(document: &mut Document) -> Result<Vec<u8>> {
@@ -809,9 +799,7 @@ mod tests {
                 .get(b"PieceInfo")
                 .is_err()
         );
-        let clean_info_id = clean.trailer.get(b"Info").unwrap().as_reference().unwrap();
-        let clean_info = clean.get_dictionary(clean_info_id).unwrap();
-        assert!(clean_info.get(b"Title").is_err());
-        assert!(clean_info.get(b"Producer").is_err());
+        assert!(clean.trailer.get(b"Info").is_err());
+        assert!(!String::from_utf8_lossy(&stripped).contains("secret"));
     }
 }

@@ -25,7 +25,7 @@ pub struct LoadOptions {
 pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
     match formats::detect(&spec.path) {
         Some(format) if format.is_image() => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             let jpegs = imageconv::to_jpegs_for_pdf(
                 &spec.path,
                 &options.image,
@@ -45,11 +45,11 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             Ok(document)
         }
         Some(Format::Cbz) => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             crate::archive::load_cbz(&spec.path, &options.image, Some(&options.text.page_size))
         }
         Some(format) if format.is_office() => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             match office::convert_to_pdf(&spec.path, &options.office) {
                 Ok(bytes) => Document::load_mem(&bytes).with_context(|| {
                     format!("Office output for {} is invalid", spec.path.display())
@@ -68,15 +68,15 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             }
         }
         Some(Format::Html) => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             load_html(&spec.path, &options.html, &options.text)
         }
         Some(Format::Text) => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             textpdf::render(&crate::encoding::read_text(&spec.path)?, &options.text)
         }
         Some(format) if format.is_ebook() => {
-            reject_pages(spec)?;
+            spec.reject_pages()?;
             let text = crate::ebook::load(&spec.path, format)?;
             textpdf::render(&text, &options.text)
         }
@@ -98,13 +98,4 @@ fn load_html(path: &Path, html: &HtmlOptions, text: &TextOptions) -> Result<Docu
             textpdf::render(&crate::ebook::convert_html_to_text(&source), text)
         }
     }
-}
-
-fn reject_pages(spec: &InputSpec) -> Result<()> {
-    if spec.pages.is_some() {
-        return Err(crate::commands::common::err_pdf_only_page_ranges(
-            &spec.path,
-        ));
-    }
-    Ok(())
 }

@@ -7,6 +7,7 @@ use lopdf::Document;
 use serde_json::json;
 
 use crate::atomic::write_atomic;
+use crate::cli::OutputArgs;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
 use crate::imageconv::{self, ImageOptions};
@@ -86,12 +87,12 @@ pub fn write_output(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn edit_pdf<F>(input: &Path, output: Option<PathBuf>, suffix: &str, edit: F) -> Result<()>
+pub fn edit_pdf<F>(input: &Path, output: &OutputArgs, suffix: &str, edit: F) -> Result<()>
 where
     F: FnOnce(&mut Document) -> Result<()>,
 {
-    let output = output.unwrap_or_else(|| suffixed_output(input, suffix, "pdf"));
-    write_output(&output, &pdf::transform_file(input, edit)?)
+    let bytes = pdf::transform_file(input, edit)?;
+    write_output(&edited_output(input, output, suffix), &bytes)
 }
 
 pub fn suffixed_output(input: &Path, suffix: &str, extension: &str) -> PathBuf {
@@ -100,6 +101,36 @@ pub fn suffixed_output(input: &Path, suffix: &str, extension: &str) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("document");
     input.with_file_name(format!("{stem}_{suffix}.{extension}"))
+}
+
+/// Destination of an edited file: the source itself with `--in-place`, the
+/// `--out` file or a same-named file inside the `--out` directory, otherwise
+/// `NAME_<suffix>.<ext>` beside the source.
+pub fn edited_output(input: &Path, output: &OutputArgs, suffix: &str) -> PathBuf {
+    if output.in_place {
+        return input.to_owned();
+    }
+    match &output.out {
+        Some(directory) if directory.is_dir() => {
+            directory.join(input.file_name().unwrap_or_default())
+        }
+        Some(file) => file.clone(),
+        None => {
+            let extension = input
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("pdf");
+            suffixed_output(input, suffix, extension)
+        }
+    }
+}
+
+/// A file `--out` names one destination, so it takes exactly one input.
+pub fn validate_output(output: &OutputArgs, count: usize) -> Result<()> {
+    if count > 1 && output.out.as_ref().is_some_and(|path| !path.is_dir()) {
+        bail!("--out must be an existing directory when there are several inputs");
+    }
+    Ok(())
 }
 
 pub fn same_path(left: &Path, right: &Path) -> bool {
@@ -148,6 +179,26 @@ impl OutputRegistry {
         }
         Ok(())
     }
+
+    /// `path`, or `path` with `_2`, `_3`... added to its stem when an earlier
+    /// call already took it.
+    pub fn unique(&mut self, path: PathBuf) -> PathBuf {
+        let mut candidate = path.clone();
+        let mut index = 2;
+        while !self.destinations.insert(path_key(&candidate)) {
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("output");
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            candidate = path.with_file_name(format!("{stem}_{index}.{extension}"));
+            index += 1;
+        }
+        candidate
+    }
 }
 
 pub fn reject_output_collision(output: &Path, inputs: &[InputSpec]) -> Result<()> {
@@ -168,35 +219,16 @@ pub fn join_numbers(values: &[u32]) -> String {
         .join(",")
 }
 
-pub fn resolve_in_place_output(input: &Path, explicit_out: Option<&Path>, verb: &str) -> PathBuf {
-    let output_path = explicit_out
-        .map(|p| {
-            if p.is_dir() {
-                p.join(input.file_name().unwrap_or_default())
-            } else {
-                p.to_path_buf()
-            }
-        })
-        .unwrap_or_else(|| input.to_path_buf());
-
-    if same_path(input, &output_path) {
-        crate::output::info(format!("{} in-place: {}", verb, input.display()));
-    }
-
-    output_path
-}
-
 /// Shared driver for commands that edit PDFs page-wise and JPEGs pixel-wise
-/// (`rotate`, `resize`), writing in place or to `--out`.
+/// (`rotate`, `resize`).
 pub struct PdfOrJpegEdit<'a, F> {
     pub operation: &'a str,
-    pub verb: &'a str,
+    pub suffix: &'a str,
     pub formats: InputFormatSet,
     pub pages: &'a str,
-    pub out: Option<&'a Path>,
-    pub image_options: ImageOptions,
-    /// Page size used to fit JPEGs, if any.
-    pub jpeg_page_size: Option<&'a str>,
+    pub output: &'a OutputArgs,
+    /// How JPEGs are re-encoded, or the reason they cannot be edited.
+    pub jpeg: std::result::Result<ImageOptions, &'a str>,
     pub edit_pdf: F,
 }
 
@@ -206,7 +238,7 @@ where
 {
     pub fn run(&self, inputs: &[String], fail_fast: bool) -> Result<()> {
         let specs = expand(inputs, self.formats)?;
-        validate_single_out(self.out, specs.len())?;
+        validate_output(self.output, specs.len())?;
         let results = batch(&specs, fail_fast, |spec| (&spec.path, self.edit_one(spec)));
         let failures = handle_results(
             results,
@@ -225,36 +257,26 @@ where
 
     fn edit_one(&self, spec: &InputSpec) -> Result<()> {
         let input = &spec.path;
-        let output_path = resolve_in_place_output(input, self.out, self.verb);
         let bytes = match formats::detect(input) {
             Some(Format::Pdf) => {
                 let pages = spec.pages.as_deref().unwrap_or(self.pages);
                 pdf::transform_file(input, |document| (self.edit_pdf)(document, pages))?
             }
             Some(Format::Jpeg) => {
-                if spec.pages.is_some() || self.pages != "all" {
-                    return Err(err_pdf_only_page_ranges(input));
+                spec.reject_pages()?;
+                if self.pages != "all" {
+                    bail!("--pages is only valid for PDF inputs: {}", input.display());
                 }
-                imageconv::to_jpeg(input, &self.image_options, self.jpeg_page_size)?
+                let options = self
+                    .jpeg
+                    .as_ref()
+                    .map_err(|reason| anyhow::anyhow!("{reason}"))?;
+                imageconv::to_jpeg(input, options, None)?
             }
             _ => bail!("unsupported input: {}", input.display()),
         };
-        write_output(&output_path, &bytes)
+        write_output(&edited_output(input, self.output, self.suffix), &bytes)
     }
-}
-
-pub fn err_pdf_only_page_ranges(input: &Path) -> anyhow::Error {
-    anyhow::anyhow!(
-        "page ranges are only valid for PDF inputs: {}",
-        input.display()
-    )
-}
-
-pub fn validate_single_out(out: Option<&Path>, count: usize) -> Result<()> {
-    if out.is_some() && count != 1 {
-        bail!("--out is only valid with one input file");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

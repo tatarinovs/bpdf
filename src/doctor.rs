@@ -3,77 +3,111 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde_json::json;
 
-use crate::cli::DoctorArgs;
 use crate::config::Config;
 use crate::ocr::{OcrEngine, OcrOptions};
 use crate::office::{self, OfficeOptions};
 use crate::{output, process, textpdf};
 
-pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
-    if args.clean_cache {
-        let (removed, bytes) = clean_cache(&config.ocr_cache_dir)?;
-        output::result(
-            "clean_cache",
-            format!(
-                "Cleaned OCR cache at {}: removed {removed} file(s), freed {bytes} bytes",
-                config.ocr_cache_dir.display()
-            ),
-            json!({
-                "cache_dir": config.ocr_cache_dir.display().to_string(),
-                "removed_files": removed,
-                "bytes_freed": bytes,
-            }),
-        );
+/// Outcome of one check. Optional integrations only warn: bpdf works
+/// without them, just not for the formats or engines they provide.
+#[derive(Clone, Copy, PartialEq)]
+enum Status {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl Status {
+    fn from(ok: bool, otherwise: Self) -> Self {
+        if ok { Self::Ok } else { otherwise }
     }
 
-    let mut failures = 0usize;
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+}
 
-    check(
+#[derive(Default)]
+struct Report {
+    warnings: usize,
+    failures: usize,
+}
+
+impl Report {
+    fn check(&mut self, name: &str, status: Status, detail: impl AsRef<str>) {
+        match status {
+            Status::Ok => {}
+            Status::Warn => self.warnings += 1,
+            Status::Fail => self.failures += 1,
+        }
+        let detail = detail.as_ref();
+        output::result(
+            "doctor_check",
+            format!("[{}] {name}: {detail}", status.label()),
+            json!({"name": name, "status": status.label(), "detail": detail}),
+        );
+    }
+}
+
+pub fn run(config: &Config) -> Result<()> {
+    let mut report = Report::default();
+    let groq_used = config.ocr_engine.eq_ignore_ascii_case("groq")
+        || config.ocr_engine.eq_ignore_ascii_case("auto");
+
+    report.check(
         "config",
-        true,
-        config
-            .source_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "not found; built-in defaults are active".to_owned()),
-        &mut failures,
-    );
-    check(
-        "groq_api_key",
-        !config.groq_api_key.trim().is_empty(),
-        if config.groq_api_key.trim().is_empty() {
-            "not configured"
-        } else {
-            "configured (redacted)"
-        },
-        &mut failures,
+        Status::Ok,
+        config.source_path.as_ref().map_or_else(
+            || "not found; built-in defaults are active".to_owned(),
+            |path| path.display().to_string(),
+        ),
     );
 
-    let ffmpeg_ok = probe_command(&config.ffmpeg, &["-version"]);
-    let ffmpeg_status = if ffmpeg_ok {
-        "available"
-    } else {
-        "not available"
-    };
-    check("ffmpeg", ffmpeg_ok, ffmpeg_status, &mut failures);
+    match textpdf::find_font(config.font_path.as_deref()) {
+        Ok(path) => report.check("font", Status::Ok, path.display().to_string()),
+        Err(error) => report.check("font", Status::Fail, format!("{error:#}")),
+    }
+
+    if config.ocr_cache {
+        match probe_cache(&config.ocr_cache_dir) {
+            Ok(()) => report.check(
+                "ocr_cache",
+                Status::Ok,
+                config.ocr_cache_dir.display().to_string(),
+            ),
+            Err(error) => report.check("ocr_cache", Status::Fail, format!("{error:#}")),
+        }
+    }
+
+    let ffmpeg = probe_command(&config.ffmpeg, &["-version"]);
+    report.check(
+        "ffmpeg",
+        Status::from(ffmpeg, Status::Warn),
+        if ffmpeg {
+            "available"
+        } else {
+            "not available; HEIC, AVIF, PSD, JPEG 2000 and similar formats cannot be read"
+        },
+    );
 
     let wic = crate::wic::availability();
     let raw_status = match (&wic, config.raw_develop) {
-        (Ok(name), true) => format!("develop mode active: {name}"),
-        (Err(error), true) => format!("develop mode active, but WIC codec failed: {error:#}"),
-        (Ok(_), false) => {
-            "available (pure Rust preview default, WIC develop codec installed)".to_owned()
-        }
-        (Err(_), false) => "available (pure Rust preview default)".to_owned(),
+        (Ok(name), true) => format!("develop mode: {name}"),
+        (Err(error), true) => format!("develop mode, but the WIC codec failed: {error:#}"),
+        (Ok(_), false) => "embedded previews (WIC develop codec also installed)".to_owned(),
+        (Err(_), false) => "embedded previews".to_owned(),
     };
-    check(
+    report.check(
         "raw_decoder",
-        !config.raw_develop || wic.is_ok(),
+        Status::from(!config.raw_develop || wic.is_ok(), Status::Fail),
         raw_status,
-        &mut failures,
     );
 
     let office_options = OfficeOptions {
@@ -87,121 +121,82 @@ pub fn run(config: &Config, args: &DoctorArgs) -> Result<()> {
                 ("excel", availability.excel),
                 ("powerpoint", availability.powerpoint),
             ] {
-                let detail = if found {
-                    "COM registration found"
-                } else {
-                    "COM registration not found"
-                };
-                check(name, found, detail, &mut failures);
+                report.check(
+                    name,
+                    Status::from(found, Status::Warn),
+                    if found {
+                        "COM registration found"
+                    } else {
+                        "not installed; only the text of such documents is merged"
+                    },
+                );
             }
         }
-        Err(error) => {
-            check("word", false, format!("{error:#}"), &mut failures);
-            check("excel", false, "Office probe failed", &mut failures);
-            check("powerpoint", false, "Office probe failed", &mut failures);
-        }
+        Err(error) => report.check("office", Status::Warn, format!("{error:#}")),
     }
 
     match crate::html::find_browser(config.browser.as_deref()) {
-        Ok(path) => check("browser", true, path.display().to_string(), &mut failures),
-        Err(error) => check("browser", false, format!("{error:#}"), &mut failures),
+        Ok(path) => report.check("browser", Status::Ok, path.display().to_string()),
+        Err(error) => report.check("browser", Status::Warn, format!("{error:#}")),
     }
 
-    match textpdf::find_font(config.font_path.as_deref()) {
-        Ok(path) => check("font", true, path.display().to_string(), &mut failures),
-        Err(error) => check("font", false, format!("{error:#}"), &mut failures),
-    }
-
-    match probe_cache(&config.ocr_cache_dir) {
-        Ok(()) => check(
-            "ocr_cache",
-            true,
-            config.ocr_cache_dir.display().to_string(),
-            &mut failures,
-        ),
-        Err(error) => check("ocr_cache", false, format!("{error:#}"), &mut failures),
-    }
-
-    let win_ocr_langs = crate::winocr::available_languages();
-    match win_ocr_langs {
-        Ok(langs) if !langs.is_empty() => {
-            check(
-                "windows_ocr",
-                true,
-                format!("available (languages: {})", langs.join(", ")),
-                &mut failures,
-            );
-        }
-        Ok(_) => {
-            check(
-                "windows_ocr",
-                false,
-                "no OCR language packs installed",
-                &mut failures,
-            );
-        }
-        Err(error) => {
-            check("windows_ocr", false, format!("{error:#}"), &mut failures);
-        }
-    }
-
-    let network_result = OcrEngine::new(OcrOptions::from_config(config))
-        .and_then(|engine| engine.check_connection());
-    let network_ok = network_result.is_ok();
-    if config.proxy.trim().is_empty() {
-        check(
-            "proxy",
-            true,
-            "not configured; direct connection selected",
-            &mut failures,
-        );
+    // Required only when it is the configured engine; `auto` can use Groq.
+    let windows_ocr_missing = if groq_used {
+        Status::Warn
     } else {
-        check(
-            "proxy",
-            network_ok,
-            if network_ok {
-                "configured proxy accepted the Groq request"
-            } else {
-                "configured, but the network check failed"
-            },
-            &mut failures,
-        );
-    }
-    match network_result {
-        Ok(()) => check(
-            "groq",
-            true,
-            "authentication and models endpoint available",
-            &mut failures,
+        Status::Fail
+    };
+    match crate::winocr::available_languages() {
+        Ok(languages) if !languages.is_empty() => report.check(
+            "windows_ocr",
+            Status::Ok,
+            format!("languages: {}", languages.join(", ")),
         ),
-        Err(error) => check("groq", false, format!("{error:#}"), &mut failures),
+        Ok(_) => report.check(
+            "windows_ocr",
+            windows_ocr_missing,
+            "no OCR language packs installed",
+        ),
+        Err(error) => report.check("windows_ocr", windows_ocr_missing, format!("{error:#}")),
+    }
+
+    let missing_key = if groq_used {
+        Status::Fail
+    } else {
+        Status::Warn
+    };
+    if config.groq_api_key.trim().is_empty() {
+        report.check("groq", missing_key, "groq_api_key is not configured");
+    } else {
+        let network = OcrEngine::new(OcrOptions::from_config(config))
+            .and_then(|engine| engine.check_connection());
+        let via = if config.proxy.trim().is_empty() {
+            "direct connection"
+        } else {
+            "configured proxy"
+        };
+        match network {
+            Ok(()) => report.check("groq", Status::Ok, format!("API key accepted ({via})")),
+            Err(error) => report.check("groq", missing_key, format!("{via}: {error:#}")),
+        }
     }
 
     output::result(
         "doctor_summary",
-        format!("Doctor completed: {failures} failure(s)"),
-        json!({"failures": failures, "ok": failures == 0}),
+        format!(
+            "Doctor completed: {} failure(s), {} warning(s)",
+            report.failures, report.warnings
+        ),
+        json!({
+            "failures": report.failures,
+            "warnings": report.warnings,
+            "ok": report.failures == 0,
+        }),
     );
-    if failures != 0 {
-        bail!("doctor found {failures} failed check(s)");
+    if report.failures != 0 {
+        bail!("doctor found {} failed check(s)", report.failures);
     }
     Ok(())
-}
-
-fn check(name: &str, ok: bool, detail: impl AsRef<str>, failures: &mut usize) {
-    if !ok {
-        *failures += 1;
-    }
-    let message = format!(
-        "[{}] {name}: {}",
-        if ok { "OK" } else { "FAIL" },
-        detail.as_ref()
-    );
-    output::result(
-        "doctor_check",
-        message,
-        json!({"name": name, "ok": ok, "detail": detail.as_ref()}),
-    );
 }
 
 fn probe_command(program: &Path, args: &[&str]) -> bool {
@@ -217,47 +212,4 @@ fn probe_cache(directory: &Path) -> Result<()> {
     fs::write(&path, b"bpdf")?;
     fs::remove_file(path)?;
     Ok(())
-}
-
-pub fn clean_cache(directory: &Path) -> Result<(usize, u64)> {
-    if !directory.exists() {
-        return Ok((0, 0));
-    }
-    let mut removed_count = 0usize;
-    let mut bytes_freed = 0u64;
-    let entries = fs::read_dir(directory)
-        .with_context(|| format!("failed to read cache directory {}", directory.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Ok(meta) = entry.metadata() {
-                bytes_freed = bytes_freed.saturating_add(meta.len());
-            }
-            if fs::remove_file(&path).is_ok() {
-                removed_count += 1;
-            }
-        }
-    }
-    Ok((removed_count, bytes_freed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn cleans_cache_directory_files_and_counts_bytes() {
-        let temp = tempdir().unwrap();
-        let file1 = temp.path().join("a.json");
-        let file2 = temp.path().join("b.md");
-        fs::write(&file1, b"12345").unwrap();
-        fs::write(&file2, b"1234567").unwrap();
-
-        let (count, bytes) = clean_cache(temp.path()).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(bytes, 12);
-        assert!(!file1.exists());
-        assert!(!file2.exists());
-    }
 }

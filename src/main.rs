@@ -1,8 +1,5 @@
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
-    // Report-only commands keep their window open when launched from a file manager.
-    let has = |name: &str| args.iter().any(|a| a == name);
-    let shows_report = has("inspect") || has("doctor") || (has("metadata") && has("show"));
     // Checked before any child process (ffmpeg, browser, Office) can attach to the console.
     let standalone = owns_console();
 
@@ -11,7 +8,7 @@ fn main() {
         bpdf::report_error(error);
         pause_if(standalone);
         std::process::exit(1);
-    } else if shows_report {
+    } else if bpdf::shows_report() {
         pause_if(standalone);
     }
 }

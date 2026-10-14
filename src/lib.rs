@@ -60,12 +60,26 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
         Err(error) => return Err(anyhow!(error.to_string())),
     };
     output::init(cli.quiet, cli.json);
+    // Report-only commands keep their window open when launched from a file manager.
+    if matches!(
+        cli.command,
+        cli::Command::Info { .. } | cli::Command::Doctor
+    ) {
+        SHOWS_REPORT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let config = Config::load(cli.config.as_deref())?;
     commands::run(cli.command, config, cli.fail_fast)
 }
 
 pub fn report_error(error: &anyhow::Error) {
     output::error(format!("{error:#}"));
+}
+
+static SHOWS_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True after parsing a command whose output is a report to read.
+pub fn shows_report() -> bool {
+    SHOWS_REPORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn is_json_mode() -> bool {

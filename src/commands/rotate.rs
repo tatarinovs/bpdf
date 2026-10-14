@@ -1,329 +1,202 @@
-use std::path::Path;
-
 use anyhow::{Result, bail};
 
 use super::common::PdfOrJpegEdit;
+use crate::cli::RotateArgs;
 use crate::config::Config;
 use crate::formats::InputFormatSet;
 use crate::imageconv::Orientation;
 use crate::pdf::transform;
 
-pub fn run(
-    inputs: &[String],
-    degrees: Option<i64>,
-    orient: Option<&str>,
-    pages: &str,
-    out: Option<&Path>,
-    config: &Config,
-    fail_fast: bool,
-) -> Result<()> {
-    let mut image_options = config.image_options(None, None);
-    image_options.force_reencode = true;
-    let orientation = match (degrees, orient) {
-        (Some(degrees), None) => {
+/// A rotation by a multiple of 90 degrees or to a target orientation.
+#[derive(Clone, Copy, Debug)]
+enum Turn {
+    By(i64),
+    To(Orientation),
+}
+
+impl Turn {
+    fn parse(value: &str) -> Result<Self> {
+        if let Ok(degrees) = value.trim().parse::<i64>() {
             if degrees % 90 != 0 {
                 bail!("rotation must be a multiple of 90 degrees");
             }
-            image_options.rotation_degrees = Some(degrees);
-            None
+            return Ok(Self::By(degrees));
         }
-        (None, Some(orient)) => {
-            let orientation = Orientation::parse(orient)?;
-            image_options.orient = Some(orientation);
-            Some(orientation)
-        }
-        (Some(_), Some(_)) => bail!("cannot specify both degrees and --orient"),
-        (None, None) => bail!("either degrees or --orient must be specified"),
-    };
+        Orientation::parse(value).map(Self::To)
+    }
+}
+
+pub fn run(args: RotateArgs, config: &Config, fail_fast: bool) -> Result<()> {
+    let turn = Turn::parse(&args.angle)?;
+    let mut image_options = config.image_options();
+    image_options.force_reencode = true;
+    match turn {
+        Turn::By(degrees) => image_options.rotation_degrees = Some(degrees),
+        Turn::To(orientation) => image_options.orient = Some(orientation),
+    }
 
     PdfOrJpegEdit {
         operation: "rotate",
-        verb: "Rotating",
+        suffix: "rotated",
         formats: InputFormatSet::Rotate,
-        pages,
-        out,
-        image_options,
-        jpeg_page_size: None,
-        edit_pdf: |document: &mut lopdf::Document, pages: &str| match orientation {
-            Some(orientation) => transform::orient_pages(document, pages, orientation),
-            None => transform::rotate_pages(document, pages, degrees.unwrap_or(0)),
+        pages: &args.pages,
+        output: &args.output,
+        jpeg: Ok(image_options),
+        edit_pdf: |document: &mut lopdf::Document, pages: &str| match turn {
+            Turn::By(degrees) => transform::rotate_pages(document, pages, degrees),
+            Turn::To(orientation) => transform::orient_pages(document, pages, orientation),
         },
     }
-    .run(inputs, fail_fast)
+    .run(&args.inputs, fail_fast)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use image::GenericImageView;
+
     use super::*;
+    use crate::cli::OutputArgs;
     use crate::commands::common::test_utils::*;
     use crate::pdf;
-    use image::GenericImageView;
-    use std::fs;
 
-    #[test]
-    fn refuses_multiple_inputs_with_explicit_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first.png");
-        let second = dir.path().join("second.png");
-        sample_png(&first);
-        sample_png(&second);
-        let out = dir.path().join("out.jpg");
-
-        let error = run(
-            &[
-                first.to_string_lossy().into_owned(),
-                second.to_string_lossy().into_owned(),
-            ],
-            Some(90),
-            None,
-            "all",
-            Some(&out),
+    fn rotate(inputs: &[&Path], angle: &str, pages: &str, out: Option<PathBuf>) -> Result<()> {
+        run(
+            RotateArgs {
+                inputs: inputs
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect(),
+                angle: angle.to_owned(),
+                pages: pages.to_owned(),
+                output: OutputArgs {
+                    in_place: out.is_none(),
+                    out,
+                },
+            },
             &Config::default(),
             true,
         )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("--out is only valid with one input file"));
     }
 
     #[test]
-    fn refuses_invalid_rotation_degrees() {
+    fn refuses_several_inputs_with_an_output_file() {
         let dir = tempfile::tempdir().unwrap();
-        let pdf = dir.path().join("sample.pdf");
-        sample_pdf(&pdf);
-
-        let error = run(
-            &[pdf.to_string_lossy().into_owned()],
-            Some(45),
-            None,
+        let (first, second) = (dir.path().join("a.jpg"), dir.path().join("b.jpg"));
+        sample_jpeg(&first, 4, 2);
+        sample_jpeg(&second, 4, 2);
+        let error = rotate(
+            &[&first, &second],
+            "90",
             "all",
-            None,
-            &Config::default(),
-            true,
+            Some(dir.path().join("x.jpg")),
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("rotation must be a multiple of 90 degrees"));
+        assert!(format!("{error:#}").contains("existing directory"));
     }
 
     #[test]
-    fn refuses_invalid_orientation() {
+    fn several_inputs_go_into_an_output_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let pdf = dir.path().join("sample.pdf");
-        sample_pdf(&pdf);
+        let (first, second) = (dir.path().join("a.jpg"), dir.path().join("b.jpg"));
+        sample_jpeg(&first, 4, 2);
+        sample_jpeg(&second, 4, 2);
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        rotate(&[&first, &second], "90", "all", Some(out.clone())).unwrap();
+        assert_eq!(image::open(out.join("b.jpg")).unwrap().dimensions(), (2, 4));
+    }
 
-        let error = run(
-            &[pdf.to_string_lossy().into_owned()],
-            None,
-            Some("diagonal"),
-            "all",
-            None,
+    #[test]
+    fn default_output_gets_a_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("photo.jpg");
+        sample_jpeg(&input, 4, 2);
+        run(
+            RotateArgs {
+                inputs: vec![input.to_string_lossy().into_owned()],
+                angle: "90".to_owned(),
+                pages: "all".to_owned(),
+                output: OutputArgs {
+                    out: None,
+                    in_place: false,
+                },
+            },
             &Config::default(),
             true,
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(image::open(&input).unwrap().dimensions(), (4, 2));
+        let rotated = dir.path().join("photo_rotated.jpg");
+        assert_eq!(image::open(rotated).unwrap().dimensions(), (2, 4));
+    }
+
+    #[test]
+    fn refuses_invalid_angles() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("sample.pdf");
+        sample_pdf(&pdf);
+        let error = rotate(&[&pdf], "45", "all", None).unwrap_err();
+        assert!(format!("{error:#}").contains("multiple of 90"));
+        let error = rotate(&[&pdf], "diagonal", "all", None).unwrap_err();
         assert!(format!("{error:#}").contains("invalid orientation 'diagonal'"));
     }
 
     #[test]
-    fn rotates_jpeg_file_and_updates_dimensions() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("photo.jpg");
-        let output = dir.path().join("rotated.jpg");
-        sample_jpeg(&input, 200, 100);
-
-        run(
-            &[input.to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "all",
-            Some(&output),
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        assert!(output.is_file());
-        let img = image::open(&output).unwrap();
-        assert_eq!(img.dimensions(), (100, 200));
-    }
-
-    #[test]
-    fn rotates_jpeg_in_place() {
+    fn rotates_and_orients_jpeg_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("photo.jpg");
         sample_jpeg(&input, 200, 100);
-
-        run(
-            &[input.to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        let img = image::open(&input).unwrap();
-        assert_eq!(img.dimensions(), (100, 200));
+        rotate(&[&input], "-90", "all", None).unwrap();
+        assert_eq!(image::open(&input).unwrap().dimensions(), (100, 200));
+        rotate(&[&input], "portrait", "all", None).unwrap();
+        assert_eq!(image::open(&input).unwrap().dimensions(), (100, 200));
+        rotate(&[&input], "landscape", "all", None).unwrap();
+        assert_eq!(image::open(&input).unwrap().dimensions(), (200, 100));
     }
 
     #[test]
-    fn orients_jpeg_to_portrait_and_landscape() {
+    fn refuses_pages_on_jpeg_and_unsupported_formats() {
         let dir = tempfile::tempdir().unwrap();
-        let wide = dir.path().join("wide.jpg");
-        sample_jpeg(&wide, 200, 100);
-
-        // Wide image to portrait -> rotated to 100x200
-        run(
-            &[wide.to_string_lossy().into_owned()],
-            None,
-            Some("portrait"),
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        let img = image::open(&wide).unwrap();
-        assert_eq!(img.dimensions(), (100, 200));
-
-        // Now tall image to landscape -> rotated back to 200x100
-        run(
-            &[wide.to_string_lossy().into_owned()],
-            None,
-            Some("landscape"),
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        let img2 = image::open(&wide).unwrap();
-        assert_eq!(img2.dimensions(), (200, 100));
-    }
-
-    #[test]
-    fn refuses_page_ranges_on_jpeg() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("photo.jpg");
-        sample_jpeg(&input, 200, 100);
-
-        let error = run(
-            &[input.to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "1-2",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("page ranges are only valid for PDF inputs"));
-    }
-
-    #[test]
-    fn refuses_unsupported_format_direct_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = dir.path().join("photo.png");
-        sample_png(&input);
-
-        let error = run(
-            &[input.to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap_err();
+        let jpeg = dir.path().join("photo.jpg");
+        let png = dir.path().join("photo.png");
+        sample_jpeg(&jpeg, 4, 2);
+        sample_png(&png);
+        let error = rotate(&[&jpeg], "90", "1-2", None).unwrap_err();
+        assert!(format!("{error:#}").contains("only valid for PDF inputs"));
+        let error = rotate(&[&png], "90", "all", None).unwrap_err();
         assert!(format!("{error:#}").contains("unsupported input"));
     }
 
     #[test]
-    fn ignores_unsupported_formats_in_directory() {
+    fn directory_input_skips_unsupported_formats() {
         let dir = tempfile::tempdir().unwrap();
         let jpeg = dir.path().join("photo.jpg");
-        let pdf = dir.path().join("document.pdf");
-        let png = dir.path().join("ignored.png");
         let txt = dir.path().join("ignored.txt");
         sample_jpeg(&jpeg, 200, 100);
-        sample_pdf(&pdf);
-        sample_png(&png);
+        sample_pdf(&dir.path().join("document.pdf"));
         fs::write(&txt, "hello world").unwrap();
-
-        run(
-            &[dir.path().to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        // JPEG was rotated
-        let img = image::open(&jpeg).unwrap();
-        assert_eq!(img.dimensions(), (100, 200));
-
-        // PNG was left untouched
-        let png_img = image::open(&png).unwrap();
-        assert_eq!(png_img.dimensions(), (2, 2));
-
-        // TXT was left untouched
+        rotate(&[dir.path()], "90", "all", None).unwrap();
+        assert_eq!(image::open(&jpeg).unwrap().dimensions(), (100, 200));
         assert_eq!(fs::read_to_string(&txt).unwrap(), "hello world");
     }
 
     #[test]
-    fn rotates_pdf_file() {
+    fn rotates_and_orients_pdf() {
         let dir = tempfile::tempdir().unwrap();
         let pdf = dir.path().join("sample.pdf");
-        let out = dir.path().join("rotated.pdf");
         sample_pdf(&pdf);
-
-        run(
-            &[pdf.to_string_lossy().into_owned()],
-            Some(90),
-            None,
-            "all",
-            Some(&out),
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        assert!(out.is_file());
-        let doc = pdf::load(&out).unwrap();
-        let page_id = *doc.get_pages().get(&1).unwrap();
-        let geom = transform::page_geometry(&doc, page_id).unwrap();
-        assert_eq!(geom.rotation, 90);
-    }
-
-    #[test]
-    fn orients_pdf_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let pdf = dir.path().join("sample.pdf");
-        sample_pdf(&pdf); // A4 portrait by default in sample_pdf (595x842)
-
-        // Orient to landscape
-        run(
-            &[pdf.to_string_lossy().into_owned()],
-            None,
-            Some("landscape"),
-            "all",
-            None,
-            &Config::default(),
-            true,
-        )
-        .unwrap();
-
-        let doc = pdf::load(&pdf).unwrap();
-        let page_id = *doc.get_pages().get(&1).unwrap();
-        let geom = transform::page_geometry(&doc, page_id).unwrap();
-        assert_eq!(geom.rotation, 90);
-        assert!(geom.display_width() > geom.display_height());
+        let rotation = |path: &Path| {
+            let document = pdf::load(path).unwrap();
+            let page_id = *document.get_pages().get(&1).unwrap();
+            transform::page_geometry(&document, page_id).unwrap()
+        };
+        let out = dir.path().join("rotated.pdf");
+        rotate(&[&pdf], "90", "all", Some(out.clone())).unwrap();
+        assert_eq!(rotation(&out).rotation, 90);
+        rotate(&[&pdf], "landscape", "all", None).unwrap();
+        assert!(rotation(&pdf).is_landscape());
     }
 }

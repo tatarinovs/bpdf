@@ -29,16 +29,25 @@ impl Default for TextOptions {
     }
 }
 
-/// Recognised words of one existing PDF page, in page units measured from
-/// the top-left corner.
+/// Recognised words of one existing PDF page, in points of the displayed
+/// page measured from its top-left corner.
 #[derive(Clone, Debug)]
 pub struct PageTextOverlay {
     pub page_id: ObjectId,
+    /// `cm` matrix from the displayed page (origin bottom-left) to the page's
+    /// user space; it accounts for `/Rotate` and the box origin.
+    pub matrix: [f64; 6],
     pub page_width: f64,
     pub page_height: f64,
     pub scaled_words: Vec<OcrWordBox>,
     pub fallback_text: Option<String>,
 }
+
+/// Resource name (or its prefix) of the font of bpdf's OCR text layer.
+pub const OCR_FONT_NAME: &str = "BpdfF0";
+
+/// The identity `cm` matrix.
+pub const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// A loaded TrueType font that records which glyphs a document uses, so only
 /// those are embedded.
@@ -344,7 +353,7 @@ pub fn overlay_searchable_text(
         .map(|overlay| overlay.page_id)
         .collect::<Vec<_>>();
     let font_name =
-        crate::pdf::transform::free_resource_name(document, &page_ids, b"Font", "BpdfF0");
+        crate::pdf::transform::free_resource_name(document, &page_ids, b"Font", OCR_FONT_NAME);
     let font_data = load_font(font_path)?;
     let mut font = FontWriter::new(&font_data)?;
     let ascender = f64::from(font.face.ascender());
@@ -353,7 +362,8 @@ pub fn overlay_searchable_text(
     // Glyph usage must be complete before the font is embedded.
     let mut page_contents = Vec::with_capacity(overlays.len());
     for overlay in overlays {
-        let mut content = String::from("\nq\nBT\n3 Tr\n");
+        let [a, b, c, d, e, f] = overlay.matrix;
+        let mut content = format!("\nq\n{a:.6} {b:.6} {c:.6} {d:.6} {e:.3} {f:.3} cm\nBT\n3 Tr\n");
         if !overlay.scaled_words.is_empty() {
             let mut line_y = None;
             for word in &overlay.scaled_words {
@@ -439,11 +449,12 @@ pub struct TextMarkStyle {
     pub opacity: f64,
     pub color: [f64; 3],
     pub pages: String,
-    pub under: bool,
 }
 
-/// Draw `text_for(page_number, page_count)` on the selected pages. Text stays
-/// horizontal relative to the displayed page whatever its /Rotate value.
+/// Draw `text_for(ordinal, count)` over the selected pages, where `ordinal`
+/// counts the selected pages from 1. Position and size refer to the visible
+/// page (CropBox, upright after /Rotate); on oversized phone scans they are
+/// scaled to the real sheet like stamps.
 pub fn add_text_marks(
     document: &mut Document,
     style: &TextMarkStyle,
@@ -458,7 +469,6 @@ pub fn add_text_marks(
     if style.font_size < 0.0 {
         bail!("font size cannot be negative");
     }
-    let page_count = document.get_pages().len();
     let pages = transform::selected_pages(document, &style.pages)?;
     let page_ids = pages.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
     let font_name = transform::free_resource_name(document, &page_ids, b"Font", "BpdfMark");
@@ -468,15 +478,18 @@ pub fn add_text_marks(
     let (sin, cos) = style.angle.to_radians().sin_cos();
 
     let mut contents = Vec::with_capacity(pages.len());
-    for (number, page_id, geometry) in pages {
-        let text = text_for(number as usize, page_count);
+    let count = pages.len();
+    for (index, (_, page_id, media)) in pages.into_iter().enumerate() {
+        let text = text_for(index + 1, count);
         if text.trim().is_empty() {
             continue;
         }
+        let geometry = transform::page_crop_geometry(document, page_id)?;
+        let paper = transform::scan_paper_factor(document, page_id, media);
         let display = geometry.displayed();
         let unit_width = font.text_width(&text, 1.0);
         let font_size = if style.font_size > 0.0 {
-            style.font_size
+            style.font_size * paper
         } else if unit_width > 0.0 {
             // Fit the text along its direction, never taller than a fifth of the page.
             let span = if sin.abs() > 0.01 {
@@ -493,7 +506,7 @@ pub fn add_text_marks(
         // Centre of the text box on the displayed page, then the baseline
         // start rotated around it.
         let (left, bottom) =
-            transform::stamp_position(&style.position, display, width, height, 1.0)?;
+            transform::stamp_position(&style.position, display, width, height, paper)?;
         let (center_x, center_y) = (left + width / 2.0, bottom + height / 2.0);
         let (dx, dy) = (-width / 2.0, -height / 2.0);
         let (origin_x, origin_y) = geometry.display_to_page(
@@ -536,7 +549,7 @@ pub fn add_text_marks(
         }
         transform::install_resources(document, page_id, &resources)?;
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        isolation.add_overlay(document, page_id, content_id, style.under)?;
+        isolation.add_overlay(document, page_id, content_id)?;
     }
     Ok(())
 }
@@ -574,6 +587,7 @@ mod tests {
         let page_id = *document.get_pages().get(&1).unwrap();
         let overlay = PageTextOverlay {
             page_id,
+            matrix: IDENTITY,
             page_width: 842.0,
             page_height: 595.0,
             scaled_words: ["ТестовоеСлово", "второе", "Следующая"]
@@ -641,7 +655,6 @@ mod tests {
             opacity: 1.0,
             color: [0.0, 0.0, 0.0],
             pages: "all".to_owned(),
-            under: false,
         };
         if add_text_marks(&mut document, &style, None, |number, total| {
             format!("Стр. {number} из {total}")
@@ -674,7 +687,6 @@ mod tests {
             opacity: 1.0,
             color: [0.0, 0.0, 0.0],
             pages: "all".to_owned(),
-            under: false,
         };
         if add_text_marks(&mut document, &style, None, |_, _| "Первый".to_owned()).is_err() {
             return;

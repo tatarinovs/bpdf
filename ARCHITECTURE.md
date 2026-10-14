@@ -68,7 +68,7 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 ## Efficiency notes
 
 - Pixel codecs (`image`, `zune-jpeg`, `png`, inflate) are built with
-  `opt-level = 3`; the rest of the release binary stays size-optimised.
+  `opt-level = 2`; the rest of the release binary stays size-optimised.
 - Strong image reductions first average pixel blocks down to twice the
   target and only then apply the Lanczos filter.
 - `split` parses a PDF once and copies, per page, only the objects that page

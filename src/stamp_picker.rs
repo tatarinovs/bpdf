@@ -74,7 +74,7 @@ pub fn pick(
         "native": size.width,
         "dpi": options.dpi,
         "opacity": options.opacity,
-        "blend": css_blend(&format!("{:?}", options.blend_mode)),
+        "blend": options.blend_mode.css_name(),
     });
 
     let picked = serve(input, &bytes, &info.to_string(), pages.len(), browser)?;
@@ -155,16 +155,6 @@ fn placement_matrix(page: &PickerPage, stamp: &PickedStamp) -> [f64; 6] {
     transform::upright_stamp_matrix(page.crop, left, bottom, width, height)
 }
 
-fn css_blend(mode: &str) -> String {
-    match mode.to_ascii_lowercase().as_str() {
-        "colordodge" => "color-dodge".to_owned(),
-        "colorburn" => "color-burn".to_owned(),
-        "hardlight" => "hard-light".to_owned(),
-        "softlight" => "soft-light".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
 /// Runs the local server until the page posts placements or is closed.
 fn serve(
     input: &Path,
@@ -175,11 +165,10 @@ fn serve(
 ) -> Result<Option<Vec<PickedStamp>>> {
     let listener = TcpListener::bind("127.0.0.1:0").context("failed to start the stamp picker")?;
     listener.set_nonblocking(true)?;
+    // RandomState is seeded from the OS random source.
     let token = format!("{:016x}", {
-        use std::hash::{BuildHasher, Hasher};
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write_u128(Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id()));
-        hasher.finish()
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(std::process::id())
     });
     let url = format!("http://{}/{token}/", listener.local_addr()?);
     output::info(format!("Stamp picker: {url}"));
