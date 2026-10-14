@@ -1,22 +1,22 @@
 /target/
-/.edge-test-profile/
-/prototype-output/
-/config.yaml
 /dist/
-/tools/
 /stamps/
+
+# Only the build and maintenance scripts in tools/ are part of the project.
+/tools/*
 !/tools/benchmark-v1.ps1
-/artifacts/
+!/tools/draw_icons.py
+!/tools/prepare-windows-resources.ps1
+
+# Local test documents and outputs.
+*.pdf
 *.xls*
 *.doc*
-*.pdf
-*.jsonc
 *.json
-!config.example.jsonc
+*.jsonc
 *.txt
+*.png
 *.br2
-*.xip
 *.zip
 *.7z
-*.png
-
+!/resources/**

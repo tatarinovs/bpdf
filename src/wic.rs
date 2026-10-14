@@ -137,6 +137,17 @@ mod platform {
     }
 
     pub fn availability() -> Result<String> {
+        match decoder_for(".dng")? {
+            Some(name) => Ok(format!("{name} available")),
+            None => bail!(
+                "Microsoft Raw Image Extension is not installed; run winget install --id 9NCTDW2W1BH8 -s msstore"
+            ),
+        }
+    }
+
+    /// Friendly name of the installed WIC decoder that claims `extension`
+    /// (with the leading dot), if any.
+    pub fn decoder_for(extension: &str) -> Result<Option<String>> {
         let _apartment = ComApartment::initialize()?;
         // SAFETY: Creating COM factory singleton with valid CLSID
         let factory: IWICImagingFactory =
@@ -156,7 +167,7 @@ mod platform {
             // SAFETY: Fetching COM objects into valid array with count
             let status = unsafe { codecs.Next(&mut item, Some(&mut fetched)) };
             if fetched == 0 {
-                break;
+                return Ok(None);
             }
             status
                 .ok()
@@ -172,18 +183,15 @@ mod platform {
                 codec_string(|buffer, actual| unsafe { codec.GetFileExtensions(buffer, actual) })?;
             if extensions
                 .split(',')
-                .any(|extension| extension.trim().eq_ignore_ascii_case(".dng"))
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(extension))
             {
                 // SAFETY: Reading codec name into valid buffer
                 let name = codec_string(|buffer, actual| unsafe {
                     codec.GetFriendlyName(buffer, actual)
                 })?;
-                return Ok(format!("{name} available"));
+                return Ok(Some(name));
             }
         }
-        bail!(
-            "Microsoft Raw Image Extension is not installed; run winget install --id 9NCTDW2W1BH8 -s msstore"
-        )
     }
 
     fn codec_string(
@@ -204,11 +212,16 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::{Decoder, availability, decode};
+pub use platform::{Decoder, availability, decode, decoder_for};
 
 #[cfg(not(windows))]
 pub fn decode(_path: &Path) -> anyhow::Result<image::DynamicImage> {
-    anyhow::bail!("camera RAW input requires Windows and Microsoft Raw Image Extension")
+    anyhow::bail!("Windows image codecs are unavailable on this platform")
+}
+
+#[cfg(not(windows))]
+pub fn decoder_for(_extension: &str) -> anyhow::Result<Option<String>> {
+    Ok(None)
 }
 
 #[cfg(not(windows))]

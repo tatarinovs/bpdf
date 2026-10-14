@@ -24,6 +24,7 @@ mod output;
 mod parallel;
 mod pdf;
 mod process;
+mod psd;
 mod raw;
 mod stamp_picker;
 mod textpdf;

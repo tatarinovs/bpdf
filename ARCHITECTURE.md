@@ -1,7 +1,8 @@
 # bpdf architecture
 
-Since version 0.3, `bpdf` is organised around explicit command boundaries and
-shared services while keeping its executable and configuration compatible.
+`bpdf` is organised around explicit command boundaries and shared services.
+The CLI is not frozen yet: 0.8.0 unified output handling and removed redundant
+options (see `CHANGELOG.md`).
 
 ## Dependency direction
 
@@ -41,13 +42,19 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   platforms; full sensor demosaicing via Windows Imaging Component (WIC) and
   the Microsoft Raw Image Extension is supported on Windows as an opt-in mode
   or fallback.
+- PSD/PSB composites are decoded in pure Rust (`psd.rs`); layouts it does not
+  handle (32-bit, bitmap, ZIP) fall back to FFmpeg.
+- HEIC/HEIF and AVIF try the WIC adapter first and fall back to FFmpeg when
+  the codec is missing or fails mid-decode.
 - JPEG XR/HD Photo, ICO and (on Windows) all TIFF files reuse the same WIC
   adapter; the Rust TIFF decoder is compiled only for other platforms.
 - GIF, APNG, and animated WebP frames share one animation-to-JPEG iterator in
   `imageconv.rs`; `input.rs` turns the resulting frames into the normal PDF
   documents and reuses the standard page-tree merger.
 - Word, Excel, and PowerPoint share the same isolated temporary-copy and Office
-  process boundary in `office.rs`; only their COM export scripts differ.
+  process boundary in `office.rs`; their COM export scripts are generated
+  from one PowerShell template that differs only in the ProgID and export
+  call.
 - HTML pages are printed to PDF by a headless Chromium-based browser in
   `html.rs` (throwaway profile, bounded by `process::run`); without one,
   `input.rs` falls back to the HTML text extractor shared with EPUB/HTMLZ.
@@ -58,7 +65,19 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 - Embedded text fonts (`textpdf.rs`) are written by one `FontWriter` and
   subset by `font_subset.rs`, keeping glyph ids so `CIDToGIDMap /Identity`
   stays valid.
-- `rotate` and `resize` share `commands::common::PdfOrJpegEdit`.
+- `rotate` and `resize` share `commands::common::PdfOrJpegEdit`. JPEG
+  rotation is lossless: `metadata.rs` composes the EXIF orientation (rotation
+  plus mirror) and patches or inserts the tag without touching scan data.
+- Single-file edits share one output rule (`commands::common::edited_output`):
+  `NAME_<action>`, `-o` file or directory, or `-i` in place.
+- Page selection lives in `pdf/mod.rs`: `parse_page_list` keeps order and
+  repeats (`extract`, `doc.pdf:3,1,1`), `parse_page_selection` is the set form
+  used by editing commands. `select_pages` rebuilds a flat page tree and
+  materialises inherited attributes.
+- Stamps, page numbers, watermarks and the OCR text layer install their
+  resources through `transform::ResourceInstaller`, which edits a shared
+  `/Resources` dictionary once instead of copying it to every page. Overlays
+  are positioned in the visible (CropBox, rotated) area of the page.
 - Batch commands run independent inputs through `commands::common::batch`,
   which uses `parallel::map` unless `--fail-fast` requires sequential,
   lazy processing. Office conversions are serialised by a process-wide lock.
@@ -73,8 +92,18 @@ such as default output names, `--fail-fast`, summaries, and user messages.
   target and only then apply the Lanczos filter.
 - `split` parses a PDF once and copies, per page, only the objects that page
   reaches (other pages are cut off), writing pages in parallel.
-- `optimize` decodes, resamples and encodes images in parallel; grayscale
-  images stay single-channel `DeviceGray` JPEGs.
+- `optimize` sizes every image for `image_dpi` at the size it is drawn:
+  `pdf/image.rs::placements` follows `cm`, `q`/`Q` and nested form XObjects;
+  images drawn indirectly fall back to the page size, and an image shown on
+  several pages keeps the largest size any of them needs. Decoding, resampling
+  and encoding run in parallel; grayscale images stay single-channel
+  `DeviceGray` JPEGs, and lossless graphics with up to 256 colours stay
+  Flate-encoded.
+- `--max-size` bisects the quality ladder instead of walking it.
+- OCR of several inputs prepares pages in chunks and recognises them through
+  one task queue shared by all files.
+- `parallel::map` runs nested calls inline on the worker thread, so a parallel
+  stage inside a parallel batch does not multiply threads.
 - Upright RGB/grayscale DCT images are extracted from PDFs without
   recompression.
 - PDF optimization decodes an image through an immutable borrow and does not
@@ -87,7 +116,8 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 ## Verification
 
 `cargo test` covers the CLI definition (including clap's consistency checks),
-the commands and the PDF transforms. `tools/benchmark-v1.ps1` compares split timings over the same source PDF.
+the commands and the PDF transforms. `tools/benchmark-v1.ps1` compares split
+timings of two executables over the same source PDF.
 
 Live Groq OCR and Microsoft Office COM calls depend on external credentials and
 installed applications. Their internal unit tests remain part of the normal

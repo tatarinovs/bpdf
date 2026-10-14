@@ -93,7 +93,21 @@ pub fn run(config: &Config) -> Result<()> {
         if ffmpeg {
             "available"
         } else {
-            "not available; HEIC, AVIF, PSD, JPEG 2000 and similar formats cannot be read"
+            "not available; JPEG 2000, 32-bit PSD and similar formats cannot be read"
+        },
+    );
+
+    let heif_codec = crate::wic::decoder_for(".heic").ok().flatten();
+    report.check(
+        "heif_decoder",
+        Status::from(heif_codec.is_some() || ffmpeg, Status::Warn),
+        match (&heif_codec, ffmpeg) {
+            (Some(name), _) => format!("{name}; ffmpeg is the fallback"),
+            (None, true) => "ffmpeg; Windows HEIF Image Extension is not installed".to_owned(),
+            (None, false) => {
+                "none; install HEIF and HEVC Video Extensions or ffmpeg to read HEIC/AVIF"
+                    .to_owned()
+            }
         },
     );
 

@@ -88,6 +88,16 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
         Some(Format::WicRaster) => {
             return apply_transformations(crate::wic::decode(path)?, options, page_size);
         }
+        Some(Format::SystemRaster) => {
+            return apply_transformations(
+                decode_with_system_codec(path, options)?,
+                options,
+                page_size,
+            );
+        }
+        Some(Format::Psd) => {
+            return apply_transformations(decode_psd(path, options)?, options, page_size);
+        }
         Some(Format::CameraRaw) => return raw_to_jpeg(path, options, page_size),
         #[cfg(windows)]
         Some(Format::Raster) if formats::is_tiff(path) => {
@@ -306,6 +316,29 @@ pub fn optimize_for_ocr(bytes: &[u8]) -> Result<Vec<u8>> {
     resize_to_jpeg_with_filter(&image, target, 80, FilterType::CatmullRom)
 }
 
+/// HEIF and AVIF go through the Windows codec (HEIF/HEVC and AV1 extensions)
+/// and fall back to FFmpeg when the codec is missing or cannot decode the
+/// file. A missing HEVC extension only fails at pixel copy, so the fallback
+/// covers the whole decode, not just opening the file.
+fn decode_with_system_codec(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
+    let system_error = match crate::wic::decode(path) {
+        Ok(image) => return Ok(image),
+        Err(error) => error,
+    };
+    decode_with_ffmpeg(path, options)
+        .with_context(|| format!("Windows codec failed: {system_error:#}"))
+}
+
+/// PSD/PSB through the built-in composite reader; 32-bit, bitmap, ZIP and
+/// other rare layouts fall back to FFmpeg.
+fn decode_psd(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
+    let native_error = match crate::psd::decode(path) {
+        Ok(image) => return Ok(image),
+        Err(error) => error,
+    };
+    decode_with_ffmpeg(path, options).with_context(|| format!("{native_error:#}"))
+}
+
 fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImage> {
     let temporary = Builder::new().suffix(".png").tempfile()?;
     let output_path = temporary.path().to_path_buf();
@@ -314,21 +347,13 @@ fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImag
     command
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
-        // HEIC files often expose both the primary image and a thumbnail.
-        .args([
-            "-map",
-            "0:v:0",
-            "-frames:v",
-            "1",
-            "-map_metadata",
-            "-1",
-            "-pix_fmt",
-            "rgba",
-        ])
+        // No -map: FFmpeg picks the largest picture, which for HEIC is the
+        // assembled tile grid rather than one tile or the thumbnail.
+        .args(["-frames:v", "1", "-map_metadata", "-1", "-pix_fmt", "rgba"])
         .arg(&output_path);
     let output = process::run(command, Duration::from_secs(120), "ffmpeg").with_context(|| {
         format!(
-            "install ffmpeg or pass --ffmpeg {}",
+            "cannot run ffmpeg at {}; install it or set ffmpeg in config.toml",
             options.ffmpeg.display()
         )
     })?;

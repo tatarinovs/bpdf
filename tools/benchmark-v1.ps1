@@ -19,7 +19,7 @@ function Invoke-Split([string]$Exe, [string]$Label) {
     $output = Join-Path ([IO.Path]::GetTempPath()) ("bpdf-bench-" + [guid]::NewGuid().ToString('N'))
     try {
         $watch = [Diagnostics.Stopwatch]::StartNew()
-        & $Exe --quiet split $Pdf $output
+        & $Exe --quiet split $Pdf -o $output
         $watch.Stop()
         if ($LASTEXITCODE -ne 0) {
             throw "$Label failed with exit code $LASTEXITCODE"

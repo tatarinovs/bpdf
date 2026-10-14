@@ -10,19 +10,24 @@ use clap::{Args, Parser, Subcommand};
 )]
 pub struct Cli {
     /// Configuration file (otherwise config.toml beside bpdf is used).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     pub config: Option<PathBuf>,
 
     /// Suppress progress and success messages; command results are still printed.
-    #[arg(long, global = true, conflicts_with = "json")]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        conflicts_with = "json"
+    )]
     pub quiet: bool,
 
     /// Emit progress, result and error events as newline-delimited JSON.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     pub json: bool,
 
     /// Stop a batch command after its first input error.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     pub fail_fast: bool,
 
     #[command(subcommand)]

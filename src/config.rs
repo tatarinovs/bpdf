@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::imageconv::ImageOptions;
 
 pub const DEFAULT_OCR_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
-pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.6-27b";
+pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.8-27b";
 pub const DEFAULT_OCR_PROMPT: &str = "You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.";
 
 #[derive(Clone, Debug, Deserialize)]

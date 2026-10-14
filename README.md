@@ -1,6 +1,6 @@
 # bpdf — Быстрая и легкая утилита для работы с PDF и документами
 
-[![Версия](https://img.shields.io/badge/Версия-0.7.0-blue.svg)](Cargo.toml)
+[![Версия](https://img.shields.io/badge/Версия-0.8.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Платформа](https://img.shields.io/badge/Платформа-Windows-blue.svg?logo=windows)]()
 [![Language](https://img.shields.io/badge/Language-English-blue.svg)](README.en.md)
@@ -34,7 +34,9 @@
 ## Требования и внешние зависимости
 
 - **ОС:** Windows 10 / 11 (x64) или Linux / macOS.
-- **Внешние форматы изображений:** Для HEIC/HEIF, AVIF, PSD, JPEG 2000/JPEG-LS, DDS, EXR, HDR, QOI, TGA, PCX, PNM, SGI, XBM, DPX, FITS и других редких растров требуется установленный `ffmpeg` в системном `PATH` либо путь `ffmpeg` в `config.toml`. Фактический набор декодеров зависит от сборки FFmpeg.
+- **HEIC/HEIF и AVIF:** на Windows читаются системным кодеком (HEIF Image Extension вместе с HEVC Video Extension, для AVIF — AV1 Video Extension); если кодека нет или он не справился, используется `ffmpeg`.
+- **PSD/PSB:** склеенное изображение (8/16 бит, RGB, CMYK, оттенки серого, индексированные цвета) читается встроенным декодером без `ffmpeg`; 32-битные, битовые и сжатые ZIP документы передаются `ffmpeg`.
+- **Внешние форматы изображений:** Для JPEG 2000/JPEG-LS, DDS, EXR, HDR, QOI, TGA, PCX, PNM, SGI, XBM, DPX, FITS и других редких растров требуется установленный `ffmpeg` в системном `PATH` либо путь `ffmpeg` в `config.toml`. Фактический набор декодеров зависит от сборки FFmpeg.
 - **Системные форматы Windows:** JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO декодируются через встроенные кодеки Windows Imaging Component.
 - **RAW-снимки камер:** По умолчанию снимки `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.raf`, `.orf`, `.rw2` и другие мгновенно обрабатываются в **Pure Rust** путём извлечения полноразмерного встроенного превью от процессора камеры (кроссплатформенно: Windows, Linux, macOS). Полная проявка сенсора через Windows Imaging Component включается опцией `raw_develop = true` в `config.toml` (требует Microsoft Raw Image Extension: `winget install --id 9NCTDW2W1BH8 -s msstore`).
 - **Конвертация Office/OpenDocument:** Для точного рендеринга DOC/DOCX/RTF/ODT, XLS/XLSX/ODS и PPT/PPTX/PPS/PPSX/ODP в Windows используется MS Office через COM-автоматизацию. Если MS Office не установлен или запуск на Linux/macOS, автоматически срабатывает встроенный **Pure-Rust fallback**, который извлекает форматированный текст и заглавия из XML-структур документов без сторонних зависимостей.
@@ -317,7 +319,9 @@ bpdf doctor
 
 - Встроенный Rust-декодер используется для JPEG, PNG, BMP, GIF, WebP и APNG. TIFF на Windows декодируется через Windows Imaging Component, на остальных ОС — встроенным декодером. Для BMP/GIF/WebP/APNG при ошибке встроенного декодера автоматически пробуется FFmpeg.
 - Текстовые файлы и FB2 читаются с учётом BOM и XML-декларации кодировки; файлы без неё, не являющиеся UTF-8, читаются как Windows-1251.
-- Через FFmpeg (путь — `ffmpeg` в конфигурации) обрабатываются HEIC/HEIF, AVIF, PSD, JPEG 2000 (`.jp2`, `.j2k`, `.j2c`, `.jpc`, `.jpf`, `.jpx`), JPEG-LS (`.jls`), DDS, EXR, HDR, QOI, TGA, PCX, PNM (`.pnm`, `.ppm`, `.pgm`, `.pbm`, `.pam`), SGI, XBM, DPX, FITS (`.fits`, `.fit`, `.fts`), PGX, Sun Raster, XWD и PIX. Берётся первый видеопоток и первый кадр.
+- HEIC/HEIF и AVIF на Windows декодируются через Windows Imaging Component (Microsoft HEIF Decoder) с учётом поворота `irot` и сетки плиток снимков iPhone; при ошибке кодека пробуется FFmpeg, вне Windows используется только он. Прозрачность AVIF не сохраняется ни одним из путей. `bpdf doctor` показывает, какой декодер будет использован (`heif_decoder`).
+- PSD и PSB читаются встроенным декодером: берётся склеенное изображение, которое Photoshop сохраняет при включённой «Максимальной совместимости» (по умолчанию), слои не отрисовываются. Прозрачность учитывается только настоящая (сохранённые выделения её не создают) и ложится на белый. Если декодер не справился (32 бита, битовый режим, сжатие ZIP), пробуется FFmpeg.
+- Через FFmpeg (путь — `ffmpeg` в конфигурации) обрабатываются JPEG 2000 (`.jp2`, `.j2k`, `.j2c`, `.jpc`, `.jpf`, `.jpx`), JPEG-LS (`.jls`), DDS, EXR, HDR, QOI, TGA, PCX, PNM (`.pnm`, `.ppm`, `.pgm`, `.pbm`, `.pam`), SGI, XBM, DPX, FITS (`.fits`, `.fit`, `.fts`), PGX, Sun Raster, XWD и PIX. Берётся первый кадр самого крупного изображения.
 - Ориентация фотографий из EXIF учитывается: в PDF снимок встраивается без перекодирования и разворачивается матрицей отрисовки, при конвертации в JPEG сохраняется только тег ориентации (остальной EXIF удаляется), при перекодировании пиксели поворачиваются.
 - Через встроенные кодеки Windows Imaging Component обрабатываются JPEG XR/HD Photo (`.jxr`, `.wdp`, `.hdp`) и ICO. Для ICO выбирается изображение с наибольшим разрешением.
 - Снимки фотокамер `.3fr`, `.arw`, `.bay`, `.cr2`, `.cr3`, `.crw`, `.dcr`, `.dng`, `.erf`, `.fff`, `.gpr`, `.iiq`, `.k25`, `.kdc`, `.mef`, `.mos`, `.mrw`, `.nef`, `.nrw`, `.orf`, `.pef`, `.raf`, `.raw`, `.rw2`, `.rwl`, `.sr2`, `.srf`, `.srw` и `.x3f` по умолчанию декодируются в **Pure Rust** через извлечение полноразмерного JPEG-превью камеры. Полная проявка сенсора через WIC — `raw_develop = true` в `config.toml`.
@@ -420,7 +424,8 @@ ocr_timeout_seconds = 120
 ocr_max_tokens = 4096
 
 # Пути к сторонним утилитам
-# FFmpeg нужен для HEIC/HEIF, AVIF, PSD, JPEG 2000 и других внешних форматов
+# FFmpeg нужен для JPEG 2000 и других внешних форматов, а также
+# для HEIC/AVIF, если в Windows нет кодека HEIF
 ffmpeg = 'ffmpeg'
 powershell = 'powershell.exe'
 # font_path = '%WINDIR%\Fonts\arial.ttf'
@@ -461,7 +466,7 @@ bpdf ocr scan.jpg -o scan.md
 # Searchable PDF прямо в исходных сканах локальным Windows OCR
 bpdf ocr scans/*.pdf -e windows -i
 
-# Конвертация AVIF и PSD в JPEG через FFmpeg
+# Конвертация AVIF (кодек Windows) и PSD (встроенный декодер) в JPEG
 bpdf convert photo.avif design.psd --out converted
 
 # Конвертация JPEG 2000, JPEG-LS, JPEG XR и ICO в JPEG

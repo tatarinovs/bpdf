@@ -1,6 +1,6 @@
 [package]
 name = "bpdf"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Second-generation loss-conscious PDF and image processing toolkit"
@@ -59,6 +59,13 @@ windows = { version = "0.62.2", features = [
 [target.'cfg(not(windows))'.dependencies]
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 image = { version = "0.25.10", default-features = false, features = ["tiff"] }
+
+# ureq <= 3.4.2 panics on HTTPS when only "native-tls-no-default" is enabled;
+# the fix (algesten/ureq#1204) is not released yet. Drop this patch once a
+# release newer than 3.4.2 is out; "native-tls" instead would add ~116 KB of
+# unused webpki roots.
+[patch.crates-io]
+ureq = { git = "https://github.com/algesten/ureq", rev = "8fcd72a7881354400c432157e1a60222d61efc5c" }
 
 [profile.release]
 strip = true

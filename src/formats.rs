@@ -9,6 +9,10 @@ pub enum Format {
     Raster,
     FfmpegRaster,
     WicRaster,
+    /// Decoded by the Windows codec when one is installed, otherwise by FFmpeg.
+    SystemRaster,
+    /// Photoshop: the built-in reader, FFmpeg for what it does not handle.
+    Psd,
     CameraRaw,
     Pdf,
     Word,
@@ -31,6 +35,8 @@ impl Format {
                 | Self::Raster
                 | Self::FfmpegRaster
                 | Self::WicRaster
+                | Self::SystemRaster
+                | Self::Psd
                 | Self::CameraRaw
         )
     }
@@ -44,7 +50,9 @@ impl Format {
     }
 
     pub const fn requires_jpeg_conversion(self) -> bool {
-        self.requires_ffmpeg() || self.requires_wic() || matches!(self, Self::CameraRaw)
+        self.requires_ffmpeg()
+            || self.requires_wic()
+            || matches!(self, Self::SystemRaster | Self::Psd | Self::CameraRaw)
     }
 
     pub const fn is_office(self) -> bool {
@@ -97,10 +105,13 @@ pub fn detect_by_extension(path: &Path) -> Option<Format> {
         "jpg" | "jpeg" => Some(Format::Jpeg),
         "png" => Some(Format::Png),
         "bmp" | "gif" | "tiff" | "tif" | "webp" | "apng" => Some(Format::Raster),
-        "heic" | "heif" | "avif" | "psd" | "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx"
-        | "pnm" | "ppm" | "pgm" | "pbm" | "pam" | "sgi" | "xbm" | "jp2" | "j2k" | "j2c" | "jpc"
-        | "jpf" | "jpx" | "jls" | "dpx" | "fits" | "fit" | "fts" | "pgx" | "ras" | "sun"
-        | "xwd" | "pix" => Some(Format::FfmpegRaster),
+        "heic" | "heif" | "avif" => Some(Format::SystemRaster),
+        "psd" | "psb" => Some(Format::Psd),
+        "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx" | "pnm" | "ppm" | "pgm" | "pbm" | "pam"
+        | "sgi" | "xbm" | "jp2" | "j2k" | "j2c" | "jpc" | "jpf" | "jpx" | "jls" | "dpx"
+        | "fits" | "fit" | "fts" | "pgx" | "ras" | "sun" | "xwd" | "pix" => {
+            Some(Format::FfmpegRaster)
+        }
         "jxr" | "wdp" | "hdp" | "ico" => Some(Format::WicRaster),
         "3fr" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "dcr" | "dng" | "erf" | "fff" | "gpr"
         | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf" | "pef" | "raf"
@@ -223,7 +234,7 @@ mod tests {
     fn detection_is_case_insensitive() {
         assert_eq!(detect(Path::new("scan.WeBp")), Some(Format::Raster));
         assert_eq!(detect(Path::new("animation.APNG")), Some(Format::Raster));
-        assert_eq!(detect(Path::new("photo.AVIF")), Some(Format::FfmpegRaster));
+        assert_eq!(detect(Path::new("photo.AVIF")), Some(Format::SystemRaster));
         assert_eq!(detect(Path::new("scan.JP2")), Some(Format::FfmpegRaster));
         assert_eq!(detect(Path::new("photo.JXR")), Some(Format::WicRaster));
         assert_eq!(detect(Path::new("camera.CR3")), Some(Format::CameraRaw));
@@ -272,14 +283,34 @@ mod tests {
     #[test]
     fn external_raster_extensions_share_the_ffmpeg_adapter() {
         for extension in [
-            "heic", "heif", "avif", "psd", "dds", "exr", "hdr", "qoi", "tga", "pcx", "pnm", "ppm",
-            "pgm", "pbm", "pam", "sgi", "xbm", "jp2", "j2k", "j2c", "jpc", "jpf", "jpx", "jls",
-            "dpx", "fits", "fit", "fts", "pgx", "ras", "sun", "xwd", "pix",
+            "dds", "exr", "hdr", "qoi", "tga", "pcx", "pnm", "ppm", "pgm", "pbm", "pam", "sgi",
+            "xbm", "jp2", "j2k", "j2c", "jpc", "jpf", "jpx", "jls", "dpx", "fits", "fit", "fts",
+            "pgx", "ras", "sun", "xwd", "pix",
         ] {
             let path = Path::new("image").with_extension(extension);
             let format = detect(&path).unwrap();
             assert_eq!(format, Format::FfmpegRaster, "{extension}");
             assert!(format.requires_ffmpeg(), "{extension}");
+        }
+    }
+
+    #[test]
+    fn photoshop_uses_the_built_in_reader() {
+        for extension in ["psd", "PSB"] {
+            let format = detect(&Path::new("image").with_extension(extension)).unwrap();
+            assert_eq!(format, Format::Psd, "{extension}");
+            assert!(format.requires_jpeg_conversion(), "{extension}");
+            assert!(!format.requires_ffmpeg(), "{extension}");
+        }
+    }
+
+    #[test]
+    fn heif_family_prefers_the_system_codec() {
+        for extension in ["heic", "HEIF", "avif"] {
+            let format = detect(&Path::new("image").with_extension(extension)).unwrap();
+            assert_eq!(format, Format::SystemRaster, "{extension}");
+            assert!(format.requires_jpeg_conversion(), "{extension}");
+            assert!(!format.requires_ffmpeg(), "{extension}");
         }
     }
 

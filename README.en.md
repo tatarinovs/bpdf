@@ -1,6 +1,6 @@
 # bpdf — Fast, Lightweight PDF & Document Toolkit in Rust
 
-[![Version](https://img.shields.io/badge/Version-0.6.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/Version-0.8.0-blue.svg)](Cargo.toml)
 [![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg?logo=windows)]()
 [![Language](https://img.shields.io/badge/Язык-Русский-blue.svg)](README.md)
@@ -41,7 +41,9 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 | **TIFF (single and multi-page)** | Native WIC | Native Pure Rust | Windows decodes TIFF through Windows Imaging Component. |
 | **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Native Pure Rust | Native Pure Rust | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
 | **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | — | Uses Windows Imaging Component. |
-| **Extended Formats (HEIC/AVIF/PSD/JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or the `ffmpeg` path in `config.toml`. |
+| **HEIC/HEIF, AVIF** | Native WIC, FFmpeg fallback | FFmpeg | Windows uses the HEIF Image Extension (plus HEVC Video Extension for HEIC, AV1 Video Extension for AVIF) and falls back to FFmpeg when the codec is missing or fails. |
+| **PSD/PSB** | Pure Rust, FFmpeg fallback | Pure Rust, FFmpeg fallback | The merged composite (8/16-bit RGB, CMYK, grayscale, indexed) is read natively; 32-bit, bitmap and ZIP-compressed documents go to FFmpeg. Layers are not rendered. |
+| **Extended Formats (JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or the `ffmpeg` path in `config.toml`. |
 | **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
 | **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. The paper follows the layout: a page that fits one sheet of `page_size` proportions becomes a single PDF page of its exact size (a 1200×1600 card is one uncropped page), a longer one is split into sheets of its width; an explicit CSS `@page { size }` wins. `--size keep` keeps that size instead of fitting `page_size`. Without a browser, the page text is extracted and rendered as a text PDF. |
 | **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |

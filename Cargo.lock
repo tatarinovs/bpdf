@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "bpdf"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1586,8 +1586,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "ureq"
 version = "3.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+source = "git+https://github.com/algesten/ureq?rev=8fcd72a7881354400c432157e1a60222d61efc5c#8fcd72a7881354400c432157e1a60222d61efc5c"
 dependencies = [
  "base64",
  "cookie_store",
