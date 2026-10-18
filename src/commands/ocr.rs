@@ -83,7 +83,8 @@ fn searchable_in_place(
     }
     let results = specs.iter().map(|spec| {
         output::info(format!("OCR (in-place): {}", describe(spec)));
-        let result = searchable(engine, spec, config)
+        // A page range picks the pages to recognise; the rest are kept.
+        let result = searchable(engine, spec, config, true)
             .and_then(|mut document| pdf::save_to_bytes(&mut document))
             .and_then(|bytes| write_output(&spec.path, &bytes));
         (&spec.path, result)
@@ -108,7 +109,7 @@ fn searchable_pdf(
 ) -> Result<()> {
     let results = specs.iter().map(|spec| {
         output::info(format!("OCR: {}", describe(spec)));
-        (&spec.path, searchable(engine, spec, config))
+        (&spec.path, searchable(engine, spec, config, false))
     });
     let mut documents = Vec::with_capacity(specs.len());
     let failures = handle_results(
@@ -176,12 +177,23 @@ fn markdown(
     finish_batch("ocr", specs.len(), failures, outputs)
 }
 
-fn searchable(engine: &OcrEngine, spec: &InputSpec, config: &Config) -> Result<lopdf::Document> {
-    engine.create_searchable_pdf_for_spec(spec, &config.page_size, config.font_path.as_deref())
+fn searchable(
+    engine: &OcrEngine,
+    spec: &InputSpec,
+    config: &Config,
+    keep_all_pages: bool,
+) -> Result<lopdf::Document> {
+    engine.create_searchable_pdf_for_spec(
+        spec,
+        &config.page_size,
+        config.font_path.as_deref(),
+        keep_all_pages,
+    )
 }
 
-/// `NAME.md` beside each input; inputs that would share a name (`a.pdf` and
-/// `a.jpg`, or two ranges of one PDF) get `NAME_2.md`, ...
+/// `NAME.md` beside each input; a name already on disk or taken by an
+/// earlier input (`a.pdf` and `a.jpg`, or two ranges of one PDF) moves on to
+/// `NAME_2.md`, ...
 fn markdown_paths(specs: &[InputSpec]) -> Vec<PathBuf> {
     let mut registry = OutputRegistry::default();
     specs
@@ -221,6 +233,15 @@ mod tests {
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, ["a.md", "a_2.md", "a_3.md", "b.md"]);
+    }
+
+    #[test]
+    fn markdown_names_skip_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("scan.png");
+        std::fs::write(directory.path().join("scan.md"), "notes").unwrap();
+        let paths = markdown_paths(&[spec(image.to_str().unwrap(), None)]);
+        assert_eq!(paths, [directory.path().join("scan_2.md")]);
     }
 
     fn windows_ocr_args(inputs: Vec<String>, out: Option<PathBuf>, in_place: bool) -> OcrArgs {
@@ -276,5 +297,26 @@ mod tests {
         assert!(result.is_ok(), "in-place OCR failed: {:?}", result.err());
         let doc = lopdf::Document::load(&input_pdf).unwrap();
         assert_eq!(doc.get_pages().len(), 1);
+    }
+
+    #[test]
+    fn ocr_in_place_with_a_page_range_keeps_every_page() {
+        if !cfg!(windows) || !crate::winocr::is_available() {
+            return;
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let input_pdf = temp_dir.path().join("source.pdf");
+        let page = || {
+            let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(500, 500);
+            crate::pdf::jpeg_document(jpeg, "A4").unwrap()
+        };
+        let mut document = crate::pdf::merge_documents(vec![page(), page(), page()]).unwrap();
+        document.save(&input_pdf).unwrap();
+
+        let input = format!("{}:2", input_pdf.to_str().unwrap());
+        let args = windows_ocr_args(vec![input], None, true);
+        run(args, &Config::default(), true).unwrap();
+        let doc = lopdf::Document::load(&input_pdf).unwrap();
+        assert_eq!(doc.get_pages().len(), 3);
     }
 }

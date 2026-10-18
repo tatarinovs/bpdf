@@ -106,6 +106,8 @@ Commands that change a file (`strip`, `rotate`, `resize`, `optimize`, `stamp`, `
 - `-o <DIR>` — write into an existing directory under the source names (several inputs);
 - `-i, --in-place` — overwrite the source.
 
+Only `-i` replaces the source: when `-o` names the source itself or the folder it is in, the command fails without writing anything. A batch in which two inputs would write the same file (same-named files from different folders into one `-o` directory) is refused as well.
+
 ### 1. `bpdf merge`
 Merge PDFs, images, Office documents, HTML, e-books and text files into one PDF.
 
@@ -130,10 +132,10 @@ Recognise scans and images with cloud Groq Vision or local Windows OCR. PDFs are
 bpdf ocr <INPUTS>... [OPTIONS]
 ```
 
-- `-o, --out <PATH>` — `.pdf` creates a **searchable PDF**; any other extension one combined Markdown file; without `-o`, a `.md` beside every input (clashing names get `_2`, `_3`).
-- `-i, --in-place` — Add the text layer to the source PDFs.
+- `-o, --out <PATH>` — `.pdf` creates a **searchable PDF**; any other extension one combined Markdown file; without `-o`, a `.md` beside every input; when that file exists or names clash, `_2`, `_3` is added, so existing files are never overwritten.
+- `-i, --in-place` — Add the text layer to the source PDFs. A page range in the input (`doc.pdf:2-4`) selects the pages to recognise; the other pages stay in the file.
 - `-e, --engine <ENGINE>` — `groq`, `windows` or `auto` (default `ocr_engine`).
-- `--lang <LANG>` — Windows OCR language (`ru`, `en-US`; default `ocr_lang`).
+- `--lang <LANG>` — Windows OCR language (`ru`, `en-US`; default `ocr_lang`). The Windows engine reads one language at a time: with a Russian profile Latin text may come out as look-alike Cyrillic letters, so pass `--lang en-US` for English documents.
 - `--force-ocr` — Also recognise pages that already have text.
 - `--no-cache` — Do not use the OCR cache.
 - `--clear-cache` — Empty the OCR cache (inputs are optional).
@@ -202,6 +204,22 @@ The stamp is always drawn over the page. Placement follows the visible, upright 
 ### 16. `bpdf doctor`
 Checks the configuration and integrations. Required parts (font, OCR cache, the configured OCR engine) report `FAIL` and a non-zero exit code; missing optional ones (FFmpeg, Office, browser, an unused engine) report `WARN`.
 
+## Overwrite Rules
+
+- Writes are atomic: the result goes to a temporary file next to the target and replaces it in one step, so an interrupted command never leaves a half-written file.
+- Sources change only with `-i/--in-place` (`--force` for `convert`). `merge` and `extract` never write to their inputs; `merge` and `ocr` without `-o` never overwrite existing files and take the next free name instead.
+- The default names `<name>_<action>` of editing commands and `<name>_01.pdf` of `split` are overwritten when a command runs again.
+- An encrypted PDF that opens without a password (only printing or copying is restricted) stays encrypted after an edit, with the same owner password and restrictions. A `merge` of several files is not encrypted. PDFs that need a password to open are refused; remove the password first.
+
+## Security
+
+bpdf is meant for documents from any source, but some formats are handled by external programs, with these consequences:
+
+- **Office.** Documents open in MS Office through COM with macros disabled. So that Office does not open the file in Protected View (where PDF export is impossible), the "downloaded from the internet" mark is removed from the temporary copy; the source is not changed. A document from an untrusted source is therefore opened as if you had clicked "Enable Editing": vulnerabilities in Office itself, external templates and links to network shares remain a risk. Keep Office updated; for suspicious files use a computer without Office, where the text fallback is used.
+- **HTML.** Pages are laid out by the browser in a separate temporary profile, with JavaScript and network access: a saved page or e-mail can load images and trackers from the web (revealing your IP address). The page cannot read other local files.
+- **FFmpeg.** Only image demuxers and the local `file` protocol are allowed: playlists and `concat` scripts disguised as images are refused.
+- **Size limits.** Images inside PDFs above 300 megapixels, archive entries above 256 MB and CBZ archives above 2 GB are not unpacked, so a "bomb" file cannot exhaust memory.
+
 ## Page Selection Syntax
 
 `all`, `first`, `last` (`l`), `even`, `odd`, `reverse`, and lists such as `1-5,8,last`, `2-last`, `5-` (to the end) or `5-1` (backwards). `extract` and per-input specifiers keep the given order and repeats. Used by `-p/--pages`, `extract`, and per-input specifiers (`doc.pdf:1-3`) in `merge`, `ocr`, `convert`, `rotate` and `resize`.
@@ -265,7 +283,7 @@ raw_develop = false # false = fast pure Rust preview, true = WIC sensor developm
 
 # OCR Settings
 ocr_engine = "groq" # "groq" (cloud vision), "windows" (local WinOCR), or "auto"
-ocr_model = "qwen/qwen3.6-27b"
+ocr_model = "qwen/qwen3.8-27b"
 # ocr_prompt = '''Extract all text exactly as it appears...'''
 ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
 ocr_jobs = 1
@@ -321,3 +339,7 @@ bpdf stamp contract.pdf seal.png --position br --blend multiply
 # System & integrations health check
 bpdf doctor
 ```
+
+## License
+
+[MIT](LICENSE).

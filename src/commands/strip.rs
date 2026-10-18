@@ -1,11 +1,10 @@
 use std::fs;
+use std::path::Path;
 
 use anyhow::Result;
 
-use super::common::{
-    batch, edited_output, finish_batch, handle_results, validate_output, write_output,
-};
-use crate::cli::{OutputArgs, StripArgs};
+use super::common::{batch, edited_outputs, finish_batch, handle_results, write_output};
+use crate::cli::StripArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
@@ -13,10 +12,11 @@ use crate::{metadata, output, pdf};
 
 pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let specs = expand(&args.inputs, InputFormatSet::Strip)?;
-    validate_output(&args.output, specs.len())?;
+    let destinations = edited_outputs(&args.output, &specs, "stripped")?;
+    let jobs = specs.iter().zip(&destinations).collect::<Vec<_>>();
     let mut outputs = 0usize;
-    let results = batch(&specs, fail_fast, |spec| {
-        (&spec.path, strip_one(spec, &args.output, config.keep_icc))
+    let results = batch(&jobs, fail_fast, |(spec, destination)| {
+        (&spec.path, strip_one(spec, destination, config.keep_icc))
     });
     let failures = handle_results(
         results,
@@ -28,7 +28,7 @@ pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
     finish_batch("strip", specs.len(), failures, outputs)
 }
 
-fn strip_one(spec: &InputSpec, output: &OutputArgs, keep_icc: bool) -> Result<bool> {
+fn strip_one(spec: &InputSpec, destination: &Path, keep_icc: bool) -> Result<bool> {
     if spec.pages.is_some() {
         anyhow::bail!("page ranges are not valid for strip");
     }
@@ -45,15 +45,16 @@ fn strip_one(spec: &InputSpec, output: &OutputArgs, keep_icc: bool) -> Result<bo
             return Ok(false);
         }
     };
-    write_output(&edited_output(input, output, "stripped"), &bytes)?;
+    write_output(destination, &bytes)?;
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
+    use crate::cli::OutputArgs;
     use crate::commands::common::test_utils::{
         sample_jpeg_default as sample_jpeg, sample_pdf, sample_png,
     };
@@ -109,6 +110,45 @@ mod tests {
         assert!(image::open(&png).is_ok());
         assert!(pdf::load(&pdf).is_ok());
         assert_eq!(fs::read_to_string(&txt).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn out_directory_holding_the_source_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("sample.png");
+        sample_png(&png);
+        let before = fs::read(&png).unwrap();
+        let error = run(
+            args(&[&png], Some(dir.path().to_path_buf())),
+            &Config::default(),
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--in-place"), "{error:#}");
+        assert_eq!(fs::read(&png).unwrap(), before);
+    }
+
+    #[test]
+    fn inputs_sharing_a_destination_are_refused_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        sample_png(&first.join("x.png"));
+        sample_png(&second.join("x.png"));
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let error = run(
+            args(
+                &[&first.join("x.png"), &second.join("x.png")],
+                Some(out.clone()),
+            ),
+            &Config::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("several inputs"), "{error:#}");
+        assert!(!out.join("x.png").exists());
     }
 
     #[test]

@@ -31,9 +31,10 @@ pub fn strip_png(input: &[u8], keep_icc: bool) -> Result<Vec<u8>> {
 
         let kind = &input[position + 4..position + 8];
         saw_iend = kind == b"IEND";
+        // `caBX` holds C2PA content credentials (author, device, edits).
         let drop = matches!(
             kind,
-            b"tEXt" | b"zTXt" | b"iTXt" | b"tIME" | b"eXIf" | b"dSIG"
+            b"tEXt" | b"zTXt" | b"iTXt" | b"tIME" | b"eXIf" | b"dSIG" | b"caBX"
         ) || (kind == b"iCCP" && !keep_icc);
 
         if !drop {
@@ -96,8 +97,9 @@ pub fn strip_jpeg(input: &[u8], keep_icc: bool) -> Result<Vec<u8>> {
             .filter(|end| *end <= input.len())
             .ok_or_else(|| anyhow::anyhow!("truncated JPEG segment"))?;
 
-        let drop =
-            marker == 0xe1 || marker == 0xed || marker == 0xfe || (marker == 0xe2 && !keep_icc);
+        // APP1 EXIF/XMP, APP11 JUMBF (C2PA content credentials), APP13
+        // IPTC, comments; APP2 is the colour profile (and MPF).
+        let drop = matches!(marker, 0xe1 | 0xeb | 0xed | 0xfe) || (marker == 0xe2 && !keep_icc);
         if !drop {
             output.extend_from_slice(&[0xff, marker]);
             output.extend_from_slice(&input[position..segment_end]);
@@ -200,6 +202,14 @@ pub fn jpeg_orientation(bytes: &[u8]) -> u16 {
     jpeg_segments(bytes)
         .filter(|(marker, _)| *marker == 0xE1)
         .find_map(|(_, data)| exif_payload(data).and_then(exif_orientation))
+        .filter(|orientation| (1..=8).contains(orientation))
+        .unwrap_or(1)
+}
+
+/// Orientation (1-8) in IFD0 of a TIFF-structured file (TIFF, and the RAW
+/// formats built on it: CR2, NEF, ARW, DNG, ORF, RW2, PEF); 1 when absent.
+pub fn tiff_orientation(bytes: &[u8]) -> u16 {
+    exif_orientation(bytes)
         .filter(|orientation| (1..=8).contains(orientation))
         .unwrap_or(1)
 }
@@ -414,6 +424,20 @@ mod tests {
 
         let stripped = strip_jpeg(&tagged, false).unwrap();
         assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn jpeg_strip_removes_c2pa_credentials() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([20, 40, 60])));
+        let mut original = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut original), ImageFormat::Jpeg)
+            .unwrap();
+        let app11 = [0xff, 0xeb, 0x00, 0x08, b'J', b'P', 0, 0, b'j', b'u'];
+        let mut tagged = original[..2].to_vec();
+        tagged.extend_from_slice(&app11);
+        tagged.extend_from_slice(&original[2..]);
+        assert_eq!(strip_jpeg(&tagged, true).unwrap(), original);
     }
 
     #[test]

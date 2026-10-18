@@ -26,13 +26,11 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
         Command::Rotate(args) => rotate::run(args, &config, fail_fast),
         Command::Resize(args) => resize::run(args, &config, fail_fast),
         Command::Optimize(args) => {
+            let destination = common::edited_output(&args.input, &args.output, "optimized")?;
             let mut document = pdf::load(&args.input)?;
             optimize_document(&mut document, &config);
             let bytes = pdf_bytes(document, &config, args.max_size)?;
-            common::write_output(
-                &common::edited_output(&args.input, &args.output, "optimized"),
-                &bytes,
-            )
+            common::write_output(&destination, &bytes)
         }
         Command::Stamp(args) => pdf_edit::stamp(args, &config),
         Command::Number(args) => pdf_edit::number(args, &config),

@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Read;
 
 use anyhow::{Context, Result};
 use zip::ZipArchive;
@@ -129,12 +128,10 @@ pub fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Stri
     } else {
         name
     };
-    let mut entry = archive
+    let entry = archive
         .by_name(lookup)
         .with_context(|| format!("entry {name} not found in ZIP archive"))?;
-    let mut content = String::new();
-    entry.read_to_string(&mut content)?;
-    Ok(content)
+    crate::archive::read_text_entry(entry, name)
 }
 
 /// Collect text fragments enclosed between `open_tag` and `close_tag` in XML.
@@ -168,15 +165,12 @@ pub fn collect_sorted_entries(
     prefix: &str,
     suffix: &str,
 ) -> Vec<String> {
-    let mut names = Vec::new();
-    for i in 0..archive.len() {
-        if let Ok(entry) = archive.by_index(i) {
-            let name = entry.name().to_owned();
-            if name.starts_with(prefix) && name.ends_with(suffix) {
-                names.push(name);
-            }
-        }
-    }
+    let mut names = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|name| name.starts_with(prefix) && name.ends_with(suffix))
+        .map(|name| name.into_owned())
+        .collect::<Vec<_>>();
     crate::fileset::natural_sort_names(&mut names);
     names
 }

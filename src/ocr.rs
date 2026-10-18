@@ -311,20 +311,32 @@ impl OcrEngine {
 
     /// A PDF with an invisible text layer: existing PDF pages keep their
     /// content, images become single-page documents. Pages that already
-    /// carry text are left alone unless OCR is forced.
+    /// carry text are left alone unless OCR is forced. A page range of the
+    /// input selects the pages of the result, or with `keep_all_pages` only
+    /// the pages to recognise (the source is rewritten in place).
     pub fn create_searchable_pdf_for_spec(
         &self,
         spec: &InputSpec,
         page_size: &str,
         font_path: Option<&Path>,
+        keep_all_pages: bool,
     ) -> Result<Document> {
         match formats::detect(&spec.path) {
             Some(Format::Pdf) => {
                 let mut document = pdf::load(&spec.path)?;
+                let mut only = None;
                 if let Some(pages) = &spec.pages {
-                    pdf::select_pages(&mut document, pages)?;
+                    if keep_all_pages {
+                        let count = document.get_pages().len();
+                        only = Some(pdf::parse_page_selection(pages, count)?);
+                    } else {
+                        pdf::select_pages(&mut document, pages)?;
+                    }
                 }
-                let pages = self.pages_to_recognise(&document);
+                let mut pages = self.pages_to_recognise(&document);
+                if let Some(only) = &only {
+                    pages.retain(|(number, _)| only.contains(&(*number as usize)));
+                }
                 let scans = parallel::map(&pages, parallel::cpu_jobs(), |&(number, page_id)| {
                     let images = pdf_image::page_images(
                         &document,

@@ -1043,7 +1043,7 @@ impl<'a> ResourceInstaller<'a> {
     }
 }
 
-fn resolve_dictionary(document: &Document, object: &Object) -> Option<Dictionary> {
+pub(crate) fn resolve_dictionary(document: &Document, object: &Object) -> Option<Dictionary> {
     match object {
         Object::Dictionary(dictionary) => Some(dictionary.clone()),
         Object::Reference(id) => document.get_dictionary(*id).ok().cloned(),

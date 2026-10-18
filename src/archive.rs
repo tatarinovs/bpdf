@@ -10,6 +10,35 @@ use crate::formats::{self, Format};
 use crate::imageconv::{self, ImageOptions};
 use crate::{fileset, parallel, pdf};
 
+/// Largest archive entry read into memory. Sizes in the ZIP directory can
+/// lie, so the limit applies to the bytes actually inflated.
+const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest total of the images of one CBZ, which are all held at once.
+const MAX_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Contents of one archive entry, refusing entries that inflate beyond
+/// `MAX_ENTRY_BYTES` (ZIP bombs).
+pub fn read_entry(entry: impl Read, name: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read archive entry {name}"))?;
+    if bytes.len() as u64 > MAX_ENTRY_BYTES {
+        bail!(
+            "archive entry {name} is larger than {} MB",
+            MAX_ENTRY_BYTES >> 20
+        );
+    }
+    Ok(bytes)
+}
+
+/// [`read_entry`] as UTF-8 text.
+pub fn read_text_entry(entry: impl Read, name: &str) -> Result<String> {
+    String::from_utf8(read_entry(entry, name)?)
+        .with_context(|| format!("archive entry {name} is not UTF-8 text"))
+}
+
 /// Loads a `.cbz` archive (or image-containing ZIP), extracts image entries in natural sort order,
 /// converts each page into JPEG format, and merges them into a PDF `Document`.
 pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Document> {
@@ -19,7 +48,7 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) ->
         .with_context(|| format!("failed to parse ZIP archive {}", path.display()))?;
 
     let mut image_names = (0..archive.len())
-        .filter_map(|index| archive.name_for_index(index).map(str::to_owned))
+        .filter_map(|index| Some(archive.name_for_index(index)?.ok()?.into_owned()))
         .filter(|name| formats::detect_by_extension(Path::new(name)).is_some_and(Format::is_image))
         .collect::<Vec<_>>();
     if image_names.is_empty() {
@@ -28,15 +57,22 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) ->
     fileset::natural_sort_names(&mut image_names);
 
     // Reading the archive is sequential; decoding and encoding run in parallel.
+    let mut total = 0u64;
     let pages = image_names
         .into_iter()
         .map(|name| {
-            let mut bytes = Vec::new();
-            archive
+            let entry = archive
                 .by_name(&name)
-                .with_context(|| format!("failed to read archive entry {name}"))?
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("failed to extract image {name}"))?;
+                .with_context(|| format!("failed to read archive entry {name}"))?;
+            let bytes = read_entry(entry, &name)?;
+            total += bytes.len() as u64;
+            if total > MAX_ARCHIVE_BYTES {
+                bail!(
+                    "images in {} exceed {} GB",
+                    path.display(),
+                    MAX_ARCHIVE_BYTES >> 30
+                );
+            }
             Ok((name, bytes))
         })
         .collect::<Result<Vec<_>>>()?;

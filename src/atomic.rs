@@ -19,7 +19,19 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
             .and_then(|value| value.to_str())
             .unwrap_or("bpdf")
     );
-    let mut temporary = Builder::new().prefix(&prefix).tempfile_in(directory)?;
+    let mut builder = Builder::new();
+    builder.prefix(&prefix);
+    // Temporary files are private (0600); the result keeps the permissions
+    // of the file it replaces, or gets the usual ones (0666 minus umask).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(
+            fs::metadata(path)
+                .map_or_else(|_| fs::Permissions::from_mode(0o666), |m| m.permissions()),
+        );
+    }
+    let mut temporary = builder.tempfile_in(directory)?;
     temporary.write_all(data)?;
     temporary.as_file_mut().sync_all()?;
     temporary

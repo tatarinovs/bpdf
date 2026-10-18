@@ -10,6 +10,9 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use super::MAX_DECOMPRESSED_BYTES;
 use crate::{imageconv, output, parallel};
 
+/// Largest raw image decoded from a PDF (an A3 page at 1200 DPI fits).
+const MAX_IMAGE_PIXELS: u64 = 300_000_000;
+
 /// A page image re-encoded (or copied) as JPEG, oriented like the page.
 #[derive(Debug)]
 pub struct ExtractedImage {
@@ -318,6 +321,11 @@ pub(crate) fn decode(document: &Document, stream: &Stream) -> Result<DynamicImag
 
     let width = dimension(stream, b"Width")?;
     let height = dimension(stream, b"Height")?;
+    // The size comes from the dictionary, not from the data: a tiny stream
+    // may claim billions of pixels.
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        bail!("embedded image is too large ({width}x{height})");
+    }
     let dict = &stream.dict;
     let is_mask = dict
         .get(b"ImageMask")
@@ -618,6 +626,19 @@ mod tests {
             decode(&document, &stream).unwrap().into_rgb8().into_raw(),
             stream.content
         );
+    }
+
+    #[test]
+    fn oversized_dimensions_are_refused_before_allocating() {
+        let stream = image_stream(
+            dictionary! {
+                "Width" => 100_000, "Height" => 100_000,
+                "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            },
+            vec![0; 16],
+        );
+        let error = decode(&Document::new(), &stream).unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error:#}");
     }
 
     #[test]

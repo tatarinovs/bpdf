@@ -67,8 +67,8 @@ ocr_engine = "groq"
 # Языковой тег для Windows OCR (например, "ru", "en-US"). Если пусто, используется язык профиля Windows.
 # ocr_lang = "ru"
 
-# Модель нейросети для распознавания текста при ocr_engine = "groq" (по умолчанию qwen/qwen3.6-27b).
-ocr_model = "qwen/qwen3.6-27b"
+# Модель нейросети для распознавания текста при ocr_engine = "groq" (по умолчанию qwen/qwen3.8-27b).
+ocr_model = "qwen/qwen3.8-27b"
 
 # Кастомный промпт для OCR. Раскомментируйте, чтобы переопределить стандартный промпт.
 # ocr_prompt = '''You are a highly accurate OCR engine. Extract all text exactly as it appears. Preserve layout, lists, and tables using Markdown. IMPORTANT: Do NOT extract or transcribe any text from stamps or seals (печати и штампы). Ignore them completely. Keep your reasoning/thinking to an absolute minimum (under 50 words) and immediately output the extracted text. Do not add any conversational filler.'''

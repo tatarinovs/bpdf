@@ -61,8 +61,10 @@ fn render_pages(
     let mut rendered = Vec::with_capacity(pages.len());
     for &number in pages {
         let page = pdf.GetPage((number - 1) as u32)?;
-        let points = page.Size()?;
-        if let Some((width, height)) = size(f64::from(points.Width), f64::from(points.Height)) {
+        // `Size` is in device-independent pixels (1/96 inch).
+        let dips = page.Size()?;
+        let to_points = |dips: f32| f64::from(dips) * 72.0 / 96.0;
+        if let Some((width, height)) = size(to_points(dips.Width), to_points(dips.Height)) {
             options.SetDestinationWidth((width.round() as u32).max(1))?;
             options.SetDestinationHeight((height.round() as u32).max(1))?;
         }

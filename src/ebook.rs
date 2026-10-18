@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -28,16 +27,16 @@ pub fn load_htmlz(path: &Path) -> Result<String> {
 
     let mut index_file = None;
     for index in 0..archive.len() {
-        let Some(name) = archive.name_for_index(index) else {
+        let Some(Ok(name)) = archive.name_for_index(index) else {
             continue;
         };
         let lower = name.to_ascii_lowercase();
         if lower == "index.html" || lower == "index.htm" {
-            index_file = Some(name.to_owned());
+            index_file = Some(name.into_owned());
             break;
         }
         if index_file.is_none() && (lower.ends_with(".html") || lower.ends_with(".htm")) {
-            index_file = Some(name.to_owned());
+            index_file = Some(name.into_owned());
         }
     }
 
@@ -62,15 +61,17 @@ fn load_fb2_zip(path: &Path) -> Result<String> {
     let index = (0..archive.len())
         .find(|index| {
             archive.name_for_index(*index).is_some_and(|name| {
+                let Ok(name) = name else {
+                    return false;
+                };
                 let name = name.to_ascii_lowercase();
                 name.ends_with(".fb2") || name.ends_with(".xml")
             })
         })
         .unwrap_or(0);
-    let mut bytes = Vec::new();
-    archive
-        .by_index(index)?
-        .read_to_end(&mut bytes)
+    let entry = archive.by_index(index)?;
+    let name = entry.name()?.into_owned();
+    let bytes = crate::archive::read_entry(entry, &name)
         .with_context(|| format!("failed to read inner FB2 file from {}", path.display()))?;
     parse_fb2_xml(&encoding::decode_text(&bytes))
 }
@@ -269,17 +270,15 @@ fn load_epub(path: &Path) -> Result<String> {
     // Fallback if spine yielded nothing: iterate over all .html / .xhtml files in archive
     if chapter_count == 0 {
         for i in 0..archive.len() {
-            if let Ok(mut entry) = archive.by_index(i) {
-                let name = entry.name().to_ascii_lowercase();
-                if name.ends_with(".html") || name.ends_with(".xhtml") || name.ends_with(".htm") {
-                    let mut html = String::new();
-                    if entry.read_to_string(&mut html).is_ok() {
-                        let text = convert_html_to_text(&html);
-                        if !text.trim().is_empty() {
-                            output.push_str(&text);
-                            output.push_str("\n\n");
-                        }
-                    }
+            if let Ok(entry) = archive.by_index(i)
+                && let Ok(name) = entry.name().map(|name| name.to_ascii_lowercase())
+                && (name.ends_with(".html") || name.ends_with(".xhtml") || name.ends_with(".htm"))
+                && let Ok(html) = crate::archive::read_text_entry(entry, &name)
+            {
+                let text = convert_html_to_text(&html);
+                if !text.trim().is_empty() {
+                    output.push_str(&text);
+                    output.push_str("\n\n");
                 }
             }
         }
@@ -294,11 +293,10 @@ fn load_epub(path: &Path) -> Result<String> {
 
 /// Helper: Find rootfile path in META-INF/container.xml
 fn find_epub_opf_path(archive: &mut ZipArchive<File>) -> Result<String> {
-    let mut container_file = archive
+    let container_file = archive
         .by_name("META-INF/container.xml")
         .context("META-INF/container.xml missing")?;
-    let mut content = String::new();
-    container_file.read_to_string(&mut content)?;
+    let content = crate::archive::read_text_entry(container_file, "META-INF/container.xml")?;
 
     if let Some(start) = content.find("full-path=\"") {
         let rest = &content[start + 11..];

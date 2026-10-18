@@ -24,6 +24,13 @@ use crate::process;
 const MAX_IMAGE_FRAMES: usize = 10_000;
 /// Longest edge sent to vision OCR; larger images are downscaled first.
 const OCR_MAX_EDGE: u32 = 1536;
+/// Demuxers FFmpeg may use for an input: still-image readers, plus `mov`
+/// for HEIF/AVIF and `fits`, `brender_pix`, `gif`, `apng` and `webp`.
+const FFMPEG_IMAGE_DEMUXERS: &str = "image2,mov,fits,brender_pix,gif,apng,webp,\
+    bmp_pipe,dds_pipe,dpx_pipe,exr_pipe,gif_pipe,hdr_pipe,j2k_pipe,jpeg_pipe,jpegls_pipe,\
+    jpegxl_pipe,pam_pipe,pbm_pipe,pcx_pipe,pfm_pipe,pgm_pipe,pgx_pipe,phm_pipe,png_pipe,\
+    ppm_pipe,psd_pipe,qoi_pipe,sgi_pipe,sunrast_pipe,tiff_pipe,webp_pipe,xbm_pipe,xpm_pipe,\
+    xwd_pipe";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Orientation {
@@ -345,7 +352,12 @@ fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImag
 
     let mut command = Command::new(&options.ffmpeg);
     command
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        // FFmpeg picks the demuxer by content: a playlist or concat script
+        // disguised as an image could pull local files or URLs into the
+        // picture. Only image demuxers and local files are allowed.
+        .args(["-format_whitelist", FFMPEG_IMAGE_DEMUXERS])
+        .args(["-protocol_whitelist", "file", "-i"])
         .arg(path)
         // No -map: FFmpeg picks the largest picture, which for HEIC is the
         // assembled tile grid rather than one tile or the thumbnail.

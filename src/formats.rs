@@ -78,10 +78,9 @@ impl InputFormatSet {
     pub fn supports(self, path: &Path) -> bool {
         detect(path).is_some_and(|format| match self {
             Self::Merge => true,
-            Self::Ocr => format.is_image() || format == Format::Pdf || format == Format::Cbz,
-            Self::Convert => {
-                format.is_image() || matches!(format, Format::Pdf | Format::Cbz | Format::Html)
-            }
+            // CBZ archives are only read by merge.
+            Self::Ocr => format.is_image() || format == Format::Pdf,
+            Self::Convert => format.is_image() || matches!(format, Format::Pdf | Format::Html),
             Self::Strip => matches!(format, Format::Jpeg | Format::Png | Format::Pdf),
             Self::Rotate | Self::Resize => matches!(format, Format::Pdf | Format::Jpeg),
         })
@@ -163,7 +162,7 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
     let mut has_fb2 = false;
 
     for index in 0..archive.len() {
-        let Some(name) = archive.name_for_index(index) else {
+        let Some(Ok(name)) = archive.name_for_index(index) else {
             continue;
         };
         let name = name.to_ascii_lowercase();

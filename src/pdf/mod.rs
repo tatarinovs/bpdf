@@ -17,8 +17,18 @@ const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate
 
 pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
+/// Load a PDF. A document encrypted with an empty user password is decrypted
+/// and encrypted again on save; one that needs a password is refused.
 pub fn load(path: &Path) -> Result<Document> {
-    Document::load(path).with_context(|| format!("failed to load PDF {}", path.display()))
+    let document =
+        Document::load(path).with_context(|| format!("failed to load PDF {}", path.display()))?;
+    if document.is_encrypted() {
+        bail!(
+            "{} is password-protected; remove the password first",
+            path.display()
+        );
+    }
+    Ok(document)
 }
 
 pub fn transform_file<F>(path: &Path, transform: F) -> Result<Vec<u8>>
@@ -54,6 +64,8 @@ pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
     let mut total_pages = 0usize;
     let mut first_catalog: Option<Dictionary> = None;
     let mut first_info: Option<Object> = None;
+    let mut first_form: Option<Dictionary> = None;
+    let mut all_fields = Vec::new();
 
     for document in &mut documents {
         document.renumber_objects_with(next_id);
@@ -82,6 +94,23 @@ pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
             .set("Parent", pages_id);
         page_roots.push(Object::Reference(source_pages_id));
 
+        // Form fields of every document join one AcroForm; the first
+        // document's form settings (default appearance, resources) stay.
+        let form = catalog
+            .get(b"AcroForm")
+            .ok()
+            .and_then(|form| transform::resolve_dictionary(document, form));
+        if let Some(form) = &form {
+            if let Some(fields) = form
+                .get(b"Fields")
+                .ok()
+                .and_then(|fields| resolve_array(document, fields))
+            {
+                all_fields.extend(fields);
+            }
+            first_form.get_or_insert_with(|| form.clone());
+        }
+
         if first_catalog.is_none() {
             first_catalog = Some(catalog);
             first_info = document.trailer.get(b"Info").ok().cloned();
@@ -102,6 +131,18 @@ pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
     let mut catalog = first_catalog.unwrap_or_default();
     catalog.set("Type", "Catalog");
     catalog.set("Pages", pages_id);
+    // Labels of the first document would number every later page too.
+    catalog.remove(b"PageLabels");
+    catalog.remove(b"AcroForm");
+    if let Some(mut form) = first_form {
+        // An XFA form describes only the first document's fields.
+        form.remove(b"XFA");
+        form.set("Fields", all_fields);
+        let form_id = (next_id, 0);
+        next_id += 1;
+        result.objects.insert(form_id, Object::Dictionary(form));
+        catalog.set("AcroForm", form_id);
+    }
     result
         .objects
         .insert(catalog_id, Object::Dictionary(catalog));
@@ -386,7 +427,8 @@ pub fn strip_document_metadata(document: &mut Document) {
         }
     }
     document.trailer.remove(b"Info");
-    if !document.trailer.has(b"Encrypt") {
+    // An encrypted document's keys derive from its identifier.
+    if !document.trailer.has(b"Encrypt") && !document.was_encrypted() {
         document.trailer.remove(b"ID");
     }
 }
@@ -395,6 +437,17 @@ pub fn save_to_bytes(document: &mut Document) -> Result<Vec<u8>> {
     document.prune_objects();
     document.renumber_objects();
     document.compress();
+    // The source's encryption and permissions carry over; the keys derive
+    // from the first file identifier, so it must still be present.
+    if let Some(state) = document.encryption_state.take() {
+        if document.trailer.has(b"ID") {
+            document
+                .encrypt(&state)
+                .context("failed to encrypt PDF again")?;
+        } else {
+            crate::output::warn("the source PDF had no file identifier; saved without encryption");
+        }
+    }
     let mut bytes = Vec::new();
     document
         .save_to(&mut bytes)
@@ -685,6 +738,18 @@ pub(crate) fn jpeg_info(bytes: &[u8]) -> Result<JpegInfo> {
     })
 }
 
+fn resolve_array(document: &Document, object: &Object) -> Option<Vec<Object>> {
+    match object {
+        Object::Reference(id) => document
+            .get_object(*id)
+            .and_then(Object::as_array)
+            .ok()
+            .cloned(),
+        Object::Array(items) => Some(items.clone()),
+        _ => None,
+    }
+}
+
 fn remove_keys(dictionary: &mut Dictionary, keys: &[&[u8]]) {
     for key in keys {
         dictionary.remove(key);
@@ -811,6 +876,106 @@ mod tests {
             let page_id = *split.get_pages().get(&1).unwrap();
             assert_eq!(split.get_page_images(page_id).unwrap().len(), 1);
         }
+    }
+
+    fn encrypted_file(user_password: &str) -> tempfile::NamedTempFile {
+        use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+        let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let id = Object::string_literal(b"0123456789abcdef".to_vec());
+        document.trailer.set("ID", vec![id.clone(), id]);
+        let state = EncryptionState::try_from(EncryptionVersion::V2 {
+            document: &document,
+            owner_password: "owner",
+            user_password,
+            key_length: 128,
+            permissions: Permissions::PRINTABLE,
+        })
+        .unwrap();
+        document.encrypt(&state).unwrap();
+        let file = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        document.save(file.path()).unwrap();
+        file
+    }
+
+    #[test]
+    fn empty_password_encryption_survives_an_edit() {
+        let source = encrypted_file("");
+        for edit in [
+            transform_file(source.path(), |document| {
+                transform::rotate_pages(document, "all", 90)
+            }),
+            transform_file(source.path(), |document| {
+                strip_document_metadata(document);
+                Ok(())
+            }),
+        ] {
+            let reloaded = Document::load_mem(&edit.unwrap()).unwrap();
+            assert!(reloaded.was_encrypted());
+            assert_eq!(reloaded.get_pages().len(), 1);
+            let page_id = *reloaded.get_pages().get(&1).unwrap();
+            assert_eq!(reloaded.get_page_images(page_id).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn password_protected_pdf_is_refused_clearly() {
+        let source = encrypted_file("secret");
+        let error = load(source.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("password-protected"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_form_fields_of_every_document() {
+        let form_page = |name: &str| {
+            let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+            let page_id = *document.get_pages().get(&1).unwrap();
+            let field = document.add_object(dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Widget",
+                "FT" => "Tx",
+                "T" => Object::string_literal(name),
+                "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                "P" => page_id,
+            });
+            document
+                .get_object_mut(page_id)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set("Annots", vec![Object::Reference(field)]);
+            let form =
+                document.add_object(dictionary! { "Fields" => vec![Object::Reference(field)] });
+            document.catalog_mut().unwrap().set("AcroForm", form);
+            document
+                .catalog_mut()
+                .unwrap()
+                .set("PageLabels", dictionary! { "Nums" => vec![0.into()] });
+            document
+        };
+        let mut merged = merge_documents(vec![form_page("first"), form_page("second")]).unwrap();
+        let loaded = Document::load_mem(&save_to_bytes(&mut merged).unwrap()).unwrap();
+        let catalog = loaded.catalog().unwrap();
+        assert!(catalog.get(b"PageLabels").is_err());
+        let form = loaded
+            .get_dictionary(catalog.get(b"AcroForm").unwrap().as_reference().unwrap())
+            .unwrap();
+        let names = form
+            .get(b"Fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| {
+                let field = loaded
+                    .get_dictionary(field.as_reference().unwrap())
+                    .unwrap();
+                pdf_text(field.get(b"T").unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["first", "second"]);
     }
 
     #[test]

@@ -30,7 +30,7 @@ ureq = { version = "3.3.0", default-features = false, features = [
     "json",
     "socks-proxy",
 ] }
-zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 # 1.1.9+ moves to miniz_oxide 0.9 while png still uses 0.8: two inflate copies.
 flate2 = ">=1.1, <1.1.9"
 sha2 = "0.11"

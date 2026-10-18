@@ -77,16 +77,21 @@ impl<'a> FontWriter<'a> {
     }
 
     /// Glyph for a character, falling back to '?' (or .notdef); the second
-    /// value is the character actually drawn.
+    /// value is the character actually drawn. Control characters (tabs,
+    /// form feeds) have no glyph and are drawn as spaces.
     fn glyph(&mut self, character: char) -> (u16, char) {
         let face = &self.face;
-        *self
-            .glyphs
-            .entry(character)
-            .or_insert_with(|| match face.glyph_index(character) {
+        *self.glyphs.entry(character).or_insert_with(|| {
+            let character = if character.is_control() {
+                ' '
+            } else {
+                character
+            };
+            match face.glyph_index(character) {
                 Some(glyph) => (glyph.0, character),
                 None => (face.glyph_index('?').map_or(0, |glyph| glyph.0), '?'),
-            })
+            }
+        })
     }
 
     fn advance(&self, glyph: u16) -> f64 {
@@ -234,7 +239,8 @@ impl<'a> FontWriter<'a> {
 }
 
 pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
-    let text = text.trim_start_matches('\u{feff}');
+    let text = expand_tabs(text.trim_start_matches('\u{feff}'));
+    let text = text.as_str();
     let font_data = load_font(options.font_path.as_deref())?;
     let mut font = FontWriter::new(&font_data)?;
 
@@ -294,6 +300,35 @@ pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
     let catalog_id = document.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
     document.trailer.set("Root", catalog_id);
     Ok(document)
+}
+
+/// Tabs replaced by spaces up to the next multiple of eight columns, so
+/// TSV files and indented code keep their alignment.
+fn expand_tabs(text: &str) -> String {
+    const TAB_WIDTH: usize = 8;
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut column = 0;
+    for character in text.chars() {
+        match character {
+            '\t' => {
+                let spaces = TAB_WIDTH - column % TAB_WIDTH;
+                result.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\n' => {
+                result.push('\n');
+                column = 0;
+            }
+            _ => {
+                result.push(character);
+                column += 1;
+            }
+        }
+    }
+    result
 }
 
 fn build_to_unicode_cmap(used: &BTreeMap<u16, char>) -> String {
@@ -419,21 +454,13 @@ pub fn overlay_searchable_text(
         font_name.as_bytes(),
         font_id,
     )]);
+    // The page content may leave a changed matrix behind; the layer must
+    // start from the page's own coordinates.
+    let isolation = crate::pdf::transform::ContentIsolation::new(document);
     for (page_id, content) in page_contents {
         let content_id = document.add_object(Stream::new(dictionary! {}, content.into_bytes()));
         installer.install(document, page_id)?;
-        let old = document
-            .get_dictionary(page_id)?
-            .get(b"Contents")
-            .ok()
-            .cloned();
-        let mut contents = Vec::new();
-        crate::pdf::transform::append_content_objects(document, &mut contents, old);
-        contents.push(Object::Reference(content_id));
-        document
-            .get_object_mut(page_id)?
-            .as_dict_mut()?
-            .set("Contents", contents);
+        isolation.add_overlay(document, page_id, content_id)?;
     }
     Ok(())
 }
@@ -622,6 +649,23 @@ mod tests {
         );
         let page_id = *parsed.get_pages().get(&1).unwrap();
         assert_eq!(parsed.get_page_images(page_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tabs_become_aligned_spaces() {
+        assert_eq!(
+            expand_tabs("a\tb\nabcdefghi\tj"),
+            "a       b\nabcdefghi       j"
+        );
+        let Ok(mut document) = render("a\tb\x0cc", &TextOptions::default()) else {
+            return;
+        };
+        let bytes = crate::pdf::save_to_bytes(&mut document).unwrap();
+        let text = Document::load_mem(&bytes)
+            .unwrap()
+            .extract_text(&[1])
+            .unwrap();
+        assert!(text.contains("a       b c"), "{text:?}");
     }
 
     #[test]

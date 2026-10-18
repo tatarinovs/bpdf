@@ -90,6 +90,11 @@ fn parse_jpeg_stream(bytes: &[u8]) -> Option<(&[u8], u32, u32)> {
             0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
         );
 
+        // Lossless frames (SOF3, 7, 11, 15) hold sensor data, not a preview,
+        // and no common decoder reads them.
+        if matches!(marker, 0xC3 | 0xC7 | 0xCB | 0xCF) {
+            return None;
+        }
         if is_sof && length >= 8 && pos + 7 < bytes.len() {
             // SOF payload: [length: 2] [precision: 1] [height: 2] [width: 2] [components: 1]
             let height = u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]) as u32;
@@ -130,12 +135,21 @@ fn parse_jpeg_stream(bytes: &[u8]) -> Option<(&[u8], u32, u32)> {
     None
 }
 
-/// Read preview from file or return error if not found.
+/// Read preview from file or return error if not found. Previews usually
+/// carry no orientation of their own; the camera's, from the TIFF structure
+/// most RAW formats use, is written into the preview without re-encoding.
 pub fn read_preview(path: &Path) -> Result<Vec<u8>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    extract_preview(&bytes)
-        .map(|slice| slice.to_vec())
-        .ok_or_else(|| anyhow!("no embedded preview found in RAW image {}", path.display()))
+    let preview = extract_preview(&bytes)
+        .ok_or_else(|| anyhow!("no embedded preview found in RAW image {}", path.display()))?;
+    let camera = crate::metadata::tiff_orientation(&bytes);
+    if camera != 1
+        && crate::metadata::jpeg_orientation(preview) == 1
+        && let Some(oriented) = crate::metadata::with_jpeg_orientation(preview, camera)
+    {
+        return Ok(oriented);
+    }
+    Ok(preview.to_vec())
 }
 
 #[cfg(test)]
@@ -189,6 +203,29 @@ mod tests {
 
         let preview = extract_preview(&raw_container).expect("should find largest preview");
         assert_eq!(preview, full.as_slice());
+    }
+
+    #[test]
+    fn camera_orientation_is_written_into_the_preview() {
+        // Little-endian TIFF header, IFD0 with one entry: Orientation = 6.
+        let mut raw = b"II\x2A\0\x08\0\0\0\x01\0".to_vec();
+        raw.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0, 0, 0, 6, 0, 0, 0]);
+        raw.extend_from_slice(&[0, 0, 0, 0]);
+        raw.extend_from_slice(&create_dummy_jpeg(64, 48));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &raw).unwrap();
+
+        let preview = read_preview(file.path()).unwrap();
+        assert_eq!(crate::metadata::jpeg_orientation(&preview), 6);
+    }
+
+    #[test]
+    fn lossless_sensor_data_is_not_a_preview() {
+        let mut lossless = create_dummy_jpeg(6000, 4000);
+        // SOI (2 bytes) and APP0 (18) precede the SOF0 marker.
+        assert_eq!(lossless[21], 0xC0);
+        lossless[21] = 0xC3;
+        assert!(extract_preview(&lossless).is_none());
     }
 
     #[test]

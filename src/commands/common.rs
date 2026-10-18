@@ -90,8 +90,9 @@ pub fn edit_pdf<F>(input: &Path, output: &OutputArgs, suffix: &str, edit: F) -> 
 where
     F: FnOnce(&mut Document) -> Result<()>,
 {
+    let destination = edited_output(input, output, suffix)?;
     let bytes = pdf::transform_file(input, edit)?;
-    write_output(&edited_output(input, output, suffix), &bytes)
+    write_output(&destination, &bytes)
 }
 
 pub fn suffixed_output(input: &Path, suffix: &str, extension: &str) -> PathBuf {
@@ -104,12 +105,13 @@ pub fn suffixed_output(input: &Path, suffix: &str, extension: &str) -> PathBuf {
 
 /// Destination of an edited file: the source itself with `--in-place`, the
 /// `--out` file or a same-named file inside the `--out` directory, otherwise
-/// `NAME_<suffix>.<ext>` beside the source.
-pub fn edited_output(input: &Path, output: &OutputArgs, suffix: &str) -> PathBuf {
+/// `NAME_<suffix>.<ext>` beside the source. Only `--in-place` may name the
+/// source: an `--out` directory that holds it would replace it silently.
+pub fn edited_output(input: &Path, output: &OutputArgs, suffix: &str) -> Result<PathBuf> {
     if output.in_place {
-        return input.to_owned();
+        return Ok(input.to_owned());
     }
-    match &output.out {
+    let destination = match &output.out {
         Some(directory) if directory.is_dir() => {
             directory.join(input.file_name().unwrap_or_default())
         }
@@ -121,15 +123,41 @@ pub fn edited_output(input: &Path, output: &OutputArgs, suffix: &str) -> PathBuf
                 .unwrap_or("pdf");
             suffixed_output(input, suffix, extension)
         }
+    };
+    if same_path(input, &destination) {
+        bail!(
+            "{} would overwrite the source; pass --in-place to replace it",
+            destination.display()
+        );
     }
+    Ok(destination)
 }
 
-/// A file `--out` names one destination, so it takes exactly one input.
-pub fn validate_output(output: &OutputArgs, count: usize) -> Result<()> {
-    if count > 1 && output.out.as_ref().is_some_and(|path| !path.is_dir()) {
+/// Destinations of every input, checked before anything is written: a file
+/// `--out` takes exactly one input, and no two inputs may share a
+/// destination (they would be written over each other in parallel).
+pub fn edited_outputs(
+    output: &OutputArgs,
+    specs: &[InputSpec],
+    suffix: &str,
+) -> Result<Vec<PathBuf>> {
+    if specs.len() > 1 && output.out.as_ref().is_some_and(|path| !path.is_dir()) {
         bail!("--out must be an existing directory when there are several inputs");
     }
-    Ok(())
+    let mut destinations = HashSet::new();
+    specs
+        .iter()
+        .map(|spec| {
+            let destination = edited_output(&spec.path, output, suffix)?;
+            if !destinations.insert(path_key(&destination)) {
+                bail!(
+                    "several inputs would write {}; process them separately",
+                    destination.display()
+                );
+            }
+            Ok(destination)
+        })
+        .collect()
 }
 
 pub fn same_path(left: &Path, right: &Path) -> bool {
@@ -179,12 +207,12 @@ impl OutputRegistry {
         Ok(())
     }
 
-    /// `path`, or `path` with `_2`, `_3`... added to its stem when an earlier
-    /// call already took it.
+    /// `path`, or `path` with `_2`, `_3`... added to its stem when the file
+    /// exists or an earlier call already took it.
     pub fn unique(&mut self, path: PathBuf) -> PathBuf {
         let mut candidate = path.clone();
         let mut index = 2;
-        while !self.destinations.insert(path_key(&candidate)) {
+        while candidate.exists() || !self.destinations.insert(path_key(&candidate)) {
             let stem = path
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -238,8 +266,11 @@ where
 {
     pub fn run(&self, inputs: &[String], fail_fast: bool) -> Result<()> {
         let specs = expand(inputs, self.formats)?;
-        validate_output(self.output, specs.len())?;
-        let results = batch(&specs, fail_fast, |spec| (&spec.path, self.edit_one(spec)));
+        let destinations = edited_outputs(self.output, &specs, self.suffix)?;
+        let jobs = specs.iter().zip(&destinations).collect::<Vec<_>>();
+        let results = batch(&jobs, fail_fast, |(spec, destination)| {
+            (&spec.path, self.edit_one(spec, destination))
+        });
         let failures = handle_results(
             results,
             fail_fast,
@@ -255,7 +286,7 @@ where
         )
     }
 
-    fn edit_one(&self, spec: &InputSpec) -> Result<()> {
+    fn edit_one(&self, spec: &InputSpec, destination: &Path) -> Result<()> {
         let input = &spec.path;
         let bytes = match formats::detect(input) {
             Some(Format::Pdf) => {
@@ -271,7 +302,7 @@ where
             }
             _ => bail!("unsupported input: {}", input.display()),
         };
-        write_output(&edited_output(input, self.output, self.suffix), &bytes)
+        write_output(destination, &bytes)
     }
 }
 

@@ -196,7 +196,9 @@ fn office_script(format: Format) -> Option<String> {
             "Word.Application",
             r#"    $app.Visible = $false
     $app.DisplayAlerts = 0
-    $doc = $app.Documents.Open($env:BPDF_OFFICE_INPUT, $false, $true)
+    # ConfirmConversions, ReadOnly, AddToRecentFiles: the temporary copy
+    # stays out of Word's recent documents.
+    $doc = $app.Documents.Open($env:BPDF_OFFICE_INPUT, $false, $true, $false)
     if ($null -eq $doc) {
         # Some Word/PowerShell combinations perform Open successfully but do
         # not marshal its return value. ActiveDocument is then authoritative.
