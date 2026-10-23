@@ -16,13 +16,13 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 - **Universal Merge:** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP), HTML pages, Office documents (Word, Excel, PowerPoint, OpenDocument), and text/source-code files into a single PDF or merged text document.
 - **Multipage Images & Animation Frames:** All TIFF pages, comic book archives (CBZ with natural sort), and all frames of GIF, APNG, and animated WebP become distinct sequential PDF pages.
 - **OCR & Searchable (Sandwich) PDF:** Extract text to Markdown or create a PDF with an invisible searchable text layer (`-o searchable.pdf` / `--in-place`) using cloud **Groq Vision** (Qwen / Llama) or native local **Windows Media OCR** (offline, zero external API keys).
-- **Table of Contents & Bookmarks:** Automatically build hierarchical PDF Outlines when merging documents (`merge --bookmarks`).
+- **Table of Contents & Bookmarks:** One outline entry per merged file holding that file's own outline (`merge --bookmarks`); named links of every document keep working.
 - **Content-Addressed OCR Cache:** SHA-256 hash-based disk caching (image hash + engine/model + prompt). Repetitive tasks and concurrent workers resolve instantly with zero redundant network requests.
 - **Network Proxy Support:** Full HTTP and SOCKS5 proxy compatibility for bypassing network restrictions or corporate firewalls.
 - **Stamps:** Overlay transparent PNG (or JPEG) stamps with precise anchor positioning (`br`, `center`, or millimeter X,Y offsets), or with the mouse (`--pick`), scale factors, opacity, and blend modes (`multiply` for authentic wet-ink appearance).
-- **Page Normalization & Resizing:** Fit and center pages to standard A4 or Letter, unify orientation by majority vote, or preserve native dimensions (`keep`).
+- **Page Normalization & Resizing:** Fit and center pages to A3–A6, B4, B5, Letter, Legal, Tabloid or a custom size, unify orientation by majority vote, preserve native dimensions (`keep`) or size pages to their images (`fit`). Drop blank scanned pages (`--remove-blank`).
 - **Lossless Metadata Stripping (Strip):** Remove EXIF / metadata from JPEG and PNG without re-encoding pixels; sanitize PDF properties, XMP and EXIF of embedded images.
-- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), and DPI-aware image optimization (`optimize`), including fitting a target file size (`--max-size`).
+- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), DPI-aware image optimization (`optimize`) including fitting a target file size (`--max-size`) and grayscale images (`--gray`), and AES-256 passwords and restrictions (`protect`, `unlock`).
 - **Page Numbers & Watermarks:** Template page numbers (`number`) and text watermarks such as "COPY" (`watermark`), kept horizontal on rotated pages.
 - **Phone Photos:** EXIF orientation is honoured by merge, convert and OCR, so photos never end up sideways.
 - **Parallel Processing:** Batch inputs and images inside PDFs are processed on all cores (up to 8 threads).
@@ -48,6 +48,8 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 | **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. The paper follows the layout: a page that fits one sheet of `page_size` proportions becomes a single PDF page of its exact size (a 1200×1600 card is one uncropped page), a longer one is split into sheets of its width; an explicit CSS `@page { size }` wins. `--size keep` keeps that size instead of fitting `page_size`. Without a browser, the page text is extracted and rendered as a text PDF. |
 | **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |
 | **HTML to JPEG (`convert page.html`)** | Edge / Chrome | Chrome / Chromium | Viewport-sized screenshot; no fallback without a browser. |
+| **SVG (`.svg`)** | Edge / Chrome | Chrome / Chromium | `merge` puts the drawing on a page of its own size (`width`, `height`, `viewBox`); `convert` draws it at least 1600 px on the long edge. No fallback without a browser. |
+| **JPEG XL (`.jxl`)** | WIC (JPEG XL extension), FFmpeg fallback | FFmpeg | Not every FFmpeg build has a JXL decoder. `.jfif` and `.jpe` are read as JPEG. |
 | **PDF page rendering (`convert --render`)** | Native Windows renderer | — | Image extraction from PDFs works everywhere. |
 | **OCR (Windows Media OCR)** | Native Windows 10/11 | — | Offline, built-in, no API keys needed. |
 | **OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or environment variable. |
@@ -116,14 +118,15 @@ bpdf merge <INPUTS>... [OPTIONS]
 ```
 
 - `-o, --out <PATH>` — Output file. Default: `<name>.pdf` for one non-PDF input, otherwise `<first>_merged.pdf`; existing files are never overwritten, the next free name (`_merged_2.pdf`) is used.
-- `-s, --size <SIZE>` — `A4`, `Letter` or `keep` (keep source PDF page sizes). Default: `page_size`.
+- `-s, --size <SIZE>` — `A3`, `A4`, `A5`, `A6`, `B4`, `B5`, `Letter`, `Legal`, `Tabloid`, a custom `WIDTHxHEIGHT` in `mm` (default), `cm`, `in` or `pt` (`210x297mm`, `8.5x11in`), `keep` (keep source PDF page sizes) or `fit` (each image on a page of its size at its DPI, else 96 DPI; PDF pages keep theirs). Default: `page_size`.
 - `--auto-rotate` / `--no-auto-rotate` — Turn pages to the majority orientation. Default: `auto_rotate`.
 - `--optimize` / `--no-optimize` — Downsample images to `image_dpi` and tidy the structure. Default: `optimize`.
 - `--strip-meta` / `--no-strip-meta` — Remove metadata from the result. Default: `strip_metadata`.
-- `--bookmarks` / `--no-bookmarks` — One outline entry per merged file. Default: `bookmarks`.
+- `--bookmarks` / `--no-bookmarks` — One outline entry per merged file, holding that file's own outline (collapsed). Without it the files' outlines follow each other. Default: `bookmarks`.
 - `--max-size <SIZE>` — Largest acceptable PDF (`10MB`, `500KB`); image resolution and quality are lowered step by step until it fits.
+- `--remove-blank` — Drop blank scanned pages (see `optimize`). A file whose pages are all blank is left out; when everything is blank, nothing is removed.
 
-Each page keeps its own orientation when fitted to A4/Letter. Author and creator come from the configuration; stamps are applied with the `stamp` command.
+Each page keeps its own orientation when fitted to the sheet. Named links of every document keep working; clashing names are renamed. Author and creator come from the configuration; stamps are applied with the `stamp` command.
 
 ### 2. `bpdf ocr`
 Recognise scans and images with cloud Groq Vision or local Windows OCR. PDFs are judged page by page: pages with their own text layer are used as they are, only scanned pages are recognised.
@@ -138,21 +141,21 @@ bpdf ocr <INPUTS>... [OPTIONS]
 - `--lang <LANG>` — Windows OCR language (`ru`, `en-US`; default `ocr_lang`). The Windows engine reads one language at a time: with a Russian profile Latin text may come out as look-alike Cyrillic letters, so pass `--lang en-US` for English documents.
 - `--force-ocr` — Also recognise pages that already have text.
 - `--no-cache` — Do not use the OCR cache.
-- `--clear-cache` — Empty the OCR cache (inputs are optional).
+- `--clear-cache` — Empty the OCR cache (inputs are optional). Only cache files are deleted; anything else in `ocr_cache_dir` stays.
 
-Model, prompt, proxy, endpoint and parallel requests are configured in `config.toml`. The text layer follows rotated and cropped pages; running `ocr -i` again does not duplicate a layer bpdf added.
+`-o` must not name an input; use `-i` for a layer in the source. Model, prompt, proxy, endpoint and parallel requests are configured in `config.toml`. Server errors (500–504) and rate limits are retried; an answer cut off by `ocr_max_tokens` is marked and reported. In `auto` mode Groq is no longer asked after it refuses the key. The text layer follows rotated and cropped pages and, on pages with several images, the place of each image; running `ocr -i` again does not duplicate a layer bpdf added.
 
 ### 3. `bpdf split`
-`bpdf split <INPUT> [-o <DIR>]` — one PDF per page (`<name>_01.pdf`, …), in the source folder by default.
+`bpdf split <INPUT> [-o <DIR>] [--force]` — one PDF per page (`<name>_01.pdf`, …), in the source folder by default. Existing page files are replaced only with `--force`.
 
 ### 4. `bpdf extract`
-`bpdf extract <INPUT> <PAGES> [-o <OUT>]` — selected pages, in the given order and with repeats (`5,1-4`, `1,1`, `reverse`), into `<name>_extracted.pdf`; never overwrites the source.
+`bpdf extract <INPUT> <PAGES> [-o <OUT> | -i]` — selected pages, in the given order and with repeats (`5,1-4`, `1,1`, `reverse`), into `<name>_extracted.pdf`; `-o` and `-i` work as for the editing commands.
 
 ### 5. `bpdf info`
 `bpdf info <INPUT>` — PDF version, size (pt and mm), rotation, font and image counts of every page, and the document properties.
 
 ### 6. `bpdf text`
-`bpdf text <INPUT> [-o <OUT>]` — the existing text layer, offline. Warns when there is none.
+`bpdf text <INPUT> [-o <OUT>]` — the existing text layer, offline. Warns when there is none; `-o` must not name the PDF itself.
 
 ### 7. `bpdf strip`
 `bpdf strip <INPUTS>... [-o <OUT> | -i]` — remove metadata from JPEG, PNG and PDF without re-encoding pixels; other files are skipped. In PDFs this covers document properties, XMP and private data of every object, `/ID` (unencrypted files) and EXIF/XMP of embedded JPEGs. ICC profiles stay when `keep_icc = true`.
@@ -170,10 +173,12 @@ JPEGs are rotated **losslessly** through the EXIF orientation tag; pixels and ot
 ```powershell
 bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-p <PAGES>] [-o <OUT> | -i]
 ```
-PDF: the visible page area is fitted and centred on A4 (default) or Letter, keeping each page's orientation; pages already of that size are untouched. JPEG: `--long-edge` (longest side at most) or `--short-edge` (shortest side exactly) is required.
+PDF: the visible page area is fitted and centred on the sheet (A4 by default; other sizes as for `merge`), keeping each page's orientation; pages already of that size are untouched. Annotations (highlights and ink included) and link and bookmark targets move with the content. JPEG: `--long-edge` (longest side at most) or `--short-edge` (shortest side exactly) is required, not both.
 
 ### 10. `bpdf optimize`
-`bpdf optimize <INPUT> [--max-size <SIZE>] [-o <OUT> | -i]` — tidy the structure and downsample images to `image_dpi` at `jpeg_quality`, measured at the size each image is drawn on the page (a large photo in a small frame shrinks to the frame) (lossless graphics with up to 256 colours stay lossless); `--max-size` steps down from 300 DPI / 85 to 72 DPI / 35 until the file fits.
+`bpdf optimize <INPUT> [--max-size <SIZE>] [--gray] [--remove-blank] [-o <OUT> | -i]` — tidy the structure and downsample images to `image_dpi` at `jpeg_quality`, measured at the size each image is drawn on the page (a large photo in a small frame shrinks to the frame) (lossless graphics with up to 256 colours stay lossless); `--max-size` steps down from 300 DPI / 85 to 72 DPI / 35 until the file fits.
+- `--gray` — Turn colour images gray (even when that does not save space); text, vector graphics and images with a transparency mask keep their colours.
+- `--remove-blank` — Drop blank scanned pages: no text, no annotations, nothing drawn but images of a plain sheet (scanner shadows at the edges, noise and dust are fine). Pages with vector graphics stay. When every page looks blank, none is removed.
 
 ### 11. `bpdf stamp`
 ```powershell
@@ -183,7 +188,7 @@ bpdf stamp <INPUT> <STAMP> [OPTIONS]
 - `--scale` — Multiplier of the physical size; `0` fits up to a quarter of the page.
 - `--dpi` — Stamp resolution (default from PNG/JPEG metadata, else 96).
 - `--opacity` — 0 to 1 (default 1).
-- `--blend` — `normal`, `multiply` (realistic ink over text), `screen`, `overlay`, `darken`, …
+- `--blend` — `normal`, `multiply` (realistic ink over text), `screen`, `overlay`, `darken`, `lighten`, `color-dodge`, `color-burn`, `hard-light`, `soft-light`, `difference`, `exclusion`.
 - `-p, --pages` — Pages (default `all`).
 - `--pick` — Place the stamp with the mouse in an Edge/Chrome window; the window also shows the equivalent `--position`, `--scale` and `--pages`.
 
@@ -196,12 +201,19 @@ The stamp is always drawn over the page. Placement follows the visible, upright 
 `bpdf watermark <INPUT> <TEXT> [--size 0] [--angle 45] [--position c] [--color gray] [--opacity 0.3] [-p PAGES]` — text drawn over the pages; size `0` fits the page.
 
 ### 14. `bpdf metadata`
-`bpdf metadata <INPUT> [--title] [--author] [--subject] [--keywords] [--creator] [-o <OUT> | -i]` — set document properties; an empty value removes a field. `bpdf info` shows the current values.
+`bpdf metadata <INPUT> [--title] [--author] [--subject] [--keywords] [--creator] [-o <OUT> | -i]` — set document properties; an empty value removes a field. `bpdf info` shows the current values. An outdated XMP packet is removed, since readers prefer it over the properties.
 
-### 15. `bpdf convert`
-`bpdf convert <INPUTS>... [-o <DIR>] [--force] [--long-edge PX] [--short-edge PX] [--orient MODE] [-q 1-100] [--render] [--viewport WxH]` — images, PDF pages/images and HTML pages to JPEG. Multipage TIFF gives one JPEG per page; PDFs give the largest image of each page, or rendered pages for text pages and with `--render` (Windows only), named `doc_page_3.jpg`; size, orientation and quality options apply to them too.
+### 15. `bpdf protect` and `bpdf unlock`
+```powershell
+bpdf protect <INPUT> [--password <PW>] [--owner-password <PW>] [--no-print] [--no-copy] [--no-modify] [-o <OUT> | -i]
+bpdf unlock <INPUT> [--password <PW>] [-o <OUT> | -i]
+```
+`protect` encrypts with AES-256 (PDF 2.0): an open password and/or restrictions on printing, copying and editing. Without `--owner-password` the restrictions get a random owner password (or the open password when there are none). Restrictions are honoured by readers, not enforced by the cipher: `unlock` and other tools lift them with the open password alone. `unlock` takes the open or owner password (none for restriction-only files). Protection survives edits by other bpdf commands; the built-in Windows renderer (`convert --render`, `stamp --pick`) cannot read AES-256 and gets a decrypted copy.
 
-### 16. `bpdf doctor`
+### 16. `bpdf convert`
+`bpdf convert <INPUTS>... [-o <DIR>] [--force] [--long-edge PX] [--short-edge PX] [--orient MODE] [-q 1-100] [--max-size SIZE] [--render] [--viewport WxH]` — images, PDF pages/images, HTML pages and SVG drawings to JPEG. Multipage TIFF gives one JPEG per page; PDFs give the largest image of each page, or rendered pages for text pages and with `--render` (Windows only), named `doc_page_3.jpg`; size, orientation and quality options apply to them too. `--max-size 500KB` keeps every JPEG within the limit: the quality is found by binary search (not below 20), then the image is scaled down if needed.
+
+### 17. `bpdf doctor`
 Checks the configuration and integrations. Required parts (font, OCR cache, the configured OCR engine) report `FAIL` and a non-zero exit code; missing optional ones (FFmpeg, Office, browser, an unused engine) report `WARN`.
 
 ## Overwrite Rules
@@ -209,7 +221,8 @@ Checks the configuration and integrations. Required parts (font, OCR cache, the 
 - Writes are atomic: the result goes to a temporary file next to the target and replaces it in one step, so an interrupted command never leaves a half-written file.
 - Sources change only with `-i/--in-place` (`--force` for `convert`). `merge` and `extract` never write to their inputs; `merge` and `ocr` without `-o` never overwrite existing files and take the next free name instead.
 - The default names `<name>_<action>` of editing commands and `<name>_01.pdf` of `split` are overwritten when a command runs again.
-- An encrypted PDF that opens without a password (only printing or copying is restricted) stays encrypted after an edit, with the same owner password and restrictions. A `merge` of several files is not encrypted. PDFs that need a password to open are refused; remove the password first.
+- An encrypted PDF that opens without a password (only printing or copying is restricted) stays encrypted after an edit, with the same owner password and restrictions. A `merge` of several files is not encrypted. PDFs that need a password to open are refused; remove the password first (`bpdf unlock`).
+- Exit codes: `0` success, `1` failure, `2` some files of a batch failed while others succeeded.
 
 ## Security
 
@@ -238,6 +251,7 @@ bpdf merge @files.txt -o output.pdf
 C:\docs\cover.jpg
 C:\docs\report.pdf:1-10
 ```
+Relative paths are relative to the folder of the list. Globs and folders take only files of known formats the command reads (no folders, extensionless or empty files); name such files explicitly.
 
 ### Total Commander Integration
 - **Button Bar:** `bpdf.bar` with buttons for all common actions. Run `make_bar.bat` next to `bpdf.exe` and it writes `bpdf.bar` with paths to that `bpdf.exe`. Then drag `bpdf.bar` onto the Total Commander toolbar (a drop-down button) or pick it under Configuration → Button bar.
@@ -254,7 +268,9 @@ C:\docs\report.pdf:1-10
 1. Path passed via `--config <PATH>`;
 2. `config.toml` beside `bpdf.exe`.
 
-The working directory is not searched: a file manager starts bpdf among your documents, where a `config.toml` of another program may live. Unknown keys (typos such as `jpeg_qualty`) are reported as errors.
+The working directory is not searched: a file manager starts bpdf among your documents, where a `config.toml` of another program may live. Unknown keys (typos such as `jpeg_qualty`) are reported as errors, and so are invalid `page_size` (same values as `merge -s`) and `ocr_engine` values.
+
+`%NAME%` environment variables are expanded in `groq_api_key`, `proxy` and the paths (`ffmpeg`, `powershell`, `font_path`, `browser`, `ocr_cache_dir`), inside double quotes too. `font_path` must be a TrueType font (`.ttf`, or `.ttc` whose first font is used).
 
 ### Example `config.toml`
 

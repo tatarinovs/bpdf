@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Format {
@@ -20,6 +22,8 @@ pub enum Format {
     PowerPoint,
     Text,
     Html,
+    /// Vector image, drawn by the same browser as HTML pages.
+    Svg,
     Epub,
     Fb2,
     Htmlz,
@@ -75,23 +79,50 @@ pub enum InputFormatSet {
 }
 
 impl InputFormatSet {
-    pub fn supports(self, path: &Path) -> bool {
-        detect(path).is_some_and(|format| match self {
+    /// True when a directory listing or glob should include `path`: only
+    /// files of a known format count, never ones that merely look like text.
+    pub fn includes(self, path: &Path) -> bool {
+        let format = if has_extension(path, "zip") {
+            detect(path)
+        } else {
+            detect_by_extension(path)
+        };
+        format.is_some_and(|format| self.accepts(format))
+    }
+
+    fn accepts(self, format: Format) -> bool {
+        match self {
             Self::Merge => true,
             // CBZ archives are only read by merge.
             Self::Ocr => format.is_image() || format == Format::Pdf,
-            Self::Convert => format.is_image() || matches!(format, Format::Pdf | Format::Html),
+            Self::Convert => {
+                format.is_image() || matches!(format, Format::Pdf | Format::Html | Format::Svg)
+            }
             Self::Strip => matches!(format, Format::Jpeg | Format::Png | Format::Pdf),
             Self::Rotate | Self::Resize => matches!(format, Format::Pdf | Format::Jpeg),
-        })
+        }
     }
 }
 
+/// Format of a file by its extension, the entries of a `.zip`, or (for an
+/// unknown extension) by looking like text. Results that read the file are
+/// remembered for the rest of the run.
 pub fn detect(path: &Path) -> Option<Format> {
-    if has_extension(path, "zip") && !is_fb2_zip(path) {
-        return detect_zip_content(path);
+    let by_content = if has_extension(path, "zip") && !is_fb2_zip(path) {
+        detect_zip_content
+    } else if let Some(format) = detect_by_extension(path) {
+        return Some(format);
+    } else {
+        |path: &Path| is_text_file(path).then_some(Format::Text)
+    };
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, Option<Format>>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Mutex::default);
+    if let Some(format) = crate::parallel::lock(seen).get(path) {
+        return *format;
     }
-    detect_by_extension(path).or_else(|| is_text_file(path).then_some(Format::Text))
+    let format = by_content(path);
+    crate::parallel::lock(seen).insert(path.to_path_buf(), format);
+    format
 }
 
 /// Format implied by the file name alone, without touching the file system.
@@ -101,10 +132,10 @@ pub fn detect_by_extension(path: &Path) -> Option<Format> {
         return Some(Format::Fb2);
     }
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => Some(Format::Jpeg),
+        "jpg" | "jpeg" | "jpe" | "jfif" => Some(Format::Jpeg),
         "png" => Some(Format::Png),
         "bmp" | "gif" | "tiff" | "tif" | "webp" | "apng" => Some(Format::Raster),
-        "heic" | "heif" | "avif" => Some(Format::SystemRaster),
+        "heic" | "heif" | "avif" | "jxl" => Some(Format::SystemRaster),
         "psd" | "psb" => Some(Format::Psd),
         "dds" | "exr" | "hdr" | "qoi" | "tga" | "pcx" | "pnm" | "ppm" | "pgm" | "pbm" | "pam"
         | "sgi" | "xbm" | "jp2" | "j2k" | "j2c" | "jpc" | "jpf" | "jpx" | "jls" | "dpx"
@@ -122,6 +153,7 @@ pub fn detect_by_extension(path: &Path) -> Option<Format> {
         "epub" => Some(Format::Epub),
         "fb2" => Some(Format::Fb2),
         "html" | "htm" | "xhtml" => Some(Format::Html),
+        "svg" => Some(Format::Svg),
         "htmlz" => Some(Format::Htmlz),
         "cbz" => Some(Format::Cbz),
         "md" | "txt" | "json" | "jsonc" | "xml" | "yaml" | "yml" | "log" | "ini" | "cfg"
@@ -190,7 +222,8 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
     }
 }
 
-/// Heuristic check to determine if a file is plain text by probing its first 8 KB.
+/// Heuristic check to determine if a file is plain text by probing its first
+/// 8 KB. An empty file has nothing to show and is not text.
 pub fn is_text_file(path: &Path) -> bool {
     let Ok(mut file) = File::open(path) else {
         return false;
@@ -201,7 +234,7 @@ pub fn is_text_file(path: &Path) -> bool {
     };
 
     if bytes_read == 0 {
-        return true;
+        return false;
     }
 
     let sample = &buffer[..bytes_read];
@@ -249,34 +282,39 @@ mod tests {
 
     #[test]
     fn operation_sets_share_the_detected_format() {
-        assert!(InputFormatSet::Merge.supports(Path::new("document.docx")));
-        assert!(!InputFormatSet::Ocr.supports(Path::new("document.docx")));
-        assert!(!InputFormatSet::Strip.supports(Path::new("photo.heic")));
-        assert!(!InputFormatSet::Strip.supports(Path::new("photo.avif")));
-        assert!(InputFormatSet::Convert.supports(Path::new("design.psd")));
-        assert!(InputFormatSet::Convert.supports(Path::new("scan.jp2")));
-        assert!(InputFormatSet::Convert.supports(Path::new("photo.jxr")));
-        assert!(InputFormatSet::Merge.supports(Path::new("slides.pptx")));
-        assert!(InputFormatSet::Merge.supports(Path::new("page.html")));
-        assert!(!InputFormatSet::Ocr.supports(Path::new("page.html")));
-        assert!(InputFormatSet::Convert.supports(Path::new("card.html")));
-        assert!(!InputFormatSet::Ocr.supports(Path::new("slides.pptx")));
-        assert!(InputFormatSet::Merge.supports(Path::new("photo.nef")));
-        assert!(InputFormatSet::Ocr.supports(Path::new("photo.arw")));
-        assert!(!InputFormatSet::Strip.supports(Path::new("photo.dng")));
-        assert!(!InputFormatSet::Strip.supports(Path::new("photo.webp")));
-        assert!(InputFormatSet::Strip.supports(Path::new("photo.png")));
-        assert!(InputFormatSet::Strip.supports(Path::new("photo.jpg")));
-        assert!(InputFormatSet::Rotate.supports(Path::new("document.pdf")));
-        assert!(InputFormatSet::Rotate.supports(Path::new("photo.jpg")));
-        assert!(InputFormatSet::Rotate.supports(Path::new("photo.jpeg")));
-        assert!(!InputFormatSet::Rotate.supports(Path::new("photo.png")));
-        assert!(!InputFormatSet::Rotate.supports(Path::new("photo.webp")));
-        assert!(InputFormatSet::Resize.supports(Path::new("document.pdf")));
-        assert!(InputFormatSet::Resize.supports(Path::new("photo.jpg")));
-        assert!(InputFormatSet::Resize.supports(Path::new("photo.jpeg")));
-        assert!(!InputFormatSet::Resize.supports(Path::new("photo.png")));
-        assert!(!InputFormatSet::Resize.supports(Path::new("photo.webp")));
+        assert!(InputFormatSet::Merge.includes(Path::new("document.docx")));
+        assert!(!InputFormatSet::Ocr.includes(Path::new("document.docx")));
+        assert!(!InputFormatSet::Strip.includes(Path::new("photo.heic")));
+        assert!(!InputFormatSet::Strip.includes(Path::new("photo.avif")));
+        assert!(InputFormatSet::Convert.includes(Path::new("design.psd")));
+        assert!(InputFormatSet::Convert.includes(Path::new("scan.jp2")));
+        assert!(InputFormatSet::Convert.includes(Path::new("photo.jxr")));
+        assert!(InputFormatSet::Merge.includes(Path::new("slides.pptx")));
+        assert!(InputFormatSet::Merge.includes(Path::new("page.html")));
+        assert!(!InputFormatSet::Ocr.includes(Path::new("page.html")));
+        assert!(InputFormatSet::Convert.includes(Path::new("card.html")));
+        assert!(!InputFormatSet::Ocr.includes(Path::new("slides.pptx")));
+        assert!(InputFormatSet::Merge.includes(Path::new("photo.nef")));
+        assert!(InputFormatSet::Ocr.includes(Path::new("photo.arw")));
+        assert!(!InputFormatSet::Strip.includes(Path::new("photo.dng")));
+        assert!(!InputFormatSet::Strip.includes(Path::new("photo.webp")));
+        assert!(InputFormatSet::Strip.includes(Path::new("photo.png")));
+        assert!(InputFormatSet::Strip.includes(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Rotate.includes(Path::new("document.pdf")));
+        assert!(InputFormatSet::Rotate.includes(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Rotate.includes(Path::new("photo.jpeg")));
+        assert!(!InputFormatSet::Rotate.includes(Path::new("photo.png")));
+        assert!(!InputFormatSet::Rotate.includes(Path::new("photo.webp")));
+        assert!(InputFormatSet::Resize.includes(Path::new("document.pdf")));
+        assert!(InputFormatSet::Resize.includes(Path::new("photo.jpg")));
+        assert!(InputFormatSet::Resize.includes(Path::new("photo.jpeg")));
+        assert!(!InputFormatSet::Resize.includes(Path::new("photo.png")));
+        assert!(!InputFormatSet::Resize.includes(Path::new("photo.webp")));
+        assert!(InputFormatSet::Convert.includes(Path::new("logo.svg")));
+        assert!(InputFormatSet::Rotate.includes(Path::new("download.JFIF")));
+        assert!(InputFormatSet::Convert.includes(Path::new("photo.jxl")));
+        // Listings take known formats only, not everything that looks like text.
+        assert!(!InputFormatSet::Merge.includes(Path::new("Makefile")));
     }
 
     #[test]

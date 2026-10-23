@@ -11,15 +11,21 @@ use anyhow::{Result, bail};
 
 use crate::cli::Command;
 use crate::config::Config;
-use crate::pdf::transform;
+use crate::pdf::transform::{self, OptimizeOptions};
 use crate::{doctor, output, pdf};
 
 pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
     match command {
         Command::Merge(args) => merge::run(args, &config, fail_fast),
         Command::Ocr(args) => ocr::run(args, &config, fail_fast),
-        Command::Split { input, out } => pdf_edit::split(&input, out.as_deref()),
-        Command::Extract { input, pages, out } => pdf_edit::extract(&input, &pages, out.as_deref()),
+        Command::Split { input, out, force } => pdf_edit::split(&input, out.as_deref(), force),
+        Command::Extract {
+            input,
+            pages,
+            output,
+        } => common::edit_pdf(&input, &output, "extracted", |document| {
+            pdf::select_pages(document, &pages)
+        }),
         Command::Info { input } => pdf_edit::info(&input),
         Command::Text { input, out } => pdf_edit::text(&input, out.as_deref()),
         Command::Strip(args) => strip::run(args, &config, fail_fast),
@@ -28,32 +34,72 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
         Command::Optimize(args) => {
             let destination = common::edited_output(&args.input, &args.output, "optimized")?;
             let mut document = pdf::load(&args.input)?;
-            optimize_document(&mut document, &config);
-            let bytes = pdf_bytes(document, &config, args.max_size)?;
+            if args.remove_blank {
+                remove_blank_pages(&mut document, &args.input.display().to_string())?;
+            }
+            optimize_document(
+                &mut document,
+                config.image_dpi,
+                config.jpeg_quality,
+                args.gray,
+            );
+            let bytes = pdf_bytes(document, &config, args.max_size, args.gray)?;
             common::write_output(&destination, &bytes)
         }
         Command::Stamp(args) => pdf_edit::stamp(args, &config),
         Command::Number(args) => pdf_edit::number(args, &config),
         Command::Watermark(args) => pdf_edit::watermark(args, &config),
         Command::Metadata(args) => pdf_edit::metadata(args),
+        Command::Protect(args) => pdf_edit::protect(args),
+        Command::Unlock(args) => pdf_edit::unlock(args),
         Command::Convert(args) => convert::run(args, &config, fail_fast),
         Command::Doctor => doctor::run(&config),
     }
 }
 
-fn optimize_document(document: &mut lopdf::Document, config: &Config) {
-    let report = transform::optimize(document, config.image_dpi, config.jpeg_quality, false);
+/// Downsample images to `image_dpi` (and turn them gray) and tidy the PDF.
+fn optimize_document(document: &mut lopdf::Document, image_dpi: u32, jpeg_quality: u8, gray: bool) {
+    let report = transform::optimize(
+        document,
+        OptimizeOptions {
+            image_dpi,
+            jpeg_quality,
+            recompress_all: false,
+            gray,
+        },
+    );
     for warning in report.warnings {
         output::warn(format!("Image optimization warning: {warning}"));
     }
-    if config.image_dpi == 0 {
-        output::info("Image downsampling is disabled by image_dpi=0");
-    } else {
+    let skipped = report.skipped_images;
+    match (image_dpi, gray) {
+        (0, false) => output::info("Image downsampling is disabled by image_dpi=0"),
+        (0, true) => output::info(format!(
+            "Images turned gray: {}; skipped: {skipped}",
+            report.resized_images
+        )),
+        (dpi, _) => output::info(format!(
+            "Images {}at most {dpi} DPI: {}; skipped: {skipped}",
+            if gray {
+                "turned gray and "
+            } else {
+                "downsampled to "
+            },
+            report.resized_images
+        )),
+    }
+}
+
+/// Drop blank scanned pages of `document` (named `label` in messages).
+fn remove_blank_pages(document: &mut lopdf::Document, label: &str) -> Result<()> {
+    let removed = pdf::blank::remove_blank_pages(document)?;
+    if !removed.is_empty() {
         output::info(format!(
-            "Images downsampled to at most {} DPI: {}; skipped: {}",
-            config.image_dpi, report.resized_images, report.skipped_images
+            "Removed blank pages of {label}: {}",
+            common::join_numbers(&removed)
         ));
     }
+    Ok(())
 }
 
 /// Serialise a document, lowering image resolution and JPEG quality until it
@@ -63,7 +109,12 @@ fn optimize_document(document: &mut lopdf::Document, config: &Config) {
 /// the gentlest one first (often enough), then the strongest (is it possible
 /// at all?), then bisection in between. Each attempt re-encodes every image,
 /// so this needs about four attempts instead of up to nine.
-fn pdf_bytes(document: lopdf::Document, config: &Config, max_size: Option<u64>) -> Result<Vec<u8>> {
+fn pdf_bytes(
+    document: lopdf::Document,
+    config: &Config,
+    max_size: Option<u64>,
+    gray: bool,
+) -> Result<Vec<u8>> {
     let mut document = document;
     let Some(limit) = max_size else {
         return pdf::save_to_bytes(&mut document);
@@ -103,7 +154,15 @@ fn pdf_bytes(document: lopdf::Document, config: &Config, max_size: Option<u64>) 
     let attempt = |index: usize| -> Result<Vec<u8>> {
         let (dpi, quality) = steps[index];
         let mut candidate = document.clone();
-        transform::optimize(&mut candidate, dpi, quality, true);
+        transform::optimize(
+            &mut candidate,
+            OptimizeOptions {
+                image_dpi: dpi,
+                jpeg_quality: quality,
+                recompress_all: true,
+                gray,
+            },
+        );
         let bytes = pdf::save_to_bytes(&mut candidate)?;
         output::info(format!(
             "Size fitting: {dpi} DPI, JPEG quality {quality}: {}",
@@ -167,16 +226,16 @@ mod tests {
         DynamicImage::ImageRgb8(image)
             .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
             .unwrap();
-        pdf::jpeg_document(jpeg, "A4").unwrap()
+        pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap()
     }
 
     #[test]
     fn size_fitting_finds_a_step_within_the_limit() {
         let config = Config::default();
-        let full = pdf_bytes(noisy_page(), &config, None).unwrap().len() as u64;
+        let full = pdf_bytes(noisy_page(), &config, None, false).unwrap().len() as u64;
         let limit = full * 2 / 5;
-        let fitted = pdf_bytes(noisy_page(), &config, Some(limit)).unwrap();
+        let fitted = pdf_bytes(noisy_page(), &config, Some(limit), false).unwrap();
         assert!(fitted.len() as u64 <= limit, "{} > {limit}", fitted.len());
-        assert!(pdf_bytes(noisy_page(), &config, Some(1000)).is_err());
+        assert!(pdf_bytes(noisy_page(), &config, Some(1000), false).is_err());
     }
 }

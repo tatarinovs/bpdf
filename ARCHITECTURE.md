@@ -25,9 +25,11 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 - `commands/convert.rs`: complete output planning before writes and image/PDF
   conversion.
 - `commands/strip.rs`: metadata-removal policy.
-- `commands/pdf_edit.rs`: single-document PDF commands.
+- `commands/pdf_edit.rs`: single-document PDF commands, including `protect`
+  and `unlock`.
 - `commands/common.rs`: atomic edit boundary, path identity, output registry,
-  and batch summaries.
+  batch summaries (partial failure exits with code 2) and `edit_each`, the
+  driver of per-file batch edits (`strip`, `rotate`, `resize`).
 - `commands/mod.rs`: routing only.
 
 ## Shared contracts
@@ -81,7 +83,15 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 - Batch commands run independent inputs through `commands::common::batch`,
   which uses `parallel::map` unless `--fail-fast` requires sequential,
   lazy processing. Office conversions are serialised by a process-wide lock.
-- PDF loading and bounded text extraction are implemented once in `pdf/mod.rs`.
+- PDF loading (with or without a password), encryption (`protect`), page
+  sizes (`PageSize`: paper, `keep`, `fit`) and bounded text extraction are
+  implemented once in `pdf/mod.rs`. Merging, with the outlines and named
+  destinations of every source, lives in `pdf/merge.rs`; blank-page detection
+  in `pdf/blank.rs`.
+- CLI values (page sizes, OCR engine, blend mode, orientation, positions) are
+  parsed into their domain types by clap, and the configuration deserialises
+  `page_size` and `ocr_engine` through the same parsers, so invalid values
+  fail before any work.
 - All material writes use `atomic::write_atomic`.
 
 ## Efficiency notes

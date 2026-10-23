@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
-use super::MAX_DECOMPRESSED_BYTES;
+use super::{MAX_DECOMPRESSED_BYTES, resolve};
 use crate::{imageconv, output, parallel};
 
 /// Largest raw image decoded from a PDF (an A3 page at 1200 DPI fits).
@@ -16,6 +16,8 @@ const MAX_IMAGE_PIXELS: u64 = 300_000_000;
 /// A page image re-encoded (or copied) as JPEG, oriented like the page.
 #[derive(Debug)]
 pub struct ExtractedImage {
+    /// The image XObject; `None` for images that are not part of a PDF.
+    pub id: Option<ObjectId>,
     pub label: String,
     pub bytes: Vec<u8>,
     pub width: u32,
@@ -86,7 +88,7 @@ pub(crate) fn page_images(
             Selection::Largest => format!("page_{page_number}"),
             Selection::AllFrom(_) => format!("page_{page_number}_image_{}", index + 1),
         };
-        match extract_one(document, stream, rotation, jpeg_quality, label) {
+        match extract_one(document, image.id, stream, rotation, jpeg_quality, label) {
             Ok(extracted) => output.push(extracted),
             Err(_) => continue,
         }
@@ -99,6 +101,7 @@ pub(crate) fn page_images(
 
 fn extract_one(
     document: &Document,
+    id: ObjectId,
     stream: &Stream,
     rotation: i64,
     jpeg_quality: u8,
@@ -113,6 +116,7 @@ fn extract_one(
         && matches!(info.components, 1 | 3)
     {
         return Ok(ExtractedImage {
+            id: Some(id),
             label,
             bytes: jpeg.to_vec(),
             width: u32::from(info.width),
@@ -132,6 +136,7 @@ fn extract_one(
         _ => image,
     };
     Ok(ExtractedImage {
+        id: Some(id),
         label,
         bytes: imageconv::encode_jpeg_on_white(&image, jpeg_quality)?,
         width: image.width(),
@@ -146,7 +151,45 @@ pub(crate) fn placements(
     document: &Document,
     page_id: ObjectId,
 ) -> Result<HashMap<ObjectId, (f64, f64)>> {
-    let mut found = HashMap::new();
+    let mut found = HashMap::<ObjectId, (f64, f64)>::new();
+    for (id, matrix) in drawn_images(document, page_id)? {
+        let size = found.entry(id).or_insert((0.0, 0.0));
+        let (width, height) = drawn_size(matrix);
+        *size = (size.0.max(width), size.1.max(height));
+    }
+    Ok(found)
+}
+
+/// Bounding box `[left, bottom, right, top]` in user space of the largest
+/// drawing of each image XObject on a page.
+pub(crate) fn placement_boxes(
+    document: &Document,
+    page_id: ObjectId,
+) -> Result<HashMap<ObjectId, [f64; 4]>> {
+    let mut largest = HashMap::<ObjectId, (f64, Matrix)>::new();
+    for (id, matrix) in drawn_images(document, page_id)? {
+        let (width, height) = drawn_size(matrix);
+        let area = width * height;
+        if largest.get(&id).is_none_or(|(known, _)| area > *known) {
+            largest.insert(id, (area, matrix));
+        }
+    }
+    Ok(largest
+        .into_iter()
+        .map(|(id, (_, [a, b, c, d, e, f]))| {
+            // Corners of the unit square the image is drawn into.
+            let xs = [e, a + e, c + e, a + c + e];
+            let ys = [f, b + f, d + f, b + d + f];
+            let min = |values: [f64; 4]| values.into_iter().fold(f64::INFINITY, f64::min);
+            let max = |values: [f64; 4]| values.into_iter().fold(f64::NEG_INFINITY, f64::max);
+            (id, [min(xs), min(ys), max(xs), max(ys)])
+        })
+        .collect())
+}
+
+/// Every image drawing on a page with its current transformation matrix.
+fn drawn_images(document: &Document, page_id: ObjectId) -> Result<Vec<(ObjectId, Matrix)>> {
+    let mut found = Vec::new();
     let Some(resources) = super::transform::inherited_value(document, page_id, b"Resources") else {
         return Ok(found);
     };
@@ -157,6 +200,10 @@ pub(crate) fn placements(
     let content = document.get_page_content_with_limit(page_id, MAX_DECOMPRESSED_BYTES)?;
     walk_placements(document, &content, resources, IDENTITY, 0, &mut found)?;
     Ok(found)
+}
+
+fn drawn_size(matrix: Matrix) -> (f64, f64) {
+    (matrix[0].hypot(matrix[1]), matrix[2].hypot(matrix[3]))
 }
 
 type Matrix = [f64; 6];
@@ -204,7 +251,7 @@ fn walk_placements(
     resources: &Dictionary,
     base: Matrix,
     depth: u8,
-    found: &mut HashMap<ObjectId, (f64, f64)>,
+    found: &mut Vec<(ObjectId, Matrix)>,
 ) -> Result<()> {
     if depth > 8 {
         bail!("form XObjects are nested too deeply");
@@ -234,12 +281,7 @@ fn walk_placements(
                     continue;
                 };
                 match stream.dict.get(b"Subtype").and_then(Object::as_name) {
-                    Ok(b"Image") => {
-                        let width = current[0].hypot(current[1]);
-                        let height = current[2].hypot(current[3]);
-                        let size = found.entry(id).or_insert((0.0, 0.0));
-                        *size = (size.0.max(width), size.1.max(height));
-                    }
+                    Ok(b"Image") => found.push((id, current)),
                     Ok(b"Form") => {
                         let form_matrix = stream
                             .dict
@@ -363,7 +405,7 @@ pub(crate) fn decode(document: &Document, stream: &Stream) -> Result<DynamicImag
     to_image(width, height, &space, samples)
 }
 
-fn is_dct(filter: &[u8]) -> bool {
+pub(crate) fn is_dct(filter: &[u8]) -> bool {
     filter == b"DCTDecode" || filter == b"DCT"
 }
 
@@ -395,13 +437,6 @@ pub(crate) fn dimension(stream: &Stream, key: &[u8]) -> Result<u32> {
         .ok()
         .filter(|value| *value > 0)
         .context("invalid embedded image dimension")
-}
-
-fn resolve<'a>(document: &'a Document, object: &'a Object) -> Result<&'a Object> {
-    match object {
-        Object::Reference(id) => Ok(document.get_object(*id)?),
-        other => Ok(other),
-    }
 }
 
 fn resolve_color_space(document: &Document, object: &Object, depth: u8) -> Result<ColorSpace> {

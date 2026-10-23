@@ -1,34 +1,277 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
 
 use ::image::codecs::jpeg::JpegDecoder;
 use ::image::{ColorType, ExtendedColorType, ImageDecoder};
 use anyhow::{Context, Result, bail};
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream, dictionary};
+use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
+use lopdf::{
+    Dictionary, Document, EncryptionState, EncryptionVersion, Object, ObjectId, Permissions,
+    Stream, dictionary,
+};
 use serde_json::{Value, json};
 
 use crate::atomic::write_atomic;
+pub(crate) mod blank;
 pub(crate) mod image;
+mod merge;
 pub mod transform;
+
+pub use merge::{merge_documents, merge_outlined};
 
 /// Page attributes a page may inherit from its page-tree ancestors.
 const INHERITABLE: [&[u8]; 4] = [b"Resources", b"MediaBox", b"CropBox", b"Rotate"];
 
 pub const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
+const POINTS_PER_MM: f64 = 72.0 / 25.4;
+
+/// Named paper sizes, portrait width and height in millimetres.
+const PAPERS: [(&str, f64, f64); 9] = [
+    ("a3", 297.0, 420.0),
+    ("a4", 210.0, 297.0),
+    ("a5", 148.0, 210.0),
+    ("a6", 105.0, 148.0),
+    ("b4", 250.0, 353.0),
+    ("b5", 176.0, 250.0),
+    ("letter", 215.9, 279.4),
+    ("legal", 215.9, 355.6),
+    ("tabloid", 279.4, 431.8),
+];
+
+/// Target page size: a sheet of paper, the sizes of the source PDF pages
+/// (`keep`), or each image at its own resolution (`fit`). Text, HTML and the
+/// image resolution limit use A4 when no sheet is given.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PageSize {
+    /// Portrait width and height in points.
+    Paper {
+        width: f64,
+        height: f64,
+    },
+    Keep,
+    Fit,
+}
+
+impl PageSize {
+    pub const A4: Self = Self::Paper {
+        width: 210.0 * POINTS_PER_MM,
+        height: 297.0 * POINTS_PER_MM,
+    };
+
+    fn from_millimetres(width: f64, height: f64) -> Self {
+        Self::Paper {
+            width: width.min(height) * POINTS_PER_MM,
+            height: width.max(height) * POINTS_PER_MM,
+        }
+    }
+
+    /// Portrait size of the sheet; A4 for `keep` and `fit`.
+    pub fn sheet(self) -> (f64, f64) {
+        match self {
+            Self::Paper { width, height } => (width, height),
+            Self::Keep | Self::Fit => Self::A4.sheet(),
+        }
+    }
+
+    /// True for a sheet every page is fitted onto.
+    pub fn is_paper(self) -> bool {
+        matches!(self, Self::Paper { .. })
+    }
+}
+
+impl FromStr for PageSize {
+    type Err = String;
+
+    /// A paper name (A3-A6, B4, B5, Letter, Legal, Tabloid), `keep`, `fit`,
+    /// or `WIDTHxHEIGHT` with a unit of mm (the default), cm, in or pt.
+    fn from_str(value: &str) -> Result<Self, String> {
+        let name = value.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "keep" | "none" | "original" => return Ok(Self::Keep),
+            "fit" => return Ok(Self::Fit),
+            _ => {}
+        }
+        if let Some(&(_, width, height)) = PAPERS.iter().find(|(paper, ..)| *paper == name) {
+            return Ok(Self::from_millimetres(width, height));
+        }
+        let invalid = || {
+            format!(
+                "unknown page size '{value}'; use A3, A4, A5, A6, B4, B5, Letter, Legal, \
+                 Tabloid, keep, fit or WIDTHxHEIGHT[mm|cm|in|pt]"
+            )
+        };
+        let (number, millimetres) = [("mm", 1.0), ("cm", 10.0), ("in", 25.4), ("pt", 25.4 / 72.0)]
+            .into_iter()
+            .find_map(|(unit, factor)| Some((name.strip_suffix(unit)?, factor)))
+            .unwrap_or((name.as_str(), 1.0));
+        let (width, height) = number.split_once(['x', '×', '*']).ok_or_else(invalid)?;
+        let side = |text: &str| {
+            text.trim()
+                .replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .map(|side| side * millimetres)
+                // 1 pt to the 200-inch limit of PDF viewers.
+                .filter(|side| (25.4 / 72.0..=5080.0).contains(side))
+        };
+        match (side(width), side(height)) {
+            (Some(width), Some(height)) => Ok(Self::from_millimetres(width, height)),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+impl fmt::Display for PageSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Keep => formatter.write_str("keep"),
+            Self::Fit => formatter.write_str("fit"),
+            Self::Paper { width, height } => {
+                let (width, height) = (width / POINTS_PER_MM, height / POINTS_PER_MM);
+                match PAPERS.iter().find(|(_, paper_width, paper_height)| {
+                    (paper_width - width).abs() < 0.2 && (paper_height - height).abs() < 0.2
+                }) {
+                    Some((name, ..)) if name.len() == 2 => {
+                        formatter.write_str(&name.to_ascii_uppercase())
+                    }
+                    Some((name, ..)) => write!(
+                        formatter,
+                        "{}{}",
+                        name[..1].to_ascii_uppercase(),
+                        &name[1..]
+                    ),
+                    None => write!(formatter, "{width:.0}x{height:.0} mm"),
+                }
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PageSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Load a PDF. A document encrypted with an empty user password is decrypted
 /// and encrypted again on save; one that needs a password is refused.
 pub fn load(path: &Path) -> Result<Document> {
-    let document =
-        Document::load(path).with_context(|| format!("failed to load PDF {}", path.display()))?;
-    if document.is_encrypted() {
-        bail!(
-            "{} is password-protected; remove the password first",
+    load_with_password(path, None)
+}
+
+/// Load a PDF, opening an encrypted one with `password` (the user or the
+/// owner password).
+pub fn load_with_password(path: &Path, password: Option<&str>) -> Result<Document> {
+    let loaded = match password {
+        Some(password) => Document::load_with_password(path, password),
+        None => Document::load(path),
+    };
+    let document = loaded.with_context(|| match password {
+        Some(_) => format!(
+            "failed to open PDF {}; is the password correct?",
             path.display()
-        );
+        ),
+        None => format!("failed to load PDF {}", path.display()),
+    })?;
+    if document.is_encrypted() {
+        match password {
+            Some(_) => bail!("wrong password for {}", path.display()),
+            None => bail!(
+                "{} is password-protected; remove the password first with `bpdf unlock`",
+                path.display()
+            ),
+        }
     }
     Ok(document)
+}
+
+/// Restrictions of a protected PDF; every action is allowed by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Restrictions {
+    pub print: bool,
+    pub copy: bool,
+    pub modify: bool,
+}
+
+impl Restrictions {
+    pub fn any(self) -> bool {
+        self.print || self.copy || self.modify
+    }
+
+    fn permissions(self) -> Permissions {
+        let mut permissions = Permissions::all();
+        if self.print {
+            permissions.remove(Permissions::PRINTABLE | Permissions::PRINTABLE_IN_HIGH_QUALITY);
+        }
+        if self.copy {
+            permissions.remove(Permissions::COPYABLE);
+        }
+        if self.modify {
+            permissions.remove(
+                Permissions::MODIFIABLE
+                    | Permissions::ANNOTABLE
+                    | Permissions::FILLABLE
+                    | Permissions::ASSEMBLABLE,
+            );
+        }
+        permissions
+    }
+}
+
+/// Encrypt the document on save with AES-256 (PDF 2.0 security handler,
+/// revision 6). `user_password` opens it (empty: anyone may open it), the
+/// owner password lifts `restrictions`.
+pub fn protect(
+    document: &mut Document,
+    user_password: &str,
+    owner_password: &str,
+    restrictions: Restrictions,
+) -> Result<()> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|error| anyhow::anyhow!("no random source: {error}"))?;
+    let filter: Arc<dyn CryptFilter> = Arc::new(Aes256CryptFilter);
+    let state = EncryptionState::try_from(EncryptionVersion::V5 {
+        encrypt_metadata: true,
+        crypt_filters: std::collections::BTreeMap::from([(b"StdCF".to_vec(), filter)]),
+        file_encryption_key: &key,
+        stream_filter: b"StdCF".to_vec(),
+        string_filter: b"StdCF".to_vec(),
+        owner_password,
+        user_password,
+        permissions: restrictions.permissions(),
+    })
+    .context("failed to prepare PDF encryption")?;
+    // AES-256 belongs to PDF 2.0; for 1.x readers it is Adobe extension level 8.
+    if document.version.as_str() < "1.7" {
+        document.version = "1.7".to_owned();
+    }
+    if document.version.as_str() < "2.0" {
+        document.catalog_mut()?.set(
+            "Extensions",
+            dictionary! {
+                "ADBE" => dictionary! {
+                    "BaseVersion" => Object::Name(b"1.7".to_vec()),
+                    "ExtensionLevel" => 8,
+                },
+            },
+        );
+    }
+    document.encryption_state = Some(state);
+    Ok(())
+}
+
+/// Random lowercase hex, for an owner password nobody needs to know.
+pub fn random_password() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("no random source: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub fn transform_file<F>(path: &Path, transform: F) -> Result<Vec<u8>>
@@ -45,116 +288,6 @@ pub fn extract_text(document: &Document) -> Result<String> {
     document
         .extract_text_with_limit(&pages, MAX_DECOMPRESSED_BYTES)
         .context("failed to extract PDF text")
-}
-
-/// Merge without flattening leaf pages. Each source Pages root becomes a child
-/// of a new Pages root, preserving inherited resources, boxes and rotation.
-pub fn merge_documents(mut documents: Vec<Document>) -> Result<Document> {
-    if documents.len() <= 1 {
-        return documents.pop().context("no PDF documents to merge");
-    }
-
-    let pages_id: ObjectId = (1, 0);
-    let catalog_id: ObjectId = (2, 0);
-    let mut result = Document::with_version("1.7");
-    result.max_id = 2;
-
-    let mut next_id = 3u32;
-    let mut page_roots = Vec::with_capacity(documents.len());
-    let mut total_pages = 0usize;
-    let mut first_catalog: Option<Dictionary> = None;
-    let mut first_info: Option<Object> = None;
-    let mut first_form: Option<Dictionary> = None;
-    let mut all_fields = Vec::new();
-
-    for document in &mut documents {
-        document.renumber_objects_with(next_id);
-        next_id = document.max_id + 1;
-
-        let root_id = document
-            .trailer
-            .get(b"Root")
-            .context("PDF trailer has no Root")?
-            .as_reference()
-            .context("PDF Root is not an indirect object")?;
-        let catalog = document
-            .get_dictionary(root_id)
-            .context("failed to read PDF catalog")?
-            .clone();
-        let source_pages_id = catalog
-            .get(b"Pages")
-            .context("PDF catalog has no Pages tree")?
-            .as_reference()
-            .context("PDF Pages root is not an indirect object")?;
-
-        total_pages += document.get_pages().len();
-        document
-            .get_object_mut(source_pages_id)?
-            .as_dict_mut()?
-            .set("Parent", pages_id);
-        page_roots.push(Object::Reference(source_pages_id));
-
-        // Form fields of every document join one AcroForm; the first
-        // document's form settings (default appearance, resources) stay.
-        let form = catalog
-            .get(b"AcroForm")
-            .ok()
-            .and_then(|form| transform::resolve_dictionary(document, form));
-        if let Some(form) = &form {
-            if let Some(fields) = form
-                .get(b"Fields")
-                .ok()
-                .and_then(|fields| resolve_array(document, fields))
-            {
-                all_fields.extend(fields);
-            }
-            first_form.get_or_insert_with(|| form.clone());
-        }
-
-        if first_catalog.is_none() {
-            first_catalog = Some(catalog);
-            first_info = document.trailer.get(b"Info").ok().cloned();
-        }
-
-        result.objects.extend(std::mem::take(&mut document.objects));
-    }
-
-    result.objects.insert(
-        pages_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Pages",
-            "Kids" => page_roots,
-            "Count" => total_pages as i64,
-        }),
-    );
-
-    let mut catalog = first_catalog.unwrap_or_default();
-    catalog.set("Type", "Catalog");
-    catalog.set("Pages", pages_id);
-    // Labels of the first document would number every later page too.
-    catalog.remove(b"PageLabels");
-    catalog.remove(b"AcroForm");
-    if let Some(mut form) = first_form {
-        // An XFA form describes only the first document's fields.
-        form.remove(b"XFA");
-        form.set("Fields", all_fields);
-        let form_id = (next_id, 0);
-        next_id += 1;
-        result.objects.insert(form_id, Object::Dictionary(form));
-        catalog.set("AcroForm", form_id);
-    }
-    result
-        .objects
-        .insert(catalog_id, Object::Dictionary(catalog));
-    result.trailer.set("Root", catalog_id);
-    if let Some(info) = first_info {
-        result.trailer.set("Info", info);
-    }
-
-    result.max_id = next_id.saturating_sub(1).max(2);
-    result.prune_objects();
-    result.renumber_objects();
-    Ok(result)
 }
 
 /// Human-readable report and JSON data describing a PDF: version, page
@@ -202,12 +335,7 @@ Pages: {}
     }
 
     let mut fields = serde_json::Map::new();
-    let info = match document.trailer.get(b"Info") {
-        Ok(Object::Reference(id)) => document.get_dictionary(*id).ok(),
-        Ok(Object::Dictionary(dictionary)) => Some(dictionary),
-        _ => None,
-    };
-    if let Some(info) = info {
+    if let Some(info) = info_dictionary(&document) {
         for key in [
             "Title",
             "Author",
@@ -248,7 +376,18 @@ Pages: {}
     Ok((report, data))
 }
 
-pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
+/// The document information dictionary, whether the trailer holds it
+/// directly or by reference.
+pub(crate) fn info_dictionary(document: &Document) -> Option<&Dictionary> {
+    resolve(document, document.trailer.get(b"Info").ok()?)
+        .ok()?
+        .as_dict()
+        .ok()
+}
+
+/// One PDF per page in `output_dir`. Existing files are only replaced with
+/// `force`; every name is checked before the first one is written.
+pub fn split_file(path: &Path, output_dir: &Path, force: bool) -> Result<Vec<PathBuf>> {
     let document = load(path)?;
     let pages = document.get_pages().into_values().collect::<Vec<_>>();
     if pages.is_empty() {
@@ -259,20 +398,42 @@ pub fn split_file(path: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
         .and_then(|value| value.to_str())
         .unwrap_or("page");
     let width = pages.len().to_string().len();
-    let numbered = pages.into_iter().enumerate().collect::<Vec<_>>();
-
-    crate::parallel::map(
-        &numbered,
-        crate::parallel::cpu_jobs(),
-        |(index, page_id)| {
-            let mut one_page = page_document(&document, *page_id)?;
+    let jobs = pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, page_id)| {
             let output = output_dir.join(format!("{stem}_{:0width$}.pdf", index + 1));
-            write_atomic(&output, &save_to_bytes(&mut one_page)?)?;
-            Ok(output)
-        },
-    )
+            (page_id, output)
+        })
+        .collect::<Vec<_>>();
+    if !force && let Some((_, existing)) = jobs.iter().find(|(_, output)| output.exists()) {
+        bail!(
+            "{} already exists; pass --force to replace the split pages",
+            existing.display()
+        );
+    }
+
+    crate::parallel::map(&jobs, crate::parallel::cpu_jobs(), |(page_id, output)| {
+        let mut one_page = page_document(&document, *page_id)?;
+        write_atomic(output, &save_to_bytes(&mut one_page)?)?;
+        Ok(output.clone())
+    })
     .into_iter()
     .collect()
+}
+
+/// A copy of the page dictionary with the attributes it inherits from the
+/// page tree written into it.
+fn standalone_page(document: &Document, page_id: ObjectId) -> Result<Dictionary> {
+    let mut page = document.get_dictionary(page_id)?.clone();
+    for key in INHERITABLE {
+        if page.get(key).is_err()
+            && let Some(value) = transform::inherited_value(document, page_id, key)
+        {
+            page.set(key, value);
+        }
+    }
+    Ok(page)
 }
 
 /// Build a standalone document from one page, copying only the objects that
@@ -290,15 +451,8 @@ fn page_document(source: &Document, page_id: ObjectId) -> Result<Document> {
         b"OpenAction",
     ];
 
-    let mut page = source.get_dictionary(page_id)?.clone();
+    let mut page = standalone_page(source, page_id)?;
     page.remove(b"Parent");
-    for key in INHERITABLE {
-        if page.get(key).is_err()
-            && let Some(value) = transform::inherited_value(source, page_id, key)
-        {
-            page.set(key, value);
-        }
-    }
 
     let mut target = Document::with_version(source.version.as_str());
     let pages_id: ObjectId = (1, 0);
@@ -437,10 +591,11 @@ pub fn save_to_bytes(document: &mut Document) -> Result<Vec<u8>> {
     document.prune_objects();
     document.renumber_objects();
     document.compress();
-    // The source's encryption and permissions carry over; the keys derive
-    // from the first file identifier, so it must still be present.
+    // The source's encryption and permissions carry over (or `protect` set
+    // new ones). Before revision 5 the keys derive from the first file
+    // identifier, so it must still be present.
     if let Some(state) = document.encryption_state.take() {
-        if document.trailer.has(b"ID") {
+        if state.revision() >= 5 || document.trailer.has(b"ID") {
             document
                 .encrypt(&state)
                 .context("failed to encrypt PDF again")?;
@@ -469,14 +624,7 @@ pub(crate) fn select_pages(document: &mut Document, expression: &str) -> Result<
     let mut kids = Vec::with_capacity(list.len());
     for number in &list {
         let page_id = pages[&(*number as u32)];
-        let mut page = document.get_dictionary(page_id)?.clone();
-        for key in INHERITABLE {
-            if page.get(key).is_err()
-                && let Some(value) = transform::inherited_value(document, page_id, key)
-            {
-                page.set(key, value);
-            }
-        }
+        let mut page = standalone_page(document, page_id)?;
         page.set("Parent", root_id);
         let id = if kept.insert(page_id) {
             document.objects.insert(page_id, Object::Dictionary(page));
@@ -571,26 +719,43 @@ pub(crate) struct ImagePlacement {
     pub height: f64,
 }
 
+/// `dpi` is the image resolution, used by `PageSize::Fit` (96 when unknown).
 pub(crate) fn image_placement(
     pixel_width: u32,
     pixel_height: u32,
-    page_size: &str,
-) -> Result<ImagePlacement> {
-    let (mut page_width, mut page_height) = paper_size(page_size)?;
+    page_size: PageSize,
+    dpi: Option<f64>,
+) -> ImagePlacement {
+    if page_size == PageSize::Fit {
+        let scale = 72.0 / dpi.filter(|dpi| *dpi >= 1.0).unwrap_or(96.0);
+        let (width, height) = (
+            f64::from(pixel_width) * scale,
+            f64::from(pixel_height) * scale,
+        );
+        return ImagePlacement {
+            page_width: width,
+            page_height: height,
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        };
+    }
+    let (mut page_width, mut page_height) = page_size.sheet();
     if (pixel_width > pixel_height) != (page_width > page_height) {
         std::mem::swap(&mut page_width, &mut page_height);
     }
     let scale = (page_width / f64::from(pixel_width)).min(page_height / f64::from(pixel_height));
     let width = f64::from(pixel_width) * scale;
     let height = f64::from(pixel_height) * scale;
-    Ok(ImagePlacement {
+    ImagePlacement {
         page_width,
         page_height,
         x: (page_width - width) / 2.0,
         y: (page_height - height) / 2.0,
         width,
         height,
-    })
+    }
 }
 
 /// Image-space matrix (`cm` operands) drawing a stored JPEG into `rect`
@@ -616,7 +781,19 @@ fn oriented_image_matrix(orientation: u16, rect: &ImagePlacement) -> [f64; 6] {
     }
 }
 
-pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> {
+/// A one-page document showing the JPEG; with `PageSize::Fit` the page takes
+/// the image size at the resolution recorded in the JPEG.
+pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: PageSize) -> Result<Document> {
+    jpeg_document_at(jpeg, page_size, None)
+}
+
+/// [`jpeg_document`] with the image resolution for `PageSize::Fit`; `None`
+/// reads it from the JPEG.
+pub(crate) fn jpeg_document_at(
+    jpeg: Vec<u8>,
+    page_size: PageSize,
+    dpi: Option<f64>,
+) -> Result<Document> {
     let info = jpeg_info(&jpeg)?;
     let orientation = crate::metadata::jpeg_orientation(&jpeg);
     let (display_width, display_height) = if orientation >= 5 {
@@ -624,7 +801,11 @@ pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> 
     } else {
         (u32::from(info.width), u32::from(info.height))
     };
-    let placement = image_placement(display_width, display_height, page_size)?;
+    let dpi = match page_size {
+        PageSize::Fit => dpi.or_else(|| crate::metadata::image_dpi(&jpeg)),
+        _ => None,
+    };
+    let placement = image_placement(display_width, display_height, page_size, dpi);
     let (page_width, page_height) = (placement.page_width, placement.page_height);
     let matrix = oriented_image_matrix(orientation, &placement)
         .map(|value| format!("{value:.6}"))
@@ -695,14 +876,6 @@ pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: &str) -> Result<Document> 
     Ok(document)
 }
 
-pub(crate) fn paper_size(name: &str) -> Result<(f64, f64)> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "a4" | "none" | "original" | "keep" => Ok((595.275_590_551, 841.889_763_78)),
-        "letter" => Ok((612.0, 792.0)),
-        other => bail!("unsupported image page size {other}; use A4 or Letter"),
-    }
-}
-
 pub(super) fn object_number(object: &Object) -> Result<f64> {
     match object {
         Object::Integer(value) => Ok(*value as f64),
@@ -738,15 +911,11 @@ pub(crate) fn jpeg_info(bytes: &[u8]) -> Result<JpegInfo> {
     })
 }
 
-fn resolve_array(document: &Document, object: &Object) -> Option<Vec<Object>> {
+/// The object a reference points to, or `object` itself.
+pub(crate) fn resolve<'a>(document: &'a Document, object: &'a Object) -> Result<&'a Object> {
     match object {
-        Object::Reference(id) => document
-            .get_object(*id)
-            .and_then(Object::as_array)
-            .ok()
-            .cloned(),
-        Object::Array(items) => Some(items.clone()),
-        _ => None,
+        Object::Reference(id) => Ok(document.get_object(*id)?),
+        other => Ok(other),
     }
 }
 
@@ -756,16 +925,13 @@ fn remove_keys(dictionary: &mut Dictionary, keys: &[&[u8]]) {
     }
 }
 
-fn pdf_text(object: &Object) -> String {
+/// A text string in PDFDocEncoding, UTF-16BE or UTF-8 (with their BOMs).
+pub(crate) fn pdf_text(object: &Object) -> String {
     match object {
-        Object::String(bytes, _) if bytes.starts_with(&[0xfe, 0xff]) => {
-            let units = bytes[2..]
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                .collect::<Vec<_>>();
-            String::from_utf16_lossy(&units)
-        }
-        Object::String(bytes, _) | Object::Name(bytes) => String::from_utf8_lossy(bytes).into(),
+        Object::String(bytes, _) => lopdf::decode_text_string(object)
+            .map(|text| text.trim_start_matches('\u{feff}').to_owned())
+            .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into()),
+        Object::Name(bytes) => String::from_utf8_lossy(bytes).into(),
         Object::Integer(value) => value.to_string(),
         Object::Real(value) => value.to_string(),
         _ => format!("{object:?}"),
@@ -804,8 +970,8 @@ mod tests {
     #[test]
     fn selection_reorders_and_duplicates_pages() {
         // Page 1 is landscape (3x2 image), page 2 portrait (2x3).
-        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
-        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let first = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), crate::pdf::PageSize::A4).unwrap();
         let mut merged = merge_documents(vec![first, second]).unwrap();
         select_pages(&mut merged, "2,1,2").unwrap();
         let bytes = save_to_bytes(&mut merged).unwrap();
@@ -824,7 +990,7 @@ mod tests {
 
     #[test]
     fn creates_valid_image_pdf() {
-        let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let mut document = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
         let bytes = save_to_bytes(&mut document).unwrap();
         let loaded = Document::load_mem(&bytes).unwrap();
         assert_eq!(loaded.get_pages().len(), 1);
@@ -832,8 +998,8 @@ mod tests {
 
     #[test]
     fn merged_page_trees_keep_all_pages() {
-        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
-        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let first = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), crate::pdf::PageSize::A4).unwrap();
         let mut merged = merge_documents(vec![first, second]).unwrap();
         let bytes = save_to_bytes(&mut merged).unwrap();
         let loaded = Document::load_mem(&bytes).unwrap();
@@ -842,8 +1008,8 @@ mod tests {
 
     #[test]
     fn page_selection_removes_unselected_page_tree_branches() {
-        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
-        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let first = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), crate::pdf::PageSize::A4).unwrap();
         let mut merged = merge_documents(vec![first, second]).unwrap();
         select_pages(&mut merged, "2").unwrap();
         let bytes = save_to_bytes(&mut merged).unwrap();
@@ -860,14 +1026,21 @@ mod tests {
 
     #[test]
     fn split_clones_keep_pages_isolated() {
-        let first = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
-        let second = jpeg_document(sample_jpeg(2, 3), "A4").unwrap();
+        let first = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
+        let second = jpeg_document(sample_jpeg(2, 3), crate::pdf::PageSize::A4).unwrap();
         let mut merged = merge_documents(vec![first, second]).unwrap();
         let source = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
         merged.save(source.path()).unwrap();
         let output = tempfile::tempdir().unwrap();
 
-        let files = split_file(source.path(), output.path()).unwrap();
+        let files = split_file(source.path(), output.path(), false).unwrap();
+        // A second split would replace the pages: only with --force.
+        let error = split_file(source.path(), output.path(), false).unwrap_err();
+        assert!(format!("{error:#}").contains("--force"), "{error:#}");
+        assert_eq!(
+            split_file(source.path(), output.path(), true).unwrap(),
+            files
+        );
 
         assert_eq!(files.len(), 2);
         for file in files {
@@ -880,7 +1053,7 @@ mod tests {
 
     fn encrypted_file(user_password: &str) -> tempfile::NamedTempFile {
         use lopdf::{EncryptionState, EncryptionVersion, Permissions};
-        let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let mut document = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
         let id = Object::string_literal(b"0123456789abcdef".to_vec());
         document.trailer.set("ID", vec![id.clone(), id]);
         let state = EncryptionState::try_from(EncryptionVersion::V2 {
@@ -927,10 +1100,113 @@ mod tests {
         );
     }
 
+    fn protected_file(
+        user: &str,
+        owner: &str,
+        restrictions: Restrictions,
+    ) -> tempfile::NamedTempFile {
+        let mut document = jpeg_document(sample_jpeg(3, 2), PageSize::A4).unwrap();
+        protect(&mut document, user, owner, restrictions).unwrap();
+        let file = tempfile::Builder::new().suffix(".pdf").tempfile().unwrap();
+        std::fs::write(file.path(), save_to_bytes(&mut document).unwrap()).unwrap();
+        file
+    }
+
+    #[test]
+    fn protected_pdf_opens_with_either_password_only() {
+        let file = protected_file("open", "owner", Restrictions::default());
+        assert!(load(file.path()).is_err());
+        assert!(load_with_password(file.path(), Some("wrong")).is_err());
+        for password in ["open", "owner"] {
+            let document = load_with_password(file.path(), Some(password)).unwrap();
+            assert!(document.was_encrypted());
+            assert_eq!(document.get_pages().len(), 1);
+        }
+    }
+
+    #[test]
+    fn restrictions_survive_edits_and_unlock_removes_them() {
+        let restrictions = Restrictions {
+            print: true,
+            copy: true,
+            modify: false,
+        };
+        let file = protected_file("", "owner", restrictions);
+        // No open password: the file loads, and an edit keeps the protection.
+        let edited = transform_file(file.path(), |document| {
+            transform::rotate_pages(document, "all", 90)
+        })
+        .unwrap();
+        let reloaded = Document::load_mem(&edited).unwrap();
+        let state = reloaded.encryption_state.as_ref().unwrap();
+        assert_eq!(state.revision(), 6);
+        assert!(!state.permissions().contains(Permissions::PRINTABLE));
+        assert!(!state.permissions().contains(Permissions::COPYABLE));
+        assert!(state.permissions().contains(Permissions::MODIFIABLE));
+
+        let mut unlocked = load_with_password(file.path(), Some("owner")).unwrap();
+        unlocked.encryption_state = None;
+        let unlocked = Document::load_mem(&save_to_bytes(&mut unlocked).unwrap()).unwrap();
+        assert!(!unlocked.was_encrypted());
+        assert!(unlocked.trailer.get(b"Encrypt").is_err());
+    }
+
+    #[test]
+    fn page_sizes_parse_names_units_and_modes() {
+        let points = |value: &str| match value.parse::<PageSize>().unwrap() {
+            PageSize::Paper { width, height } => (width.round(), height.round()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(points("A4"), (595.0, 842.0));
+        assert_eq!(points("letter"), (612.0, 792.0));
+        assert_eq!(points("Legal"), (612.0, 1008.0));
+        assert_eq!(points("a3"), (842.0, 1191.0));
+        assert_eq!(points("297x210mm"), (595.0, 842.0));
+        assert_eq!(points("21 x 29,7 cm"), (595.0, 842.0));
+        assert_eq!(points("8.5x11in"), (612.0, 792.0));
+        assert_eq!(points("612x792pt"), (612.0, 792.0));
+        assert_eq!("keep".parse::<PageSize>(), Ok(PageSize::Keep));
+        assert_eq!("ORIGINAL".parse::<PageSize>(), Ok(PageSize::Keep));
+        assert_eq!("fit".parse::<PageSize>(), Ok(PageSize::Fit));
+        for invalid in ["A9", "x", "0x10", "10x10km", "100000x10"] {
+            assert!(invalid.parse::<PageSize>().is_err(), "{invalid}");
+        }
+        assert_eq!(PageSize::A4.to_string(), "A4");
+        assert_eq!("letter".parse::<PageSize>().unwrap().to_string(), "Letter");
+        assert_eq!(
+            "100x150".parse::<PageSize>().unwrap().to_string(),
+            "100x150 mm"
+        );
+    }
+
+    #[test]
+    fn fitted_pages_take_the_image_size_at_its_resolution() {
+        let placement = image_placement(300, 150, PageSize::Fit, Some(150.0));
+        assert_eq!((placement.page_width, placement.page_height), (144.0, 72.0));
+        assert_eq!((placement.x, placement.width), (0.0, 144.0));
+        let unknown = image_placement(96, 96, PageSize::Fit, None);
+        assert_eq!(unknown.page_width, 72.0);
+    }
+
+    #[test]
+    fn info_strings_decode_pdf_doc_encoding_and_bom() {
+        // 0xE9 is é in PDFDocEncoding, 0x8D a left double quotation mark.
+        let literal = Object::String(
+            vec![b'C', b'a', b'f', 0xE9, 0x8D],
+            lopdf::StringFormat::Literal,
+        );
+        assert_eq!(pdf_text(&literal), "Caf\u{e9}\u{201c}");
+        let utf8 = Object::String(
+            "\u{feff}Привет".as_bytes().to_vec(),
+            lopdf::StringFormat::Literal,
+        );
+        assert_eq!(pdf_text(&utf8), "Привет");
+    }
+
     #[test]
     fn merge_keeps_form_fields_of_every_document() {
         let form_page = |name: &str| {
-            let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+            let mut document = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
             let page_id = *document.get_pages().get(&1).unwrap();
             let field = document.add_object(dictionary! {
                 "Type" => "Annot",
@@ -980,7 +1256,7 @@ mod tests {
 
     #[test]
     fn pdf_strip_removes_info_catalog_and_page_metadata() {
-        let mut document = jpeg_document(sample_jpeg(3, 2), "A4").unwrap();
+        let mut document = jpeg_document(sample_jpeg(3, 2), crate::pdf::PageSize::A4).unwrap();
         let metadata_id = document.add_object(Stream::new(
             dictionary! {"Type" => "Metadata", "Subtype" => "XML"},
             b"<xmp>secret</xmp>".to_vec(),

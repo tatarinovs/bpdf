@@ -8,7 +8,8 @@ use zip::ZipArchive;
 
 use crate::formats::{self, Format};
 use crate::imageconv::{self, ImageOptions};
-use crate::{fileset, parallel, pdf};
+use crate::pdf::{self, PageSize};
+use crate::{fileset, parallel};
 
 /// Largest archive entry read into memory. Sizes in the ZIP directory can
 /// lie, so the limit applies to the bytes actually inflated.
@@ -41,7 +42,7 @@ pub fn read_text_entry(entry: impl Read, name: &str) -> Result<String> {
 
 /// Loads a `.cbz` archive (or image-containing ZIP), extracts image entries in natural sort order,
 /// converts each page into JPEG format, and merges them into a PDF `Document`.
-pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Document> {
+pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: PageSize) -> Result<Document> {
     let file = File::open(path)
         .with_context(|| format!("failed to open CBZ archive {}", path.display()))?;
     let mut archive = ZipArchive::new(file)
@@ -77,9 +78,12 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: Option<&str>) ->
         })
         .collect::<Result<Vec<_>>>()?;
     let documents = parallel::map(&pages, parallel::cpu_jobs(), |(name, bytes)| {
-        let jpeg = imageconv::bytes_to_jpeg(bytes, options, page_size)
+        let jpeg = imageconv::bytes_to_jpeg(bytes, options, Some(page_size))
             .with_context(|| format!("failed to convert image {name} to JPEG"))?;
-        pdf::jpeg_document(jpeg, page_size.unwrap_or("A4"))
+        let dpi = (page_size == PageSize::Fit)
+            .then(|| crate::metadata::image_dpi(bytes))
+            .flatten();
+        pdf::jpeg_document_at(jpeg, page_size, dpi)
     })
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
@@ -124,7 +128,7 @@ mod tests {
             ..ImageOptions::default()
         };
 
-        let doc = load_cbz(temp_file.path(), &image_opts, Some("A4")).unwrap();
+        let doc = load_cbz(temp_file.path(), &image_opts, PageSize::A4).unwrap();
         assert_eq!(doc.get_pages().len(), 2);
     }
 }

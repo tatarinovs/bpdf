@@ -2,6 +2,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::imageconv::Orientation;
+use crate::ocr::OcrBackend;
+use crate::pdf::PageSize;
+use crate::pdf::transform::BlendMode;
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -47,16 +52,18 @@ pub enum Command {
         /// Destination directory (defaults to the source file's directory).
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Replace page files that already exist.
+        #[arg(long)]
+        force: bool,
     },
-    /// Extract selected pages into one PDF.
+    /// Extract selected pages into one PDF (also reorders, e.g. 3,1,2 or reverse).
     Extract {
         /// Source PDF file.
         input: PathBuf,
-        /// Page selection, for example 1-5,8,last, even or odd.
+        /// Page selection, for example 1-5,8,last, even, odd or reverse.
         pages: String,
-        /// Destination PDF (defaults to NAME_extracted.pdf; must differ from the source).
-        #[arg(short, long)]
-        out: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Show page sizes, fonts, images and metadata of a PDF.
     Info {
@@ -87,6 +94,10 @@ pub enum Command {
     Watermark(WatermarkArgs),
     /// Set PDF document properties, leaving unspecified fields unchanged.
     Metadata(MetadataArgs),
+    /// Encrypt a PDF with AES-256: an open password and/or restrictions.
+    Protect(ProtectArgs),
+    /// Remove the password and restrictions of a PDF.
+    Unlock(UnlockArgs),
     /// Convert images, PDF pages or images, and HTML pages to JPEG.
     Convert(ConvertArgs),
     /// Check configuration and external integrations without exposing secrets.
@@ -114,9 +125,9 @@ pub struct MergeArgs {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
-    /// Target page size: A4, Letter, or keep for source PDF sizes (default: page_size).
-    #[arg(short, long)]
-    pub size: Option<String>,
+    /// Page size: A3-A6, B4, B5, Letter, Legal, Tabloid, WxH[mm|cm|in|pt], keep (PDF sizes) or fit (image sizes) (default: page_size).
+    #[arg(short, long, value_parser = parse_page_size)]
+    pub size: Option<PageSize>,
 
     /// Rotate pages to the document's majority orientation (default: auto_rotate).
     #[arg(long, overrides_with = "no_auto_rotate")]
@@ -149,6 +160,10 @@ pub struct MergeArgs {
     /// Largest acceptable PDF size, e.g. 10MB or 500KB; image DPI and JPEG quality are lowered until the PDF fits.
     #[arg(long, value_parser = parse_size)]
     pub max_size: Option<u64>,
+
+    /// Drop blank scanned pages (no text, only paper-coloured images).
+    #[arg(long)]
+    pub remove_blank: bool,
 }
 
 impl MergeArgs {
@@ -169,9 +184,9 @@ pub struct OcrArgs {
     /// Add a searchable text layer to the source PDFs.
     #[arg(short, long, conflicts_with = "out")]
     pub in_place: bool,
-    /// OCR engine: groq, windows or auto (default: ocr_engine).
-    #[arg(short, long)]
-    pub engine: Option<String>,
+    /// OCR engine (default: ocr_engine).
+    #[arg(short, long, value_enum, ignore_case = true)]
+    pub engine: Option<OcrBackend>,
     /// Windows OCR language tag, e.g. ru or en-US (default: ocr_lang).
     #[arg(long)]
     pub lang: Option<String>,
@@ -215,11 +230,11 @@ pub struct ResizeArgs {
     /// PDF files or JPEG images, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
     pub inputs: Vec<String>,
-    /// Paper size for PDF pages: A4 or Letter.
-    #[arg(short, long, default_value = "A4")]
-    pub size: String,
+    /// Paper size for PDF pages: A3-A6, B4, B5, Letter, Legal, Tabloid or WxH[mm|cm|in|pt].
+    #[arg(short, long, default_value = "A4", value_parser = parse_paper_size)]
+    pub size: PageSize,
     /// JPEG: shrink so the longest edge is at most this many pixels.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "short_edge")]
     pub long_edge: Option<u32>,
     /// JPEG: scale so the shortest edge is exactly this many pixels.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
@@ -238,6 +253,12 @@ pub struct OptimizeArgs {
     /// Largest acceptable file size, e.g. 10MB or 500KB; image DPI and JPEG quality are lowered until the PDF fits.
     #[arg(long, value_parser = parse_size)]
     pub max_size: Option<u64>,
+    /// Convert colour images to grayscale (text and drawings keep their colours).
+    #[arg(long)]
+    pub gray: bool,
+    /// Drop blank scanned pages (no text, only paper-coloured images).
+    #[arg(long)]
+    pub remove_blank: bool,
     #[command(flatten)]
     pub output: OutputArgs,
 }
@@ -249,7 +270,7 @@ pub struct StampArgs {
     /// Stamp image (PNG with transparency, or JPEG).
     pub stamp: PathBuf,
     /// Anchor (br, bl, tr, tl, c, tc, bc, l, r) or X,Y mm offset from bottom-right.
-    #[arg(long, default_value = "br")]
+    #[arg(long, default_value = "br", value_parser = parse_position)]
     pub position: String,
     /// Scale multiplier; omit for the physical size, 0 fits up to a quarter of the page.
     #[arg(long)]
@@ -263,9 +284,9 @@ pub struct StampArgs {
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(short, long, default_value = "all")]
     pub pages: String,
-    /// Blend mode: normal, multiply, screen, overlay, darken, lighten, colordodge, colorburn, hardlight, softlight, difference, exclusion.
-    #[arg(long, default_value = "normal")]
-    pub blend: String,
+    /// Blend mode of the stamp with the page.
+    #[arg(long, value_enum, default_value = "normal", ignore_case = true)]
+    pub blend: BlendMode,
     /// Place the stamp in a browser window; --position, --scale and --pages set the starting point.
     #[arg(long)]
     pub pick: bool,
@@ -281,7 +302,7 @@ pub struct NumberArgs {
     #[arg(long, default_value = "{n}")]
     pub format: String,
     /// Anchor (bc, br, bl, tc, tr, tl, c, l, r) or X,Y mm offset from bottom-right.
-    #[arg(long, default_value = "bc")]
+    #[arg(long, default_value = "bc", value_parser = parse_position)]
     pub position: String,
     /// Font size in points.
     #[arg(long, default_value_t = 10.0)]
@@ -315,7 +336,7 @@ pub struct WatermarkArgs {
     #[arg(long, default_value_t = 45.0, allow_negative_numbers = true)]
     pub angle: f64,
     /// Anchor (c, tc, bc, ...) or X,Y mm offset from bottom-right.
-    #[arg(long, default_value = "c")]
+    #[arg(long, default_value = "c", value_parser = parse_position)]
     pub position: String,
     /// Text colour: black, gray, red, blue, green, white or #RRGGBB.
     #[arg(long, default_value = "gray", value_parser = parse_color)]
@@ -354,6 +375,40 @@ pub struct MetadataArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ProtectArgs {
+    /// Source PDF file.
+    pub input: PathBuf,
+    /// Password needed to open the PDF (omit to let anyone open it).
+    #[arg(long)]
+    pub password: Option<String>,
+    /// Password that lifts the restrictions (default: the open password, or a random one with restrictions).
+    #[arg(long)]
+    pub owner_password: Option<String>,
+    /// Forbid printing.
+    #[arg(long)]
+    pub no_print: bool,
+    /// Forbid copying text and images.
+    #[arg(long)]
+    pub no_copy: bool,
+    /// Forbid editing, annotating, filling forms and assembling pages.
+    #[arg(long)]
+    pub no_modify: bool,
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct UnlockArgs {
+    /// Source PDF file.
+    pub input: PathBuf,
+    /// Open or owner password (omit for PDFs that open without one but carry restrictions).
+    #[arg(long)]
+    pub password: Option<String>,
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct ConvertArgs {
     /// Input files, non-recursive directories, globs, or @list.txt manifests.
     #[arg(required = true)]
@@ -365,23 +420,46 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub force: bool,
     /// Shrink so the longest edge is at most this many pixels.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "short_edge")]
     pub long_edge: Option<u32>,
     /// Scale so the shortest edge is exactly this many pixels.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub short_edge: Option<u32>,
     /// Rotate images to landscape or portrait.
-    #[arg(long)]
-    pub orient: Option<String>,
+    #[arg(long, value_enum, ignore_case = true)]
+    pub orient: Option<Orientation>,
     /// JPEG quality 1-100 (default: jpeg_quality).
     #[arg(short, long, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub quality: Option<u8>,
+    /// Largest size of each JPEG, e.g. 500KB; quality, then dimensions, are lowered until it fits.
+    #[arg(long, value_parser = parse_size)]
+    pub max_size: Option<u64>,
     /// Render whole PDF pages instead of extracting their images.
     #[arg(long)]
     pub render: bool,
     /// Browser window size for HTML pages, e.g. 1200x1600 (default: html_viewport).
     #[arg(long)]
     pub viewport: Option<String>,
+}
+
+/// Parse a page size for merge and OCR (paper, `keep` or `fit`).
+pub fn parse_page_size(value: &str) -> Result<PageSize, String> {
+    value.parse()
+}
+
+/// Parse a sheet of paper; `keep` and `fit` are not sizes to fit pages to.
+pub fn parse_paper_size(value: &str) -> Result<PageSize, String> {
+    match value.parse::<PageSize>()? {
+        size if size.is_paper() => Ok(size),
+        _ => Err(format!("'{value}' is not a paper size")),
+    }
+}
+
+/// Check a stamp, number or watermark position early.
+pub fn parse_position(value: &str) -> Result<String, String> {
+    crate::pdf::transform::parse_position(value)
+        .map(|_| value.to_owned())
+        .map_err(|error| error.to_string())
 }
 
 /// Parse a colour name or `#RRGGBB` into RGB components in 0..=1.
@@ -492,6 +570,23 @@ mod tests {
     #[test]
     fn out_and_in_place_conflict() {
         assert!(parse(&["strip", "a.jpg", "-o", "b.jpg", "-i"]).is_err());
+    }
+
+    #[test]
+    fn values_are_checked_before_any_work() {
+        let Ok(Command::Merge(args)) = parse(&["merge", "a.pdf", "-s", "210x297mm"]) else {
+            panic!("expected merge");
+        };
+        assert_eq!(args.size, Some(PageSize::A4));
+        assert!(parse(&["merge", "a.pdf", "-s", "A9"]).is_err());
+        assert!(parse(&["resize", "a.pdf", "-s", "keep"]).is_err());
+        assert!(parse(&["stamp", "a.pdf", "s.png", "--position", "middle"]).is_err());
+        assert!(parse(&["stamp", "a.pdf", "s.png", "--position", "5,10"]).is_ok());
+        assert!(parse(&["stamp", "a.pdf", "s.png", "--blend", "ColorDodge"]).is_ok());
+        assert!(parse(&["ocr", "a.pdf", "-e", "winocr"]).is_ok());
+        assert!(parse(&["ocr", "a.pdf", "-e", "tesseract"]).is_err());
+        assert!(parse(&["convert", "a.jpg", "--long-edge", "9", "--short-edge", "5"]).is_err());
+        assert!(parse(&["convert", "a.jpg", "--orient", "diagonal"]).is_err());
     }
 
     #[test]

@@ -9,10 +9,10 @@ use image::GenericImageView;
 use image::imageops::FilterType;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat, dictionary};
 
-use super::{image as pdf_image, object_number, paper_size, parse_page_selection};
+use super::{image as pdf_image, object_number, parse_page_selection, resolve};
 use crate::imageconv::{self, Orientation};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum BlendMode {
     Normal,
     Multiply,
@@ -20,9 +20,13 @@ pub enum BlendMode {
     Overlay,
     Darken,
     Lighten,
+    #[value(alias = "colordodge")]
     ColorDodge,
+    #[value(alias = "colorburn")]
     ColorBurn,
+    #[value(alias = "hardlight")]
     HardLight,
+    #[value(alias = "softlight")]
     SoftLight,
     Difference,
     Exclusion,
@@ -43,15 +47,6 @@ impl BlendMode {
         (Self::Difference, "Difference"),
         (Self::Exclusion, "Exclusion"),
     ];
-
-    pub fn parse(value: &str) -> Result<Self> {
-        let normalized = value.replace('-', "");
-        Self::ALL
-            .iter()
-            .find(|(_, name)| name.eq_ignore_ascii_case(&normalized))
-            .map(|(mode, _)| *mode)
-            .with_context(|| format!("unsupported blend mode: {value}"))
-    }
 
     pub fn to_pdf_name(self) -> &'static [u8] {
         Self::ALL
@@ -236,12 +231,18 @@ pub fn orient_pages(document: &mut Document, pages: &str, orient: Orientation) -
     Ok(())
 }
 
-/// Fit the visible area (CropBox) of every selected page onto the paper,
-/// keeping each page's orientation; pages already of that size stay as is.
-pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<()> {
-    let (portrait_width, portrait_height) = paper_size(size)?;
+/// Fit the visible area (CropBox) of every selected page onto the paper
+/// (portrait width and height in points), keeping each page's orientation;
+/// pages already of that size stay as is. Annotations and every destination
+/// that points into a resized page move with its content.
+pub fn resize_pages(
+    document: &mut Document,
+    (portrait_width, portrait_height): (f64, f64),
+    pages: &str,
+) -> Result<()> {
     let pages = selected_pages(document, pages)?;
     let suffix_id = document.add_object(Stream::new(dictionary! {}, b"Q\n".to_vec()));
+    let mut moves = HashMap::new();
 
     for (_, page_id, _) in pages {
         let geometry = page_crop_geometry(document, page_id)?;
@@ -277,8 +278,21 @@ pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<
         let translate_y = (target_height - geometry.raw_height() * scale) / 2.0 - bottom * scale;
         let prefix = format!("q\n{scale:.8} 0 0 {scale:.8} {translate_x:.8} {translate_y:.8} cm\n");
         let prefix_id = document.add_object(Stream::new(dictionary! {}, prefix.into_bytes()));
-        wrap_page_contents(document, page_id, prefix_id, suffix_id)?;
-        transform_annotation_rectangles(document, page_id, scale, translate_x, translate_y);
+        rewrite_contents(document, page_id, |old| {
+            [
+                vec![Object::Reference(prefix_id)],
+                old,
+                vec![Object::Reference(suffix_id)],
+            ]
+            .concat()
+        })?;
+        let movement = Movement {
+            scale,
+            translate_x,
+            translate_y,
+        };
+        transform_annotation_geometry(document, page_id, movement);
+        moves.insert(page_id, movement);
 
         let page = document.get_object_mut(page_id)?.as_dict_mut()?;
         let target_box: Vec<Object> = vec![
@@ -295,7 +309,73 @@ pub fn resize_pages(document: &mut Document, size: &str, pages: &str) -> Result<
             }
         }
     }
+    if !moves.is_empty() {
+        for object in document.objects.values_mut() {
+            transform_destinations(object, &moves);
+        }
+    }
     Ok(())
+}
+
+/// Uniform scale and translation applied to a resized page's content.
+#[derive(Clone, Copy, Debug)]
+struct Movement {
+    scale: f64,
+    translate_x: f64,
+    translate_y: f64,
+}
+
+impl Movement {
+    fn x(self, value: f64) -> f64 {
+        value * self.scale + self.translate_x
+    }
+
+    fn y(self, value: f64) -> f64 {
+        value * self.scale + self.translate_y
+    }
+
+    /// Move a number of a flat `x y x y ...` array.
+    fn coordinate(self, value: &mut Object, is_x: bool) {
+        if let Ok(number) = object_number(value) {
+            *value = if is_x { self.x(number) } else { self.y(number) }.into();
+        }
+    }
+}
+
+/// Explicit destinations `[page /XYZ left top zoom]`, `[page /FitR l b r t]`
+/// and the like, anywhere in `object`, that point into a moved page.
+fn transform_destinations(object: &mut Object, moves: &HashMap<ObjectId, Movement>) {
+    match object {
+        Object::Array(items) => {
+            if let [Object::Reference(page), Object::Name(kind), rest @ ..] = items.as_mut_slice()
+                && let Some(&movement) = moves.get(&*page)
+            {
+                // Which coordinates follow the destination type.
+                let axes: &[bool] = match kind.as_slice() {
+                    b"XYZ" => &[true, false],
+                    b"FitH" | b"FitBH" => &[false],
+                    b"FitV" | b"FitBV" => &[true],
+                    b"FitR" => &[true, false, true, false],
+                    _ => &[],
+                };
+                for (value, is_x) in rest.iter_mut().zip(axes) {
+                    movement.coordinate(value, *is_x);
+                }
+                return;
+            }
+            items
+                .iter_mut()
+                .for_each(|item| transform_destinations(item, moves));
+        }
+        Object::Dictionary(dictionary) => dictionary
+            .iter_mut()
+            .for_each(|(_, value)| transform_destinations(value, moves)),
+        Object::Stream(stream) => stream
+            .dict
+            .iter_mut()
+            .for_each(|(_, value)| transform_destinations(value, moves)),
+        _ => {}
+    }
 }
 
 fn dominant_landscape(geometries: impl IntoIterator<Item = PageGeometry>) -> bool {
@@ -445,23 +525,16 @@ impl ContentIsolation {
         page_id: ObjectId,
         content_id: ObjectId,
     ) -> Result<()> {
-        let old = document
-            .get_dictionary(page_id)?
-            .get(b"Contents")
-            .ok()
-            .cloned();
-        let mut contents = Vec::new();
-        if old.is_some() {
-            contents.push(Object::Reference(self.push));
-            append_content_objects(document, &mut contents, old);
-            contents.push(Object::Reference(self.pop));
-        }
-        contents.push(Object::Reference(content_id));
-        document
-            .get_object_mut(page_id)?
-            .as_dict_mut()?
-            .set("Contents", contents);
-        Ok(())
+        rewrite_contents(document, page_id, |old| {
+            let mut contents = Vec::with_capacity(old.len() + 3);
+            if !old.is_empty() {
+                contents.push(Object::Reference(self.push));
+                contents.extend(old);
+                contents.push(Object::Reference(self.pop));
+            }
+            contents.push(Object::Reference(content_id));
+            contents
+        })
     }
 }
 
@@ -491,19 +564,38 @@ impl PageGeometry {
             self.bottom.min(self.top) + raw_y,
         )
     }
+
+    /// Map a point in page (user space) coordinates to the displayed page;
+    /// the inverse of [`Self::display_to_page`].
+    pub(crate) fn page_to_display(self, x: f64, y: f64) -> (f64, f64) {
+        let (width, height) = (self.raw_width(), self.raw_height());
+        let (raw_x, raw_y) = (x - self.left.min(self.right), y - self.bottom.min(self.top));
+        match self.rotation.rem_euclid(360) {
+            90 => (raw_y, width - raw_x),
+            180 => (width - raw_x, height - raw_y),
+            270 => (height - raw_y, raw_x),
+            _ => (raw_x, raw_y),
+        }
+    }
 }
 
-/// Downsample images above `image_dpi` (0 disables it) and tidy the object
-/// graph. With `recompress_all`, images already within the limit are
-/// re-encoded at `jpeg_quality` too. An image is replaced only when the new
-/// JPEG is smaller than its current stream.
-pub fn optimize(
-    document: &mut Document,
-    image_dpi: u32,
-    jpeg_quality: u8,
-    recompress_all: bool,
-) -> OptimizeReport {
-    let mut report = downsample_images(document, image_dpi, jpeg_quality, recompress_all);
+/// How `optimize` treats images.
+#[derive(Clone, Copy, Debug)]
+pub struct OptimizeOptions {
+    /// Resolution limit where an image is drawn; 0 keeps every size.
+    pub image_dpi: u32,
+    pub jpeg_quality: u8,
+    /// Re-encode images already within the limit at `jpeg_quality` too.
+    pub recompress_all: bool,
+    /// Convert colour images to grayscale.
+    pub gray: bool,
+}
+
+/// Downsample images above the resolution limit and tidy the object graph.
+/// A re-encoded image replaces the original only when it is smaller, unless
+/// it was turned gray.
+pub fn optimize(document: &mut Document, options: OptimizeOptions) -> OptimizeReport {
+    let mut report = downsample_images(document, options);
     document.delete_zero_length_streams();
     document.prune_objects();
     document.renumber_objects();
@@ -512,22 +604,21 @@ pub fn optimize(
     report
 }
 
-fn downsample_images(
-    document: &mut Document,
-    image_dpi: u32,
-    jpeg_quality: u8,
-    recompress_all: bool,
-) -> OptimizeReport {
+fn downsample_images(document: &mut Document, options: OptimizeOptions) -> OptimizeReport {
     let mut report = OptimizeReport::default();
-    if image_dpi == 0 && !recompress_all {
+    if options.image_dpi == 0 && !options.recompress_all && !options.gray {
         return report;
     }
 
-    let candidates =
-        collect_image_resizes(document, image_dpi, recompress_all, &mut report.warnings);
+    let candidates = collect_image_resizes(
+        document,
+        options.image_dpi,
+        options.recompress_all || options.gray,
+        &mut report.warnings,
+    );
     // Decoding, resampling and encoding are independent per image.
     let encoded = crate::parallel::map(&candidates, crate::parallel::cpu_jobs(), |candidate| {
-        encode_downsampled(document, *candidate, jpeg_quality)
+        encode_downsampled(document, *candidate, options)
     });
 
     for (candidate, result) in candidates.iter().zip(encoded) {
@@ -670,6 +761,8 @@ struct EncodedImage {
     content: Vec<u8>,
     filter: &'static str,
     gray: bool,
+    /// Replace the original even when the new stream is larger.
+    required: bool,
 }
 
 /// Decode, resample and re-encode one image, or `None` when there is
@@ -678,31 +771,34 @@ struct EncodedImage {
 fn encode_downsampled(
     document: &Document,
     resize: ImageResize,
-    jpeg_quality: u8,
+    options: OptimizeOptions,
 ) -> Result<Option<EncodedImage>> {
     let original = document.get_object(resize.id)?.as_stream()?;
     reject_unsafe_image_features(original)?;
-    let decoded = pdf_image::decode(document, original)?;
+    let mut decoded = pdf_image::decode(document, original)?;
     let target = (resize.target_width, resize.target_height);
+    let turned_gray = options.gray && decoded.color().channel_count() > 2;
+    if turned_gray {
+        decoded = image::DynamicImage::ImageLuma8(decoded.to_luma8());
+    } else if options.gray && !options.recompress_all && target == decoded.dimensions() {
+        return Ok(None);
+    }
     let is_jpeg = original
         .filters()
         .ok()
-        .and_then(|filters| {
-            filters
-                .last()
-                .map(|filter| matches!(*filter, b"DCTDecode" | b"DCT"))
-        })
+        .and_then(|filters| filters.last().map(|filter| pdf_image::is_dct(filter)))
         .unwrap_or(false);
     if is_jpeg || !imageconv::has_few_colours(&decoded) {
-        let jpeg = imageconv::resize_to_jpeg(&decoded, Some(target), jpeg_quality)?;
+        let jpeg = imageconv::resize_to_jpeg(&decoded, Some(target), options.jpeg_quality)?;
         let gray = super::jpeg_info(&jpeg)?.components == 1;
         return Ok(Some(EncodedImage {
             content: jpeg,
             filter: "DCTDecode",
             gray,
+            required: turned_gray,
         }));
     }
-    if target == decoded.dimensions() {
+    if target == decoded.dimensions() && !turned_gray {
         return Ok(None);
     }
     let resized = imageconv::resize(&decoded, target.0, target.1, FilterType::Lanczos3);
@@ -721,6 +817,7 @@ fn encode_downsampled(
         content: encoder.finish()?,
         filter: "FlateDecode",
         gray,
+        required: turned_gray,
     }))
 }
 
@@ -732,7 +829,7 @@ fn replace_image(
     encoded: EncodedImage,
 ) -> Result<bool> {
     let stream = document.get_object_mut(resize.id)?.as_stream_mut()?;
-    if encoded.content.len() >= stream.content.len() {
+    if !encoded.required && encoded.content.len() >= stream.content.len() {
         return Ok(false);
     }
     stream.dict.set("Width", i64::from(resize.target_width));
@@ -794,10 +891,15 @@ pub fn set_info_fields(document: &mut Document, fields: &[(&str, Option<&str>)])
         return Ok(());
     }
 
-    let info_id = match document.trailer.get(b"Info").and_then(Object::as_reference) {
-        Ok(id) => id,
-        Err(_) => {
-            let id = document.add_object(Dictionary::new());
+    // A direct Info dictionary moves into its own object with its fields.
+    let info_id = match document.trailer.get(b"Info") {
+        Ok(Object::Reference(id)) if document.get_dictionary(*id).is_ok() => *id,
+        other => {
+            let existing = match other {
+                Ok(Object::Dictionary(dictionary)) => dictionary.clone(),
+                _ => Dictionary::new(),
+            };
+            let id = document.add_object(existing);
             document.trailer.set("Info", id);
             id
         }
@@ -920,42 +1022,30 @@ fn set_page_rotation(document: &mut Document, page_id: ObjectId, rotation: i64) 
     Ok(())
 }
 
-/// Surround the page content with the given prefix and suffix streams.
-fn wrap_page_contents(
+/// Replace the page's content streams with `build(old streams)`; a direct
+/// content stream becomes an object first.
+fn rewrite_contents(
     document: &mut Document,
     page_id: ObjectId,
-    prefix_id: ObjectId,
-    suffix_id: ObjectId,
+    build: impl FnOnce(Vec<Object>) -> Vec<Object>,
 ) -> Result<()> {
-    let old = document
+    let old = match document
         .get_dictionary(page_id)?
         .get(b"Contents")
         .ok()
-        .cloned();
-    let mut contents = vec![Object::Reference(prefix_id)];
-    append_content_objects(document, &mut contents, old);
-    contents.push(Object::Reference(suffix_id));
+        .cloned()
+    {
+        Some(Object::Array(items)) => items,
+        Some(Object::Stream(stream)) => vec![Object::Reference(document.add_object(stream))],
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    let contents = build(old);
     document
         .get_object_mut(page_id)?
         .as_dict_mut()?
         .set("Contents", contents);
     Ok(())
-}
-
-pub(crate) fn append_content_objects(
-    document: &mut Document,
-    destination: &mut Vec<Object>,
-    old: Option<Object>,
-) {
-    match old {
-        Some(Object::Array(items)) => destination.extend(items),
-        Some(Object::Stream(stream)) => {
-            let id = document.add_object(stream);
-            destination.push(Object::Reference(id));
-        }
-        Some(other) => destination.push(other),
-        None => {}
-    }
 }
 
 /// A resource name, derived from `base`, that none of `pages` uses yet in
@@ -1043,21 +1133,14 @@ impl<'a> ResourceInstaller<'a> {
     }
 }
 
+/// A copy of the dictionary `object` is or refers to.
 pub(crate) fn resolve_dictionary(document: &Document, object: &Object) -> Option<Dictionary> {
-    match object {
-        Object::Dictionary(dictionary) => Some(dictionary.clone()),
-        Object::Reference(id) => document.get_dictionary(*id).ok().cloned(),
-        _ => None,
-    }
+    resolve(document, object).ok()?.as_dict().ok().cloned()
 }
 
-fn transform_annotation_rectangles(
-    document: &mut Document,
-    page_id: ObjectId,
-    scale: f64,
-    translate_x: f64,
-    translate_y: f64,
-) {
+/// Move the annotation rectangles of a resized page together with their
+/// point lists (highlight quads, ink strokes, polygon vertices, lines).
+fn transform_annotation_geometry(document: &mut Document, page_id: ObjectId, movement: Movement) {
     let references = |items: &[Object]| {
         items
             .iter()
@@ -1084,18 +1167,34 @@ fn transform_annotation_rectangles(
         else {
             continue;
         };
-        let Some([x1, y1, x2, y2]) = annotation.get(b"Rect").ok().and_then(parse_box) else {
-            continue;
+        if let Some([x1, y1, x2, y2]) = annotation.get(b"Rect").ok().and_then(parse_box) {
+            annotation.set(
+                "Rect",
+                vec![
+                    movement.x(x1).into(),
+                    movement.y(y1).into(),
+                    movement.x(x2).into(),
+                    movement.y(y2).into(),
+                ],
+            );
+        }
+        let move_points = |points: &mut Vec<Object>| {
+            for (index, value) in points.iter_mut().enumerate() {
+                movement.coordinate(value, index % 2 == 0);
+            }
         };
-        annotation.set(
-            "Rect",
-            vec![
-                (x1 * scale + translate_x).into(),
-                (y1 * scale + translate_y).into(),
-                (x2 * scale + translate_x).into(),
-                (y2 * scale + translate_y).into(),
-            ],
-        );
+        for key in [b"QuadPoints".as_slice(), b"Vertices", b"L", b"CL"] {
+            if let Ok(Object::Array(points)) = annotation.get_mut(key) {
+                move_points(points);
+            }
+        }
+        if let Ok(Object::Array(strokes)) = annotation.get_mut(b"InkList") {
+            for stroke in strokes {
+                if let Object::Array(points) = stroke {
+                    move_points(points);
+                }
+            }
+        }
     }
 }
 
@@ -1150,26 +1249,8 @@ pub(crate) fn stamp_position(
 ) -> Result<(f64, f64)> {
     let mm_to_points = 72.0 / 25.4 * unit;
     let margin = 10.0 * mm_to_points;
-    let mut position = value.trim().to_ascii_lowercase();
-    let mut offset_x = 0.0;
-    let mut offset_y = 0.0;
-    if let Some((x, y)) = position.split_once(',') {
-        offset_x = x.trim().parse::<f64>().context("invalid stamp X offset")? * mm_to_points;
-        offset_y = y.trim().parse::<f64>().context("invalid stamp Y offset")? * mm_to_points;
-        position = "br".to_owned();
-    }
-    let position = match position.as_str() {
-        "top-left" => "tl",
-        "top-center" => "tc",
-        "top-right" => "tr",
-        "center-left" => "l",
-        "center" => "c",
-        "center-right" => "r",
-        "bottom-left" => "bl",
-        "bottom-center" => "bc",
-        "bottom-right" | "" => "br",
-        other => other,
-    };
+    let (position, (offset_x, offset_y)) = parse_position(value)?;
+    let (offset_x, offset_y) = (offset_x * mm_to_points, offset_y * mm_to_points);
 
     let left = page.left + margin;
     let center_x = page.left + (page.raw_width() - width) / 2.0;
@@ -1186,71 +1267,40 @@ pub(crate) fn stamp_position(
         "r" => (right, center_y),
         "bl" => (left, bottom),
         "bc" => (center_x, bottom),
-        "br" => (right, bottom),
-        _ => bail!("unsupported stamp position {position}"),
+        _ => (right, bottom),
     };
     Ok((x + offset_x, y + offset_y))
 }
 
-pub fn create_bookmarks(document: &mut Document, entries: &[(String, u32)]) -> Result<()> {
-    let pages = document.get_pages();
-    let valid_entries: Vec<(&str, ObjectId)> = entries
-        .iter()
-        .filter_map(|(title, page_number)| {
-            pages
-                .get(page_number)
-                .map(|&page_id| (title.as_str(), page_id))
-        })
-        .collect();
-    if valid_entries.is_empty() {
-        return Ok(());
-    }
-
-    let outline_root_id = document.new_object_id();
-    let item_ids: Vec<ObjectId> = (0..valid_entries.len())
-        .map(|_| document.new_object_id())
-        .collect();
-
-    for (index, ((title, page_id), item_id)) in valid_entries.iter().zip(&item_ids).enumerate() {
-        let mut item = dictionary! {
-            "Title" => info_string(title),
-            "Parent" => outline_root_id,
-            "Dest" => vec![Object::Reference(*page_id), Object::Name(b"Fit".to_vec())],
+/// An anchor (`br`, `top-left`, ...) or an `X,Y` millimetre offset from the
+/// bottom-right anchor, as (short anchor, offset).
+pub(crate) fn parse_position(value: &str) -> Result<(&'static str, (f64, f64))> {
+    let position = value.trim().to_ascii_lowercase();
+    if let Some((x, y)) = position.split_once(',') {
+        let offset = |text: &str, axis: &str| {
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("invalid {axis} offset in position '{value}'"))
         };
-        if let Some(previous) = index.checked_sub(1) {
-            item.set("Prev", item_ids[previous]);
-        }
-        if let Some(next) = item_ids.get(index + 1) {
-            item.set("Next", *next);
-        }
-        document.objects.insert(*item_id, Object::Dictionary(item));
+        return Ok(("br", (offset(x, "X")?, offset(y, "Y")?)));
     }
-
-    document.objects.insert(
-        outline_root_id,
-        Object::Dictionary(dictionary! {
-            "Type" => "Outlines",
-            "First" => item_ids[0],
-            "Last" => item_ids[item_ids.len() - 1],
-            "Count" => item_ids.len() as i64,
-        }),
-    );
-
-    let catalog_id = match document.trailer.get(b"Root") {
-        Ok(root) => root.as_reference()?,
-        Err(_) => {
-            let id = document.add_object(dictionary! { "Type" => "Catalog" });
-            document.trailer.set("Root", id);
-            id
-        }
+    let anchor = match position.as_str() {
+        "tl" | "top-left" => "tl",
+        "tc" | "top-center" => "tc",
+        "tr" | "top-right" => "tr",
+        "l" | "center-left" => "l",
+        "c" | "center" => "c",
+        "r" | "center-right" => "r",
+        "bl" | "bottom-left" => "bl",
+        "bc" | "bottom-center" => "bc",
+        "br" | "bottom-right" | "" => "br",
+        _ => bail!(
+            "unsupported position '{value}'; use tl, tc, tr, l, c, r, bl, bc, br or X,Y in mm"
+        ),
     };
-    document
-        .get_object_mut(catalog_id)
-        .context("catalog object not found")?
-        .as_dict_mut()
-        .context("catalog is not a dictionary")?
-        .set("Outlines", outline_root_id);
-    Ok(())
+    Ok((anchor, (0.0, 0.0)))
 }
 
 #[cfg(test)]
@@ -1282,7 +1332,7 @@ mod tests {
         image
             .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
             .unwrap();
-        let mut document = super::super::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = super::super::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         if let Some((width, height)) = placement {
             let page_id = *document.get_pages().get(&1).unwrap();
             let content_id = document
@@ -1302,6 +1352,90 @@ mod tests {
                 );
         }
         document
+    }
+
+    fn options(image_dpi: u32, jpeg_quality: u8) -> OptimizeOptions {
+        OptimizeOptions {
+            image_dpi,
+            jpeg_quality,
+            recompress_all: false,
+            gray: false,
+        }
+    }
+
+    #[test]
+    fn gray_optimize_turns_colour_images_gray() {
+        let mut document = placed_image(400, 300, 400.0, 300.0);
+        let report = optimize(
+            &mut document,
+            OptimizeOptions {
+                gray: true,
+                ..options(0, 80)
+            },
+        );
+        assert_eq!(report.resized_images, 1);
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let image = document.get_page_images(page_id).unwrap().remove(0);
+        assert_eq!(image.color_space.as_deref(), Some("DeviceGray"));
+        assert_eq!(first_image_dimensions(&document), (400, 300));
+        // Already gray: nothing left to do.
+        let report = optimize(
+            &mut document,
+            OptimizeOptions {
+                gray: true,
+                ..options(0, 80)
+            },
+        );
+        assert_eq!(report.resized_images, 0);
+    }
+
+    #[test]
+    fn resize_moves_annotation_points_and_destinations() {
+        let mut document = one_page();
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let geometry = page_geometry(&document, page_id).unwrap();
+        // Shrink the page to half its size first, so A4 scales it by two.
+        let (width, height) = (geometry.raw_width() / 2.0, geometry.raw_height() / 2.0);
+        let highlight = document.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Highlight",
+            "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+            "QuadPoints" => vec![10.into(), 20.into(), 20.into(), 20.into(), 10.into(), 10.into(), 20.into(), 10.into()],
+        });
+        let page = document
+            .get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap();
+        page.set(
+            "MediaBox",
+            vec![0.into(), 0.into(), width.into(), height.into()],
+        );
+        page.set("Annots", vec![Object::Reference(highlight)]);
+        let target = document.add_object(Object::Array(vec![
+            Object::Reference(page_id),
+            Object::Name(b"XYZ".to_vec()),
+            10.into(),
+            20.into(),
+            Object::Null,
+        ]));
+
+        resize_pages(&mut document, crate::pdf::PageSize::A4.sheet(), "all").unwrap();
+
+        let number = |object: &Object| object_number(object).unwrap().round() as i64;
+        let quads = document
+            .get_dictionary(highlight)
+            .unwrap()
+            .get(b"QuadPoints")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(number)
+            .collect::<Vec<_>>();
+        assert_eq!(quads, [20, 40, 40, 40, 20, 20, 40, 20]);
+        let destination = document.get_object(target).unwrap().as_array().unwrap();
+        assert_eq!((number(&destination[2]), number(&destination[3])), (20, 40));
+        assert_eq!(destination[4], Object::Null);
     }
 
     fn first_image_dimensions(document: &Document) -> (u32, u32) {
@@ -1364,7 +1498,7 @@ mod tests {
     #[test]
     fn resize_sets_a4_box_and_preserves_page() {
         let mut document = one_page();
-        resize_pages(&mut document, "A4", "all").unwrap();
+        resize_pages(&mut document, crate::pdf::PageSize::A4.sheet(), "all").unwrap();
         let page_id = *document.get_pages().get(&1).unwrap();
         let geometry = page_geometry(&document, page_id).unwrap();
         assert!((geometry.display_width() - 841.89).abs() < 0.1);
@@ -1392,7 +1526,7 @@ mod tests {
         duplicate_first_page(&mut document);
         rotate_pages(&mut document, "2-3", 90).unwrap();
 
-        resize_pages(&mut document, "A4", "all").unwrap();
+        resize_pages(&mut document, crate::pdf::PageSize::A4.sheet(), "all").unwrap();
         let orientations = document
             .get_pages()
             .into_values()
@@ -1407,7 +1541,7 @@ mod tests {
     #[test]
     fn optimize_downsamples_image_to_its_placed_size() {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
-        let report = optimize(&mut document, 36, 82, false);
+        let report = optimize(&mut document, options(36, 82));
 
         assert_eq!(report.resized_images, 1);
         assert_eq!(report.skipped_images, 0);
@@ -1428,7 +1562,7 @@ mod tests {
     #[test]
     fn optimize_dpi_zero_keeps_image_dimensions() {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
-        let report = optimize(&mut document, 0, 82, false);
+        let report = optimize(&mut document, options(0, 82));
 
         assert_eq!(report.resized_images, 0);
         assert_eq!(report.skipped_images, 0);
@@ -1440,7 +1574,7 @@ mod tests {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
         duplicate_first_page(&mut document);
 
-        let report = optimize(&mut document, 36, 82, false);
+        let report = optimize(&mut document, options(36, 82));
 
         assert_eq!(report.resized_images, 1);
         assert_eq!(document.get_pages().len(), 2);
@@ -1465,14 +1599,14 @@ mod tests {
         let mut document = placed_image(1200, 600, 144.0, 72.0);
         duplicate_first_page(&mut document);
         redraw_second_page(&mut document, "q 576 0 0 288 0 0 cm /Im0 Do Q");
-        optimize(&mut document, 36, 82, false);
+        optimize(&mut document, options(36, 82));
         assert_eq!(first_image_dimensions(&document), (288, 144));
 
         // Drawn at full resolution on one page: nothing to downsample.
         let mut document = placed_image(1200, 600, 144.0, 72.0);
         duplicate_first_page(&mut document);
         redraw_second_page(&mut document, "q 2400 0 0 1200 0 0 cm /Im0 Do Q");
-        let report = optimize(&mut document, 36, 82, false);
+        let report = optimize(&mut document, options(36, 82));
         assert_eq!(report.resized_images, 0);
         assert_eq!(first_image_dimensions(&document), (1200, 600));
     }
@@ -1504,7 +1638,7 @@ mod tests {
             .unwrap()
             .set_content(b"q 0.5 0 0 0.5 0 0 cm /Fm0 Do Q".to_vec());
 
-        let report = optimize(&mut document, 36, 82, false);
+        let report = optimize(&mut document, options(36, 82));
         assert_eq!(report.resized_images, 1);
         // Objects are renumbered: find the image by its type.
         let image = document
@@ -1552,7 +1686,7 @@ mod tests {
         stream.compress().unwrap();
         document.objects.insert(image_id, Object::Stream(stream));
 
-        let report = optimize(&mut document, 36, 90, false);
+        let report = optimize(&mut document, options(36, 90));
 
         assert_eq!(report.resized_images, 1, "{:?}", report.warnings);
         let embedded = document.get_page_images(page_id).unwrap().remove(0);
@@ -1600,7 +1734,7 @@ mod tests {
         stream.compress().unwrap();
         document.objects.insert(image_id, Object::Stream(stream));
 
-        let report = optimize(&mut document, 36, 90, false);
+        let report = optimize(&mut document, options(36, 90));
 
         assert_eq!(report.resized_images, 1, "{:?}", report.warnings);
         let stream = document.get_object(image_id).unwrap().as_stream().unwrap();
@@ -1628,7 +1762,7 @@ mod tests {
                 vec![0.into(), 0.into(), 0.into(), 0.into(), 0.into(), 0.into()],
             );
 
-        let report = optimize(&mut document, 100, 82, false);
+        let report = optimize(&mut document, options(100, 82));
 
         assert_eq!(report.resized_images, 0);
         assert_eq!(report.skipped_images, 1);
@@ -1706,6 +1840,27 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_info_dictionary_keeps_its_other_fields() {
+        let mut document = one_page();
+        document.trailer.set(
+            "Info",
+            dictionary! { "Author" => Object::string_literal("Ann") },
+        );
+        set_info_fields(&mut document, &[("Title", Some("Report"))]).unwrap();
+        let info = crate::pdf::info_dictionary(&document).unwrap();
+        assert_eq!(info.get(b"Author").unwrap().as_str().unwrap(), b"Ann");
+        assert_eq!(info.get(b"Title").unwrap().as_str().unwrap(), b"Report");
+        assert!(
+            document
+                .trailer
+                .get(b"Info")
+                .unwrap()
+                .as_reference()
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn metadata_uses_utf16_for_cyrillic() {
         let mut document = one_page();
         set_info_fields(&mut document, &[("Title", Some("Реквизиты"))]).unwrap();
@@ -1723,49 +1878,6 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(value.starts_with(&[0xfe, 0xff]));
-    }
-
-    #[test]
-    fn create_bookmarks_builds_outlines_tree() {
-        let mut document = one_page();
-        duplicate_first_page(&mut document);
-        let entries = vec![
-            ("First Section".to_owned(), 1),
-            ("Вторая секция".to_owned(), 2),
-        ];
-        create_bookmarks(&mut document, &entries).unwrap();
-
-        let root_id = document
-            .trailer
-            .get(b"Root")
-            .unwrap()
-            .as_reference()
-            .unwrap();
-        let catalog = document.get_dictionary(root_id).unwrap();
-        let outlines_id = catalog.get(b"Outlines").unwrap().as_reference().unwrap();
-        let outlines = document.get_dictionary(outlines_id).unwrap();
-
-        assert_eq!(outlines.get(b"Count").unwrap().as_i64().unwrap(), 2);
-        let first_id = outlines.get(b"First").unwrap().as_reference().unwrap();
-        let last_id = outlines.get(b"Last").unwrap().as_reference().unwrap();
-
-        let first_item = document.get_dictionary(first_id).unwrap();
-        assert_eq!(
-            first_item.get(b"Title").unwrap().as_str().unwrap(),
-            b"First Section"
-        );
-        assert_eq!(
-            first_item.get(b"Next").unwrap().as_reference().unwrap(),
-            last_id
-        );
-
-        let last_item = document.get_dictionary(last_id).unwrap();
-        assert_eq!(
-            last_item.get(b"Prev").unwrap().as_reference().unwrap(),
-            first_id
-        );
-        let title_bytes = last_item.get(b"Title").unwrap().as_str().unwrap();
-        assert!(title_bytes.starts_with(&[0xfe, 0xff]));
     }
 
     #[test]

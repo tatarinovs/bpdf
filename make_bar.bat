@@ -70,7 +70,7 @@ set "EXE=!BASE!\bpdf.exe"
 set "RUN=!Q!!EXE!!Q!"
 > "!OUT!" (
 echo [Buttonbar]
-echo Buttoncount=18
+echo Buttoncount=20
 echo button1=!EXE!,1
 echo cmd1=!RUN! merge --optimize --auto-rotate -s A4
 echo param1=@"%%UL"
@@ -150,12 +150,22 @@ echo cmd16=!RUN! convert
 echo param16=@"%%UL"
 echo iconic16=0
 echo menu16=Конвертировать в JPEG
-echo button17=
+echo button17=!EXE!,18
+echo cmd17=!RUN! protect
+echo param17=?%%P%%N --no-modify --password ""
 echo iconic17=0
-echo button18=!EXE!,10
-echo cmd18=!RUN! doctor
+echo menu17=Защитить PDF паролем ^(AES-256^)
+echo button18=!EXE!,19
+echo cmd18=!RUN! unlock
+echo param18=?%%P%%N --password ""
 echo iconic18=0
-echo menu18=Проверка настроек bpdf ^(doctor^)
+echo menu18=Снять пароль с PDF
+echo button19=
+echo iconic19=0
+echo button20=!EXE!,10
+echo cmd20=!RUN! doctor
+echo iconic20=0
+echo menu20=Проверка настроек bpdf ^(doctor^)
 )
 set "RC=!errorlevel!"
 if "!RC!"=="0" (

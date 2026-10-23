@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,7 @@ use crate::fileset::InputSpec;
 use crate::formats::{self, Format};
 use crate::hash::sha256_hex;
 use crate::imageconv::{self, ImageOptions};
+use crate::pdf::PageSize;
 use crate::pdf::image::{self as pdf_image, ExtractedImage, Selection};
 use crate::pdf::transform::PageGeometry;
 use crate::textpdf::{OCR_FONT_NAME, PageTextOverlay, overlay_searchable_text};
@@ -28,26 +31,29 @@ const TEXT_LAYER_THRESHOLD: usize = 100;
 /// searchable layer.
 const MIN_SEARCHABLE_IMAGE_AREA: u64 = 100_000;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum OcrBackend {
     Groq,
+    #[value(alias = "win", alias = "winocr")]
     Windows,
     Auto,
 }
 
-impl OcrBackend {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "groq" => Ok(Self::Groq),
-            "windows" | "win" | "winocr" => {
-                if !cfg!(windows) {
-                    bail!("Windows Media OCR is only available on Windows");
-                }
-                Ok(Self::Windows)
-            }
-            "auto" => Ok(Self::Auto),
-            _ => bail!("unknown OCR engine '{value}'; valid options are groq, windows, auto"),
-        }
+impl FromStr for OcrBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        <Self as clap::ValueEnum>::from_str(value, true).map_err(|_| {
+            format!("unknown OCR engine '{value}'; valid options are groq, windows, auto")
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OcrBackend {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -95,6 +101,8 @@ pub struct OcrEngine {
     options: OcrOptions,
     gate: Arc<RequestGate>,
     cache_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Set when Groq refused the API key; `auto` then uses Windows OCR only.
+    groq_refused: Arc<AtomicBool>,
 }
 
 struct RequestGate {
@@ -123,7 +131,7 @@ impl RequestGate {
     }
 
     fn enter(&self) -> RequestPermit<'_> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = crate::parallel::lock(&self.state);
         loop {
             let now = Instant::now();
             if state.blocked_until > now {
@@ -146,7 +154,7 @@ impl RequestGate {
     }
 
     fn defer(&self, duration: Duration) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = crate::parallel::lock(&self.state);
         state.blocked_until = state.blocked_until.max(Instant::now() + duration);
         self.changed.notify_all();
     }
@@ -154,11 +162,7 @@ impl RequestGate {
 
 impl Drop for RequestPermit<'_> {
     fn drop(&mut self) {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = crate::parallel::lock(&self.0.state);
         state.active = state.active.saturating_sub(1);
         self.0.changed.notify_all();
     }
@@ -194,11 +198,15 @@ impl OcrEngine {
         if options.jobs == 0 {
             bail!("OCR jobs must be at least 1");
         }
+        if options.backend == OcrBackend::Windows && !cfg!(windows) {
+            bail!("Windows Media OCR is only available on Windows");
+        }
         Ok(Self {
             agent: build_agent(&options)?,
             gate: Arc::new(RequestGate::new(options.jobs)),
             options,
             cache_locks: Arc::new(Mutex::new(HashMap::new())),
+            groq_refused: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -257,12 +265,8 @@ impl OcrEngine {
                 }
                 // Every page contributes its own text layer, or the
                 // recognised text of its largest image when it has none.
-                let texts = document
-                    .get_pages()
-                    .into_keys()
-                    .map(|number| (number, page_text(&document, number)))
-                    .collect::<BTreeMap<_, _>>();
-                let pending = self.pages_to_recognise(&document);
+                let texts = page_texts(&document);
+                let pending = self.pages_to_recognise(&document, &texts);
                 if pending.is_empty() {
                     output::info(format!(
                         "Text layer found on all {} pages of {}, skipping image OCR",
@@ -294,6 +298,7 @@ impl OcrEngine {
                 spec.reject_pages()?;
                 let bytes = imageconv::for_ocr(path, &self.options.image)?;
                 let image = ExtractedImage {
+                    id: None,
                     label: file_label(path).to_owned(),
                     bytes,
                     width: 0,
@@ -317,7 +322,7 @@ impl OcrEngine {
     pub fn create_searchable_pdf_for_spec(
         &self,
         spec: &InputSpec,
-        page_size: &str,
+        page_size: PageSize,
         font_path: Option<&Path>,
         keep_all_pages: bool,
     ) -> Result<Document> {
@@ -333,7 +338,7 @@ impl OcrEngine {
                         pdf::select_pages(&mut document, pages)?;
                     }
                 }
-                let mut pages = self.pages_to_recognise(&document);
+                let mut pages = self.pages_to_recognise(&document, &page_texts(&document));
                 if let Some(only) = &only {
                     pages.retain(|(number, _)| only.contains(&(*number as usize)));
                 }
@@ -351,6 +356,17 @@ impl OcrEngine {
                 .filter(|(_, images)| !images.is_empty())
                 .map(|(page_id, images)| {
                     let crop = pdf::transform::page_crop_geometry(&document, page_id)?;
+                    let boxes = pdf_image::placement_boxes(&document, page_id).unwrap_or_default();
+                    let images = images
+                        .into_iter()
+                        .map(|image| {
+                            let area = image
+                                .id
+                                .and_then(|id| boxes.get(&id))
+                                .map(|bounds| displayed_area(crop, *bounds));
+                            (image, area)
+                        })
+                        .collect::<Vec<_>>();
                     Ok((page_id, crop, images))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -388,12 +404,20 @@ impl OcrEngine {
                 output::info(format!("OCR {} (searchable layer)...", spec.path.display()));
                 let result = self.recognize_image(&jpeg, file_label(&spec.path))?;
 
-                let placement = pdf::image_placement(width, height, page_size)?;
                 let mut document = pdf::jpeg_document(jpeg, page_size)?;
                 let page_id = *document
                     .get_pages()
                     .get(&1)
                     .context("image page is missing")?;
+                let geometry = pdf::transform::page_geometry(&document, page_id)?;
+                let placement = pdf::image_placement(
+                    width,
+                    height,
+                    page_size,
+                    // The size the page was given, whatever resolution it took.
+                    (page_size == PageSize::Fit)
+                        .then(|| 72.0 * f64::from(width) / geometry.raw_width()),
+                );
                 // Image pixels -> page points, measured from the page top.
                 let scale = placement.width / f64::from(width);
                 let top = placement.page_height - placement.y - placement.height;
@@ -428,19 +452,21 @@ impl OcrEngine {
         }
     }
 
-    /// Recognise the images of one page and map their words onto the visible
-    /// page, assuming each image covers it. Extracted images are upright, so
-    /// words are placed on the displayed page and `matrix` turns them with it.
+    /// Recognise the images of one page and map their words onto the area
+    /// each image covers on the visible page (`[left, top, width, height]`
+    /// from the top-left corner), or the whole page when it is not known.
+    /// Extracted images are upright, so words are placed on the displayed
+    /// page and `matrix` turns them with it.
     fn page_overlay(
         &self,
         page_id: lopdf::ObjectId,
         crop: PageGeometry,
-        images: &[ExtractedImage],
+        images: &[(ExtractedImage, Option<[f64; 4]>)],
     ) -> PageTextOverlay {
         let (page_width, page_height) = (crop.display_width(), crop.display_height());
         let mut words = Vec::new();
         let mut fallback = Vec::new();
-        for image in images {
+        for (image, area) in images {
             output::info(format!("OCR {} (searchable layer)...", image.label));
             let result = match self.recognize_image(&image.bytes, &image.label) {
                 Ok(result) => result,
@@ -449,14 +475,15 @@ impl OcrEngine {
                     continue;
                 }
             };
-            let scale_x = page_width / f64::from(image.width.max(1));
-            let scale_y = page_height / f64::from(image.height.max(1));
+            let [left, top, width, height] = area.unwrap_or([0.0, 0.0, page_width, page_height]);
+            let scale_x = width / f64::from(image.width.max(1));
+            let scale_y = height / f64::from(image.height.max(1));
             words.extend(result.words.into_iter().map(|mut word| {
-                word.x *= scale_x;
-                word.y *= scale_y;
+                word.x = left + word.x * scale_x;
+                word.y = top + word.y * scale_y;
                 word.width *= scale_x;
                 word.height *= scale_y;
-                word.line_y *= scale_y;
+                word.line_y = top + word.line_y * scale_y;
                 word.line_height *= scale_y;
                 word
             }));
@@ -492,13 +519,22 @@ impl OcrEngine {
     }
 
     /// Pages (number, id) that need OCR: all with `--force-ocr`, otherwise
-    /// those without a meaningful text layer of their own.
-    fn pages_to_recognise(&self, document: &Document) -> Vec<(u32, lopdf::ObjectId)> {
+    /// those without a meaningful text layer of their own (`texts`).
+    fn pages_to_recognise(
+        &self,
+        document: &Document,
+        texts: &BTreeMap<u32, String>,
+    ) -> Vec<(u32, lopdf::ObjectId)> {
         document
             .get_pages()
             .into_iter()
             .filter(|&(number, page_id)| {
-                self.options.force_image_ocr || !has_text_layer(document, number, page_id)
+                self.options.force_image_ocr
+                    || !has_text_layer(
+                        document,
+                        page_id,
+                        texts.get(&number).map_or("", String::as_str),
+                    )
             })
             .collect()
     }
@@ -510,7 +546,9 @@ impl OcrEngine {
                 .run_vision(original, label)
                 .map(OcrPageResult::text_only),
             OcrBackend::Auto => {
-                if !self.options.api_key.trim().is_empty() {
+                if !self.options.api_key.trim().is_empty()
+                    && !self.groq_refused.load(Ordering::Relaxed)
+                {
                     match self.run_vision(original, label) {
                         Ok(text) => return Ok(OcrPageResult::text_only(text)),
                         Err(error) => output::warn(format!(
@@ -588,14 +626,11 @@ impl OcrEngine {
         };
         let key = sha256_hex(key_parts);
         let path = cache_dir.join(format!("{key}.{extension}"));
-        let item_lock = self
-            .cache_locks
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        let item_lock = crate::parallel::lock(&self.cache_locks)
             .entry(key)
             .or_default()
             .clone();
-        let _guard = item_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = crate::parallel::lock(&item_lock);
 
         match fs::read_to_string(&path) {
             Ok(data) => {
@@ -662,15 +697,15 @@ impl OcrEngine {
                 .post(&self.options.endpoint)
                 .header("Authorization", &authorization)
                 .send_json(&payload);
+            let backoff = Duration::from_secs((attempt * 2) as u64);
             let mut response = match response {
                 Ok(response) => response,
                 Err(error) if attempt < MAX_ATTEMPTS => {
-                    let wait = Duration::from_secs((attempt * 2) as u64);
                     drop(permit);
-                    self.gate.defer(wait);
+                    self.gate.defer(backoff);
                     output::warn(format!(
                         "Network error: {error}. Retrying in {}s ({attempt}/{MAX_ATTEMPTS})",
-                        wait.as_secs()
+                        backoff.as_secs()
                     ));
                     continue;
                 }
@@ -698,6 +733,18 @@ impl OcrEngine {
                 ));
                 continue;
             }
+            // Overloaded or restarting servers usually recover shortly.
+            if matches!(status, 500 | 502 | 503 | 504) && attempt < MAX_ATTEMPTS {
+                self.gate.defer(backoff);
+                output::warn(format!(
+                    "OCR server error {status}. Retrying in {}s ({attempt}/{MAX_ATTEMPTS})",
+                    backoff.as_secs()
+                ));
+                continue;
+            }
+            if matches!(status, 401 | 403) {
+                self.groq_refused.store(true, Ordering::Relaxed);
+            }
             if !(200..300).contains(&status) {
                 bail!("OCR API returned {status}: {body}");
             }
@@ -708,7 +755,20 @@ impl OcrEngine {
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
                 .context("OCR API response has no choices[0].message.content")?;
-            return Ok(strip_think_blocks(content.trim()));
+            let mut text = strip_think_blocks(content.trim());
+            if response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("length")
+                && !text.ends_with(TRUNCATION_NOTE)
+            {
+                output::warn(format!(
+                    "the OCR answer reached ocr_max_tokens ({}) and is cut off",
+                    self.options.max_tokens
+                ));
+                text.push_str(TRUNCATION_NOTE);
+            }
+            return Ok(text);
         }
 
         bail!("OCR exceeded {MAX_ATTEMPTS} attempts")
@@ -771,21 +831,44 @@ fn models_endpoint(endpoint: &str) -> Result<String> {
     Ok(format!("{base}/models"))
 }
 
-fn page_text(document: &Document, number: u32) -> String {
+/// The existing text layer of every page, by page number.
+fn page_texts(document: &Document) -> BTreeMap<u32, String> {
     document
-        .extract_text_with_limit(&[number], pdf::MAX_DECOMPRESSED_BYTES)
-        .unwrap_or_default()
+        .get_pages()
+        .into_keys()
+        .map(|number| {
+            let text = document
+                .extract_text_with_limit(&[number], pdf::MAX_DECOMPRESSED_BYTES)
+                .unwrap_or_default();
+            (number, text)
+        })
+        .collect()
 }
 
 /// A page has a text layer when bpdf already added its OCR layer, or when
 /// it carries a real amount of text (a page number alone does not count).
-fn has_text_layer(document: &Document, number: u32, page_id: lopdf::ObjectId) -> bool {
+fn has_text_layer(document: &Document, page_id: lopdf::ObjectId, text: &str) -> bool {
     let has_bpdf_layer = document.get_page_fonts(page_id).is_ok_and(|fonts| {
         fonts
             .keys()
             .any(|name| name.starts_with(OCR_FONT_NAME.as_bytes()))
     });
-    has_bpdf_layer || has_enough_text(&page_text(document, number))
+    has_bpdf_layer || has_enough_text(text)
+}
+
+/// Where an image covers the displayed page, as `[left, top, width, height]`
+/// in points from its top-left corner; `bounds` are in user space.
+fn displayed_area(crop: PageGeometry, [left, bottom, right, top]: [f64; 4]) -> [f64; 4] {
+    let corners = [(left, bottom), (right, top)].map(|(x, y)| crop.page_to_display(x, y));
+    let (x0, x1) = (
+        corners[0].0.min(corners[1].0),
+        corners[0].0.max(corners[1].0),
+    );
+    let (y0, y1) = (
+        corners[0].1.min(corners[1].1),
+        corners[0].1.max(corners[1].1),
+    );
+    [x0, crop.display_height() - y1, x1 - x0, y1 - y0]
 }
 
 fn has_enough_text(text: &str) -> bool {
@@ -795,7 +878,8 @@ fn has_enough_text(text: &str) -> bool {
         .is_some()
 }
 
-/// Delete every cached OCR response; returns (files, bytes) removed.
+/// Delete every cached OCR response (`<sha256>.md` and `<sha256>.json`);
+/// other files in the directory are left alone. Returns (files, bytes).
 pub fn clear_cache(directory: &Path) -> Result<(usize, u64)> {
     if !directory.exists() {
         return Ok((0, 0));
@@ -805,6 +889,17 @@ pub fn clear_cache(directory: &Path) -> Result<(usize, u64)> {
     let entries = fs::read_dir(directory)
         .with_context(|| format!("failed to read cache directory {}", directory.display()))?;
     for entry in entries.flatten() {
+        let path = entry.path();
+        let is_cache_entry = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| {
+                stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && (formats::has_extension(&path, "md") || formats::has_extension(&path, "json"));
+        if !is_cache_entry {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -820,11 +915,18 @@ fn retry_after(header: Option<&str>, body: &str, attempt: usize) -> Duration {
     let mut seconds = header
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(0.0);
+    // "Please try again in 2.25s" or "... in 1m30.5s".
     if seconds <= 0.0
         && let Some(rest) = body.split("try again in ").nth(1)
         && let Some(value) = rest.split('s').next()
     {
-        seconds = value.trim().parse::<f64>().unwrap_or(0.0);
+        seconds = match value.split_once('m') {
+            Some((minutes, rest)) => {
+                minutes.trim().parse::<f64>().unwrap_or(0.0) * 60.0
+                    + rest.trim().parse::<f64>().unwrap_or(0.0)
+            }
+            None => value.trim().parse::<f64>().unwrap_or(0.0),
+        };
     }
     if seconds <= 0.0 {
         seconds = (attempt * 5) as f64;
@@ -840,7 +942,7 @@ fn strip_think_blocks(content: &str) -> String {
         };
         let Some(relative_end) = content[start..].find("</think>") else {
             content.truncate(start);
-            content.push_str("\n\n*[ВНИМАНИЕ: Ответ модели был оборван из-за лимита токенов]*");
+            content.push_str(TRUNCATION_NOTE);
             return content;
         };
         let end = start + relative_end + "</think>".len();
@@ -848,6 +950,9 @@ fn strip_think_blocks(content: &str) -> String {
         content = content.trim().to_owned();
     }
 }
+
+/// Appended to an OCR answer cut off by the token limit.
+const TRUNCATION_NOTE: &str = "\n\n*[Warning: the model's answer was cut off by the token limit]*";
 
 fn file_label(path: &Path) -> &str {
     path.file_name()
@@ -869,12 +974,39 @@ mod tests {
 
     #[test]
     fn ocr_backend_parsing() {
-        assert_eq!(OcrBackend::parse("groq").unwrap(), OcrBackend::Groq);
-        assert_eq!(OcrBackend::parse("auto").unwrap(), OcrBackend::Auto);
-        if cfg!(windows) {
-            assert_eq!(OcrBackend::parse("windows").unwrap(), OcrBackend::Windows);
-            assert_eq!(OcrBackend::parse("winocr").unwrap(), OcrBackend::Windows);
-        }
+        assert_eq!("groq".parse::<OcrBackend>().unwrap(), OcrBackend::Groq);
+        assert_eq!("AUTO".parse::<OcrBackend>().unwrap(), OcrBackend::Auto);
+        assert_eq!(
+            "windows".parse::<OcrBackend>().unwrap(),
+            OcrBackend::Windows
+        );
+        assert_eq!("winocr".parse::<OcrBackend>().unwrap(), OcrBackend::Windows);
+        assert!("tesseract".parse::<OcrBackend>().is_err());
+    }
+
+    #[test]
+    fn image_areas_follow_page_rotation() {
+        let crop = PageGeometry {
+            left: 0.0,
+            bottom: 0.0,
+            right: 600.0,
+            top: 800.0,
+            rotation: 0,
+        };
+        // Lower half of an upright page.
+        assert_eq!(
+            displayed_area(crop, [0.0, 0.0, 600.0, 400.0]),
+            [0.0, 400.0, 600.0, 400.0]
+        );
+        // Turned a quarter: the page shows 800 wide and 600 high.
+        let turned = PageGeometry {
+            rotation: 90,
+            ..crop
+        };
+        assert_eq!(
+            displayed_area(turned, [0.0, 0.0, 600.0, 400.0]),
+            [0.0, 0.0, 400.0, 600.0]
+        );
     }
 
     #[test]
@@ -886,10 +1018,14 @@ mod tests {
     #[test]
     fn clears_cache_files_and_counts_bytes() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("a.json"), b"12345").unwrap();
-        fs::write(temp.path().join("b.md"), b"1234567").unwrap();
+        let key = "0123456789abcdef".repeat(4);
+        fs::write(temp.path().join(format!("{key}.json")), b"12345").unwrap();
+        fs::write(temp.path().join(format!("{key}.md")), b"1234567").unwrap();
+        // Not cache entries: a user's notes beside the cache stay.
+        fs::write(temp.path().join("notes.md"), b"mine").unwrap();
+        fs::write(temp.path().join(format!("{key}.txt")), b"mine").unwrap();
         assert_eq!(clear_cache(temp.path()).unwrap(), (2, 12));
-        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -900,6 +1036,10 @@ mod tests {
             Duration::from_millis(2250)
         );
         assert_eq!(retry_after(Some("999"), "", 1), MAX_RETRY_WAIT);
+        assert_eq!(
+            retry_after(None, "Please try again in 1m2.5s.", 1),
+            Duration::from_millis(62_500)
+        );
     }
 
     #[test]
@@ -908,7 +1048,7 @@ mod tests {
             strip_think_blocks("<think>hidden</think>\nanswer"),
             "answer"
         );
-        assert!(strip_think_blocks("<think>cut").contains("ВНИМАНИЕ"));
+        assert!(strip_think_blocks("<think>cut").ends_with(TRUNCATION_NOTE));
     }
 
     #[test]

@@ -4,13 +4,14 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use super::common::{
-    DOCUMENT_SEPARATOR, OutputRegistry, finish_batch, handle_results, write_output,
+    DOCUMENT_SEPARATOR, OutputRegistry, finish_batch, handle_results, lazy_when,
+    reject_output_collision, write_output,
 };
 use crate::cli::OcrArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
-use crate::ocr::{self, OcrBackend, OcrEngine, OcrOptions};
+use crate::ocr::{self, OcrEngine, OcrOptions};
 use crate::{output, pdf};
 
 pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
@@ -27,8 +28,11 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
             spec.reject_pages()?;
         }
     }
+    if let Some(path) = &args.out {
+        reject_output_collision(path, &specs)?;
+    }
     let engine = OcrEngine::new(OcrOptions {
-        backend: OcrBackend::parse(args.engine.as_deref().unwrap_or(&config.ocr_engine))?,
+        backend: args.engine.unwrap_or(config.ocr_engine),
         lang: args.lang.or_else(|| config.ocr_lang.clone()),
         force_image_ocr: args.force_ocr,
         jobs: config.ocr_jobs.clamp(1, 64),
@@ -137,11 +141,12 @@ fn markdown(
     for spec in specs {
         output::info(format!("Queued OCR: {}", describe(spec)));
     }
-    let results: Box<dyn Iterator<Item = Result<String>>> = if fail_fast {
-        Box::new(specs.iter().map(|spec| engine.extract_spec(spec)))
-    } else {
-        Box::new(engine.extract_many_specs(specs).into_iter())
-    };
+    // Without --fail-fast all images share one queue of OCR workers.
+    let results = lazy_when(
+        fail_fast,
+        specs.iter().map(|spec| engine.extract_spec(spec)),
+        || engine.extract_many_specs(specs),
+    );
     let mut texts = Vec::with_capacity(specs.len());
     let failures = handle_results(
         specs
@@ -185,7 +190,7 @@ fn searchable(
 ) -> Result<lopdf::Document> {
     engine.create_searchable_pdf_for_spec(
         spec,
-        &config.page_size,
+        config.page_size,
         config.font_path.as_deref(),
         keep_all_pages,
     )
@@ -244,12 +249,25 @@ mod tests {
         assert_eq!(paths, [directory.path().join("scan_2.md")]);
     }
 
+    #[test]
+    fn a_searchable_pdf_must_not_replace_an_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("scan.pdf");
+        crate::commands::common::test_utils::sample_pdf(&source);
+        let before = std::fs::read(&source).unwrap();
+        let mut args = windows_ocr_args(vec![source.to_str().unwrap().to_owned()], None, false);
+        args.out = Some(source.clone());
+        let error = run(args, &Config::default(), true).unwrap_err();
+        assert!(format!("{error:#}").contains("also an input"), "{error:#}");
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+    }
+
     fn windows_ocr_args(inputs: Vec<String>, out: Option<PathBuf>, in_place: bool) -> OcrArgs {
         OcrArgs {
             inputs,
             out,
             in_place,
-            engine: Some("windows".to_owned()),
+            engine: Some(crate::ocr::OcrBackend::Windows),
             lang: None,
             force_ocr: in_place,
             no_cache: true,
@@ -288,7 +306,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let input_pdf = temp_dir.path().join("source.pdf");
         let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(500, 500);
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         crate::pdf::transform::rotate_pages(&mut document, "all", 90).unwrap();
         document.save(&input_pdf).unwrap();
 
@@ -308,7 +326,7 @@ mod tests {
         let input_pdf = temp_dir.path().join("source.pdf");
         let page = || {
             let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(500, 500);
-            crate::pdf::jpeg_document(jpeg, "A4").unwrap()
+            crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap()
         };
         let mut document = crate::pdf::merge_documents(vec![page(), page(), page()]).unwrap();
         document.save(&input_pdf).unwrap();

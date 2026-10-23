@@ -32,10 +32,14 @@ pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<Input
     for argument in arguments {
         if let Some(manifest_arg) = argument.strip_prefix('@') {
             let (manifest_path, pages) = split_pdf_range(manifest_arg);
-            for entry in read_manifest(Path::new(&manifest_path))? {
+            let manifest_path = Path::new(&manifest_path);
+            // Relative entries are relative to the list, not to the
+            // directory bpdf happens to run in.
+            let base = manifest_path.parent().unwrap_or(Path::new(""));
+            for entry in read_manifest(manifest_path)? {
                 let (entry_path, entry_pages) = split_pdf_range(&entry);
                 files.push(InputSpec {
-                    path: PathBuf::from(entry_path),
+                    path: base.join(entry_path),
                     pages: entry_pages.or_else(|| pages.clone()),
                 });
             }
@@ -56,7 +60,7 @@ pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<Input
                         .unwrap_or(false)
                 })
                 .map(|entry| entry.path())
-                .filter(|entry| formats.supports(entry))
+                .filter(|entry| formats.includes(entry))
                 .filter(|entry| !is_office_lock_file(entry))
                 .collect::<Vec<_>>();
             natural_sort(&mut entries);
@@ -65,14 +69,16 @@ pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<Input
                 pages: pages.clone(),
             }));
         } else if base.contains(['*', '?']) {
+            // Like a directory listing: files of the formats the command reads.
             let mut matches = glob(&base)
                 .with_context(|| format!("invalid glob pattern {base}"))?
                 .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.is_file() && formats.includes(entry))
                 .filter(|entry| !is_office_lock_file(entry))
                 .collect::<Vec<_>>();
             natural_sort(&mut matches);
             if matches.is_empty() {
-                crate::output::warn(format!("no files match {base}, skipping"));
+                crate::output::warn(format!("no supported files match {base}, skipping"));
             }
             files.extend(matches.into_iter().map(|path| InputSpec {
                 path,
@@ -216,5 +222,38 @@ mod tests {
                 PathBuf::from("scan_10.jpg")
             ]
         );
+    }
+
+    #[test]
+    fn manifest_entries_are_relative_to_the_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let list = directory.path().join("list.txt");
+        std::fs::write(&list, "# scans\nscan.pdf:2\nsub/photo.jpg\n").unwrap();
+        let specs = expand(&[format!("@{}", list.display())], InputFormatSet::Merge).unwrap();
+        assert_eq!(specs[0].path, directory.path().join("scan.pdf"));
+        assert_eq!(specs[0].pages.as_deref(), Some("2"));
+        assert_eq!(specs[1].path, directory.path().join("sub/photo.jpg"));
+    }
+
+    #[test]
+    fn globs_take_supported_files_only() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a.jpg", "b.txt", "c.pdf"] {
+            std::fs::write(directory.path().join(name), "x").unwrap();
+        }
+        std::fs::create_dir(directory.path().join("d.jpg")).unwrap();
+        let pattern = directory.path().join("*").display().to_string();
+        let specs = expand(&[pattern], InputFormatSet::Rotate).unwrap();
+        let names = specs
+            .iter()
+            .map(|spec| {
+                spec.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["a.jpg", "c.pdf"]);
     }
 }

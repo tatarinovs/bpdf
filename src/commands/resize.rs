@@ -23,7 +23,7 @@ pub fn run(args: ResizeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         pages: &args.pages,
         output: &args.output,
         edit_pdf: |document: &mut lopdf::Document, pages: &str| {
-            transform::resize_pages(document, &args.size, pages)
+            transform::resize_pages(document, args.size.sheet(), pages)
         },
         edit_jpeg: |path: &Path| {
             if !has_edges {
@@ -48,7 +48,7 @@ mod tests {
         run(
             ResizeArgs {
                 inputs: vec![input.to_string_lossy().into_owned()],
-                size: size.to_owned(),
+                size: size.parse().unwrap(),
                 long_edge: edges.0,
                 short_edge: edges.1,
                 pages: "all".to_owned(),

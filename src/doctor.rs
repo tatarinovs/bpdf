@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use serde_json::json;
 
 use crate::config::Config;
-use crate::ocr::{OcrEngine, OcrOptions};
+use crate::ocr::{OcrBackend, OcrEngine, OcrOptions};
 use crate::office::{self, OfficeOptions};
 use crate::{output, process, textpdf};
 
@@ -58,8 +58,7 @@ impl Report {
 
 pub fn run(config: &Config) -> Result<()> {
     let mut report = Report::default();
-    let groq_used = config.ocr_engine.eq_ignore_ascii_case("groq")
-        || config.ocr_engine.eq_ignore_ascii_case("auto");
+    let groq_used = config.ocr_engine != OcrBackend::Windows;
 
     report.check(
         "config",

@@ -8,7 +8,7 @@ use crate::formats::{self, Format};
 use crate::html::{self, HtmlOptions};
 use crate::imageconv::{self, ImageOptions};
 use crate::office::{self, OfficeOptions};
-use crate::pdf;
+use crate::pdf::{self, PageSize};
 use crate::textpdf::{self, TextOptions};
 
 /// Dependencies needed to turn every supported source type into the common
@@ -26,14 +26,20 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
     match formats::detect(&spec.path) {
         Some(format) if format.is_image() => {
             spec.reject_pages()?;
-            let jpegs = imageconv::to_jpegs_for_pdf(
-                &spec.path,
-                &options.image,
-                Some(&options.text.page_size),
-            )?;
+            let page_size = options.text.page_size;
+            let jpegs = imageconv::to_jpegs_for_pdf(&spec.path, &options.image, Some(page_size))?;
+            // A fitted page uses the resolution of the source, which a
+            // re-encoded JPEG no longer records.
+            let dpi = if page_size == PageSize::Fit {
+                std::fs::read(&spec.path)
+                    .ok()
+                    .and_then(|bytes| crate::metadata::image_dpi(&bytes))
+            } else {
+                None
+            };
             let documents = jpegs
                 .into_iter()
-                .map(|jpeg| pdf::jpeg_document(jpeg, &options.text.page_size))
+                .map(|jpeg| pdf::jpeg_document_at(jpeg, page_size, dpi))
                 .collect::<Result<Vec<_>>>()?;
             pdf::merge_documents(documents)
         }
@@ -46,7 +52,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
         }
         Some(Format::Cbz) => {
             spec.reject_pages()?;
-            crate::archive::load_cbz(&spec.path, &options.image, Some(&options.text.page_size))
+            crate::archive::load_cbz(&spec.path, &options.image, options.text.page_size)
         }
         Some(format) if format.is_office() => {
             spec.reject_pages()?;
@@ -71,6 +77,11 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
             spec.reject_pages()?;
             load_html(&spec.path, &options.html, &options.text)
         }
+        Some(Format::Svg) => {
+            spec.reject_pages()?;
+            html::svg_to_pdf(&spec.path, &options.html)
+                .with_context(|| format!("cannot draw {}", spec.path.display()))
+        }
         Some(Format::Text) => {
             spec.reject_pages()?;
             textpdf::render(&crate::encoding::read_text(&spec.path)?, &options.text)
@@ -86,7 +97,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
 
 /// Browser layout of an HTML page, or its text when no browser can render it.
 fn load_html(path: &Path, html: &HtmlOptions, text: &TextOptions) -> Result<Document> {
-    let (width, height) = crate::pdf::paper_size(&text.page_size)?;
+    let (width, height) = text.page_size.sheet();
     match html::convert_to_pdf(path, html, height / width) {
         Ok(document) => Ok(document),
         Err(browser_err) => {

@@ -7,7 +7,7 @@ fn main() {
     if let Err(error) = &result {
         bpdf::report_error(error);
         pause_if(standalone);
-        std::process::exit(1);
+        std::process::exit(bpdf::exit_code(error));
     } else if bpdf::shows_report() {
         pause_if(standalone);
     }

@@ -8,11 +8,12 @@ use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use ttf_parser::{Face, GlyphId};
 
 use crate::font_subset;
+use crate::pdf::PageSize;
 use crate::winocr::OcrWordBox;
 
 #[derive(Clone, Debug)]
 pub struct TextOptions {
-    pub page_size: String,
+    pub page_size: PageSize,
     pub font_path: Option<PathBuf>,
     pub font_size: f64,
     pub margin: f64,
@@ -21,7 +22,7 @@ pub struct TextOptions {
 impl Default for TextOptions {
     fn default() -> Self {
         Self {
-            page_size: "A4".to_owned(),
+            page_size: PageSize::A4,
             font_path: None,
             font_size: 10.0,
             margin: 40.0,
@@ -68,6 +69,11 @@ impl<'a> FontWriter<'a> {
     fn new(data: &'a [u8]) -> Result<Self> {
         let face = Face::parse(data, 0)
             .map_err(|error| anyhow::anyhow!("failed to parse font: {error:?}"))?;
+        if face.tables().glyf.is_none() {
+            bail!(
+                "the font has PostScript (CFF) outlines; set font_path to a TrueType font (.ttf or .ttc)"
+            );
+        }
         Ok(Self {
             data,
             face,
@@ -167,14 +173,49 @@ impl<'a> FontWriter<'a> {
         output.push(chunk);
     }
 
+    /// Subset font name: a tag unique to the glyph set plus the font's
+    /// PostScript name, so two different subsets of one font in a document
+    /// (page numbers and an OCR layer) never share a name.
+    fn subset_name(&self) -> String {
+        let glyphs = self
+            .used
+            .keys()
+            .flat_map(|glyph| glyph.to_be_bytes())
+            .collect::<Vec<_>>();
+        let digest = crate::hash::sha256_hex(&[&glyphs, &self.data.len().to_be_bytes()]);
+        let tag = digest
+            .bytes()
+            .take(6)
+            .map(|byte| char::from(b'A' + byte % 26))
+            .collect::<String>();
+        let postscript = self
+            .face
+            .names()
+            .into_iter()
+            .find(|name| name.name_id == ttf_parser::name_id::POST_SCRIPT_NAME)
+            .and_then(|name| name.to_string())
+            .map(|name| {
+                name.chars()
+                    .filter(|character| {
+                        character.is_ascii_graphic() && !"[](){}<>/%#".contains(*character)
+                    })
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "BpdfEmbedded".to_owned());
+        format!("{tag}+{postscript}")
+    }
+
     /// Write the subset font objects and return the Type0 font id.
-    fn embed(self, document: &mut Document) -> ObjectId {
+    fn embed(self, document: &mut Document) -> Result<ObjectId> {
         let units = f64::from(self.face.units_per_em());
         let metric = |value: i16| f64::from(value) * 1000.0 / units;
+        let name = Object::Name(self.subset_name().into_bytes());
 
         let used_glyphs = self.used.keys().copied().collect::<BTreeSet<_>>();
         let font_data = font_subset::subset_truetype(self.data, &used_glyphs)
-            .unwrap_or_else(|| self.data.to_vec());
+            .or_else(|| font_subset::standalone_truetype(self.data))
+            .context("the font cannot be embedded; set font_path to a TrueType font")?;
         let font_file_id = document.add_object(Stream::new(
             dictionary! { "Length1" => font_data.len() as i64 },
             font_data,
@@ -183,7 +224,7 @@ impl<'a> FontWriter<'a> {
         let bounds = self.face.global_bounding_box();
         let descriptor_id = document.add_object(dictionary! {
             "Type" => "FontDescriptor",
-            "FontName" => "BpdfEmbedded",
+            "FontName" => name.clone(),
             "Flags" => 32,
             "FontBBox" => vec![
                 metric(bounds.x_min).into(),
@@ -212,7 +253,7 @@ impl<'a> FontWriter<'a> {
         let cid_font_id = document.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "CIDFontType2",
-            "BaseFont" => "BpdfEmbedded",
+            "BaseFont" => name.clone(),
             "CIDSystemInfo" => dictionary! {
                 "Registry" => Object::string_literal("Adobe"),
                 "Ordering" => Object::string_literal("Identity"),
@@ -227,14 +268,14 @@ impl<'a> FontWriter<'a> {
             dictionary! {},
             build_to_unicode_cmap(&self.used).into_bytes(),
         ));
-        document.add_object(dictionary! {
+        Ok(document.add_object(dictionary! {
             "Type" => "Font",
             "Subtype" => "Type0",
-            "BaseFont" => "BpdfEmbedded",
+            "BaseFont" => name,
             "Encoding" => "Identity-H",
             "DescendantFonts" => vec![Object::Reference(cid_font_id)],
             "ToUnicode" => to_unicode_id,
-        })
+        }))
     }
 }
 
@@ -244,7 +285,7 @@ pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
     let font_data = load_font(options.font_path.as_deref())?;
     let mut font = FontWriter::new(&font_data)?;
 
-    let (page_width, page_height) = crate::pdf::paper_size(&options.page_size)?;
+    let (page_width, page_height) = options.page_size.sheet();
     let line_height = options.font_size * 1.25;
     let lines_per_page = ((page_height - 2.0 * options.margin) / line_height)
         .floor()
@@ -275,7 +316,7 @@ pub fn render(text: &str, options: &TextOptions) -> Result<Document> {
 
     let mut document = Document::with_version("1.7");
     let pages_id = document.new_object_id();
-    let font_id = font.embed(&mut document);
+    let font_id = font.embed(&mut document)?;
     let resources_id = document.add_object(dictionary! {
         "Font" => dictionary! { "F0" => font_id },
     });
@@ -448,7 +489,7 @@ pub fn overlay_searchable_text(
         page_contents.push((overlay.page_id, content));
     }
 
-    let font_id = font.embed(document);
+    let font_id = font.embed(document)?;
     let mut installer = crate::pdf::transform::ResourceInstaller::new(vec![(
         b"Font".as_slice(),
         font_name.as_bytes(),
@@ -561,7 +602,7 @@ pub fn add_text_marks(
         contents.push((page_id, content));
     }
 
-    let font_id = font.embed(document);
+    let font_id = font.embed(document)?;
     let state_id = (style.opacity < 1.0).then(|| {
         document.add_object(dictionary! {
             "Type" => "ExtGState",
@@ -612,7 +653,7 @@ mod tests {
     #[test]
     fn overlay_adds_searchable_text_to_an_image_page() {
         let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         let page_id = *document.get_pages().get(&1).unwrap();
         let overlay = PageTextOverlay {
             page_id,
@@ -692,7 +733,7 @@ mod tests {
     #[test]
     fn page_numbers_are_upright_on_rotated_pages() {
         let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         crate::pdf::transform::rotate_pages(&mut document, "all", 90).unwrap();
         let style = TextMarkStyle {
             font_size: 10.0,
@@ -752,7 +793,7 @@ mod tests {
     #[test]
     fn a_second_mark_run_keeps_the_first_visible() {
         let jpeg = crate::commands::common::test_utils::sample_jpeg_bytes(20, 10);
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         let style = TextMarkStyle {
             font_size: 10.0,
             position: "bc".to_owned(),

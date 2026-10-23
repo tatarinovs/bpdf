@@ -22,6 +22,8 @@
 16 ICON "number.ico"
 17 ICON "watermark.ico"
 18 ICON "ocr-inplace.ico"
+19 ICON "protect.ico"
+20 ICON "unlock.ico"
 
 1 RT_MANIFEST "bpdf.manifest"
 

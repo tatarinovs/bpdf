@@ -1,39 +1,33 @@
 use std::fs;
-use std::path::Path;
 
 use anyhow::Result;
 
-use super::common::{batch, edited_outputs, finish_batch, handle_results, write_output};
+use super::common::edit_each;
 use crate::cli::StripArgs;
 use crate::config::Config;
-use crate::fileset::{InputSpec, expand};
+use crate::fileset::InputSpec;
 use crate::formats::{self, Format, InputFormatSet};
 use crate::{metadata, output, pdf};
 
 pub fn run(args: StripArgs, config: &Config, fail_fast: bool) -> Result<()> {
-    let specs = expand(&args.inputs, InputFormatSet::Strip)?;
-    let destinations = edited_outputs(&args.output, &specs, "stripped")?;
-    let jobs = specs.iter().zip(&destinations).collect::<Vec<_>>();
-    let mut outputs = 0usize;
-    let results = batch(&jobs, fail_fast, |(spec, destination)| {
-        (&spec.path, strip_one(spec, destination, config.keep_icc))
-    });
-    let failures = handle_results(
-        results,
+    edit_each(
+        "strip",
+        "stripped",
+        InputFormatSet::Strip,
+        &args.inputs,
+        &args.output,
         fail_fast,
-        "failed to process",
-        "error processing",
-        |stripped| outputs += usize::from(stripped),
-    )?;
-    finish_batch("strip", specs.len(), failures, outputs)
+        |spec| strip_one(spec, config.keep_icc),
+    )
 }
 
-fn strip_one(spec: &InputSpec, destination: &Path, keep_icc: bool) -> Result<bool> {
+/// The stripped file, or `None` for a format strip does not handle.
+fn strip_one(spec: &InputSpec, keep_icc: bool) -> Result<Option<Vec<u8>>> {
     if spec.pages.is_some() {
         anyhow::bail!("page ranges are not valid for strip");
     }
     let input = &spec.path;
-    let bytes = match formats::detect(input) {
+    Ok(Some(match formats::detect(input) {
         Some(Format::Jpeg) => metadata::strip_jpeg(&fs::read(input)?, keep_icc)?,
         Some(Format::Png) => metadata::strip_png(&fs::read(input)?, keep_icc)?,
         Some(Format::Pdf) => pdf::transform_file(input, |document| {
@@ -42,16 +36,14 @@ fn strip_one(spec: &InputSpec, destination: &Path, keep_icc: bool) -> Result<boo
         })?,
         _ => {
             output::info(format!("Skipping unsupported file: {}", input.display()));
-            return Ok(false);
+            return Ok(None);
         }
-    };
-    write_output(destination, &bytes)?;
-    Ok(true)
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::cli::OutputArgs;

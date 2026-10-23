@@ -4,8 +4,8 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use serde_json::json;
 
-use super::common::{edit_pdf, same_path, suffixed_output, write_output};
-use crate::cli::{MetadataArgs, NumberArgs, StampArgs, WatermarkArgs};
+use super::common::{edit_pdf, edited_output, same_path, write_output};
+use crate::cli::{MetadataArgs, NumberArgs, ProtectArgs, StampArgs, UnlockArgs, WatermarkArgs};
 use crate::config::Config;
 use crate::output;
 use crate::pdf;
@@ -13,7 +13,7 @@ use crate::pdf::transform::{self, StampOptions};
 use crate::stamp_picker;
 use crate::textpdf::{self, TextMarkStyle};
 
-pub fn split(input: &Path, output_dir: Option<&Path>) -> Result<()> {
+pub fn split(input: &Path, output_dir: Option<&Path>, force: bool) -> Result<()> {
     let directory = output_dir.map(Path::to_path_buf).unwrap_or_else(|| {
         input
             .parent()
@@ -21,23 +21,10 @@ pub fn split(input: &Path, output_dir: Option<&Path>) -> Result<()> {
             .to_path_buf()
     });
     fs::create_dir_all(&directory)?;
-    for output_path in pdf::split_file(input, &directory)? {
+    for output_path in pdf::split_file(input, &directory, force)? {
         output::written(&output_path);
     }
     Ok(())
-}
-
-pub fn extract(input: &Path, pages: &str, output_path: Option<&Path>) -> Result<()> {
-    let output_path = output_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| suffixed_output(input, "extracted", "pdf"));
-    if same_path(input, &output_path) {
-        bail!("refusing to overwrite the input PDF");
-    }
-    write_output(
-        &output_path,
-        &pdf::transform_file(input, |document| pdf::select_pages(document, pages))?,
-    )
 }
 
 pub fn info(input: &Path) -> Result<()> {
@@ -47,6 +34,14 @@ pub fn info(input: &Path) -> Result<()> {
 }
 
 pub fn text(input: &Path, output_path: Option<&Path>) -> Result<()> {
+    if let Some(output_path) = output_path
+        && same_path(input, output_path)
+    {
+        bail!(
+            "{} would replace the source PDF with its text",
+            output_path.display()
+        );
+    }
     let document = pdf::load(input)?;
     let text = pdf::extract_text(&document)?;
     if text.trim().is_empty() {
@@ -75,7 +70,7 @@ pub fn stamp(args: StampArgs, config: &Config) -> Result<()> {
         dpi: args.dpi,
         opacity: args.opacity,
         pages: args.pages,
-        blend_mode: transform::BlendMode::parse(&args.blend)?,
+        blend_mode: args.blend,
         placements: Vec::new(),
     };
     if args.pick {
@@ -148,6 +143,47 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
         );
     }
     edit_pdf(&args.input, &args.output, "metadata", |document| {
-        transform::set_info_fields(document, &fields)
+        transform::set_info_fields(document, &fields)?;
+        // Readers prefer XMP over the Info dictionary, so an old XMP packet
+        // would keep showing the old properties.
+        if document.catalog_mut()?.remove(b"Metadata").is_some() {
+            output::info("Removed the XMP metadata so readers show the new properties");
+        }
+        Ok(())
     })
+}
+
+pub fn protect(args: ProtectArgs) -> Result<()> {
+    let restrictions = pdf::Restrictions {
+        print: args.no_print,
+        copy: args.no_copy,
+        modify: args.no_modify,
+    };
+    let user = args.password.unwrap_or_default();
+    if user.is_empty() && !restrictions.any() {
+        bail!("set --password, or restrict the PDF with --no-print, --no-copy or --no-modify");
+    }
+    let owner = match args.owner_password {
+        Some(owner) if !owner.is_empty() => owner,
+        // Without an owner password of its own anyone with the open
+        // password could lift the restrictions.
+        _ if restrictions.any() => {
+            output::info("Restrictions are protected by a random owner password");
+            pdf::random_password()?
+        }
+        _ => user.clone(),
+    };
+    edit_pdf(&args.input, &args.output, "protected", |document| {
+        pdf::protect(document, &user, &owner, restrictions)
+    })
+}
+
+pub fn unlock(args: UnlockArgs) -> Result<()> {
+    let destination = edited_output(&args.input, &args.output, "unlocked")?;
+    let mut document =
+        pdf::load_with_password(&args.input, Some(args.password.as_deref().unwrap_or("")))?;
+    if document.encryption_state.take().is_none() {
+        bail!("{} is not encrypted", args.input.display());
+    }
+    write_output(&destination, &pdf::save_to_bytes(&mut document)?)
 }

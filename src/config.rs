@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::imageconv::ImageOptions;
+use crate::ocr::OcrBackend;
+use crate::pdf::PageSize;
 
 pub const DEFAULT_OCR_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 pub const DEFAULT_OCR_MODEL: &str = "qwen/qwen3.8-27b";
@@ -22,10 +24,10 @@ pub struct Config {
     pub auto_rotate: bool,
     pub keep_icc: bool,
     pub optimize: bool,
-    pub page_size: String,
+    pub page_size: PageSize,
     pub strip_metadata: bool,
     pub bookmarks: bool,
-    pub ocr_engine: String,
+    pub ocr_engine: OcrBackend,
     pub ocr_lang: Option<String>,
     pub ocr_model: String,
     pub ocr_prompt: String,
@@ -58,10 +60,10 @@ impl Default for Config {
             auto_rotate: false,
             keep_icc: false,
             optimize: false,
-            page_size: "A4".to_owned(),
+            page_size: PageSize::A4,
             strip_metadata: false,
             bookmarks: false,
-            ocr_engine: "groq".to_owned(),
+            ocr_engine: OcrBackend::Groq,
             ocr_lang: None,
             ocr_model: DEFAULT_OCR_MODEL.to_owned(),
             ocr_prompt: DEFAULT_OCR_PROMPT.to_owned(),
@@ -130,10 +132,25 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
-        let clean_text = expand_env_string(text);
-
-        let config: Self =
-            basic_toml::from_str(&clean_text).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut config: Self =
+            basic_toml::from_str(text).map_err(|error| anyhow::anyhow!("{error}"))?;
+        // `%NAME%` is expanded in the parsed values, so a variable holding
+        // backslashes or quotes cannot break the TOML syntax.
+        for value in [&mut config.groq_api_key, &mut config.proxy] {
+            *value = expand_env_string(value);
+        }
+        for path in [
+            Some(&mut config.ffmpeg),
+            Some(&mut config.powershell),
+            Some(&mut config.ocr_cache_dir),
+            config.font_path.as_mut(),
+            config.browser.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *path = PathBuf::from(expand_env_string(&path.to_string_lossy()));
+        }
 
         if !(1..=100).contains(&config.jpeg_quality) {
             bail!("jpeg_quality must be between 1 and 100");
@@ -232,7 +249,7 @@ mod tests {
 
         assert!(config.auto_rotate);
         assert!(!config.keep_icc);
-        assert_eq!(config.page_size, "Letter");
+        assert_eq!(config.page_size, "Letter".parse().unwrap());
         assert_eq!(config.ocr_prompt, "Keep # signs and: colons");
         assert_eq!(config.jpeg_quality, 91);
         assert_eq!(config.ocr_jobs, 3);
@@ -248,9 +265,23 @@ mod tests {
     fn toml_example_file_parses_successfully() {
         let example_toml = include_str!("../config.example.toml");
         let config = Config::parse(example_toml).expect("config.example.toml must be valid");
-        assert_eq!(config.page_size, "A4");
+        assert_eq!(config.page_size, PageSize::A4);
         assert_eq!(config.jpeg_quality, 95);
-        assert_eq!(config.ocr_engine, "groq");
+        assert_eq!(config.ocr_engine, OcrBackend::Groq);
+    }
+
+    #[test]
+    fn invalid_page_size_and_engine_are_reported() {
+        let error = Config::parse("page_size = \"A9\"").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unknown page size"),
+            "{error:#}"
+        );
+        let error = Config::parse("ocr_engine = \"tesseract\"").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unknown OCR engine"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -311,11 +342,14 @@ mod tests {
             r#"
                 groq_api_key = "%BPDF_KEY_VAR%"
                 ffmpeg = '%BPDF_PATH_VAR%\ffmpeg.exe'
+                ocr_cache_dir = "%BPDF_PATH_VAR%/cache"
             "#,
         )
         .unwrap();
         assert_eq!(config.groq_api_key, "secret_key_123");
         assert_eq!(config.ffmpeg, PathBuf::from(r"C:\Tools\bin\ffmpeg.exe"));
+        // Backslashes of the value inside a "..." string are no TOML escapes.
+        assert_eq!(config.ocr_cache_dir, PathBuf::from(r"C:\Tools\bin/cache"));
         unsafe {
             std::env::remove_var("BPDF_PATH_VAR");
             std::env::remove_var("BPDF_KEY_VAR");

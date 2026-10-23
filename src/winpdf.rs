@@ -40,16 +40,42 @@ fn render_pages(
     use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
     use windows::core::HSTRING;
 
-    // StorageFile requires an absolute path.
-    let absolute = std::path::absolute(input)
-        .with_context(|| format!("failed to resolve {}", input.display()))?;
     let _apartment = crate::com::ComApartment::initialize()?;
-    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(absolute.as_os_str()))?
-        .join()
-        .context("failed to get storage file from path")?;
-    let pdf = PdfDocument::LoadFromFileAsync(&file)?
-        .join()
-        .context("failed to load PDF document via Windows API")?;
+    let open = |path: &Path| -> Result<PdfDocument> {
+        // StorageFile requires an absolute path.
+        let absolute = std::path::absolute(path)
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(absolute.as_os_str()))?
+            .join()
+            .context("failed to get storage file from path")?;
+        // The empty password opens files encrypted only for restrictions.
+        PdfDocument::LoadFromFileWithPasswordAsync(&file, &HSTRING::new())?
+            .join()
+            .context("failed to load PDF document via Windows API")
+    };
+    // The Windows renderer cannot read AES-256 (bpdf protect): it gets a
+    // decrypted copy of a file bpdf itself can open.
+    let mut _decrypted = None;
+    let pdf = match open(input) {
+        Ok(pdf) => pdf,
+        Err(error) => {
+            let Ok(mut document) = crate::pdf::load(input) else {
+                return Err(error);
+            };
+            if document.encryption_state.take().is_none() {
+                return Err(error);
+            }
+            // A closed file: the Windows API cannot share an open temporary one.
+            let copy = tempfile::Builder::new()
+                .suffix(".pdf")
+                .tempfile()?
+                .into_temp_path();
+            std::fs::write(&copy, crate::pdf::save_to_bytes(&mut document)?)?;
+            let pdf = open(&copy)?;
+            _decrypted = Some(copy);
+            pdf
+        }
+    };
 
     let count = pdf.PageCount()? as usize;
     if let Some(page) = pages.iter().find(|page| **page == 0 || **page > count) {

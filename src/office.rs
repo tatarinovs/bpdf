@@ -37,7 +37,7 @@ pub fn convert_to_pdf(path: &Path, options: &OfficeOptions) -> Result<Vec<u8>> {
     // Office COM servers misbehave with concurrent automation sessions, so
     // conversions are serialised even when inputs load in parallel.
     static OFFICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _session = OFFICE.lock().unwrap_or_else(|error| error.into_inner());
+    let _session = crate::parallel::lock(&OFFICE);
     convert_to_pdf_windows(path, options)
 }
 

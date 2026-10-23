@@ -1,5 +1,5 @@
-pub mod cli;
-pub mod config;
+pub(crate) mod cli;
+pub(crate) mod config;
 
 mod archive;
 mod atomic;
@@ -74,6 +74,19 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
 
 pub fn report_error(error: &anyhow::Error) {
     output::error(format!("{error:#}"));
+}
+
+/// Process exit code for a failed run: 2 when only some inputs of a batch
+/// failed, 1 otherwise.
+pub fn exit_code(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<commands::common::PartialFailure>()
+        .is_some()
+    {
+        2
+    } else {
+        1
+    }
 }
 
 static SHOWS_REPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

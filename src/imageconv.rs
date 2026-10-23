@@ -19,6 +19,7 @@ use tempfile::Builder;
 
 use crate::formats::{self, Format};
 use crate::metadata;
+use crate::pdf::PageSize;
 use crate::process;
 
 const MAX_IMAGE_FRAMES: usize = 10_000;
@@ -32,7 +33,7 @@ const FFMPEG_IMAGE_DEMUXERS: &str = "image2,mov,fits,brender_pix,gif,apng,webp,\
     ppm_pipe,psd_pipe,qoi_pipe,sgi_pipe,sunrast_pipe,tiff_pipe,webp_pipe,xbm_pipe,xpm_pipe,\
     xwd_pipe";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 pub enum Orientation {
     Portrait,
     Landscape,
@@ -87,7 +88,11 @@ impl ImageOptions {
     }
 }
 
-pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
+pub fn to_jpeg(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<PageSize>,
+) -> Result<Vec<u8>> {
     match formats::detect(path) {
         Some(Format::FfmpegRaster) => {
             return apply_transformations(decode_with_ffmpeg(path, options)?, options, page_size);
@@ -133,7 +138,7 @@ pub fn to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> 
 pub fn bytes_to_jpeg(
     bytes: &[u8],
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Result<Vec<u8>> {
     if let Some(jpeg) = jpeg_fast_path(bytes, options, page_size) {
         return Ok(jpeg);
@@ -146,7 +151,7 @@ pub fn bytes_to_jpeg(
 fn jpeg_fast_path(
     bytes: &[u8],
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Option<Vec<u8>> {
     if options.needs_reencode() || image::guess_format(bytes).ok()? != ImageFormat::Jpeg {
         return None;
@@ -177,28 +182,36 @@ pub(crate) fn decode_bytes(bytes: &[u8]) -> Result<DynamicImage> {
 
 /// Decode every logical page/frame for PDF construction. Single-image callers
 /// keep using `to_jpeg`, so convert/OCR naming and behavior remain stable.
+/// Animated and multi-page files are recognised by their content, so a
+/// misnamed file still takes the right decoder.
 pub fn to_jpegs_for_pdf(
     path: &Path,
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Result<Vec<Vec<u8>>> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    // RAW files are TIFF inside, PSD and HEIF have their own decoders.
+    if !matches!(
+        formats::detect(path),
+        Some(Format::Jpeg | Format::Png | Format::Raster)
+    ) {
+        return Ok(vec![to_jpeg(path, options, page_size)?]);
+    }
     let open = || -> Result<BufReader<File>> {
         Ok(BufReader::new(File::open(path).with_context(|| {
             format!("failed to open {}", path.display())
         })?))
     };
-    match extension.as_str() {
-        "gif" => {
+    let content = ImageReader::new(open()?)
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.format());
+    match content {
+        Some(ImageFormat::Gif) => {
             let decoder = GifDecoder::new(open()?)
                 .with_context(|| format!("failed to decode GIF {}", path.display()))?;
             encode_animation_frames(decoder.into_frames(), options, page_size, path)
         }
-        "png" | "apng" => {
+        Some(ImageFormat::Png) => {
             let decoder = PngDecoder::new(open()?)
                 .with_context(|| format!("failed to decode PNG {}", path.display()))?;
             if decoder.is_apng()? {
@@ -207,7 +220,7 @@ pub fn to_jpegs_for_pdf(
                 Ok(vec![to_jpeg(path, options, page_size)?])
             }
         }
-        "webp" => {
+        Some(ImageFormat::WebP) => {
             let decoder = WebPDecoder::new(open()?)
                 .with_context(|| format!("failed to decode WebP {}", path.display()))?;
             if decoder.has_animation() {
@@ -216,7 +229,7 @@ pub fn to_jpegs_for_pdf(
                 Ok(vec![to_jpeg(path, options, page_size)?])
             }
         }
-        "tif" | "tiff" => decode_tiff_pages(path, options, page_size),
+        Some(ImageFormat::Tiff) => decode_tiff_pages(path, options, page_size),
         _ => Ok(vec![to_jpeg(path, options, page_size)?]),
     }
 }
@@ -224,7 +237,7 @@ pub fn to_jpegs_for_pdf(
 fn encode_animation_frames(
     frames: impl Iterator<Item = image::ImageResult<image::Frame>>,
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
     path: &Path,
 ) -> Result<Vec<Vec<u8>>> {
     let mut output = Vec::new();
@@ -248,7 +261,7 @@ fn encode_animation_frames(
 fn decode_tiff_pages(
     path: &Path,
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Result<Vec<Vec<u8>>> {
     let decoder = crate::wic::Decoder::open(path)?;
     let count = decoder.frame_count()?;
@@ -267,12 +280,16 @@ fn decode_tiff_pages(
 fn decode_tiff_pages(
     path: &Path,
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Result<Vec<Vec<u8>>> {
     Ok(vec![to_jpeg(path, options, page_size)?])
 }
 
-fn raw_to_jpeg(path: &Path, options: &ImageOptions, page_size: Option<&str>) -> Result<Vec<u8>> {
+fn raw_to_jpeg(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: Option<PageSize>,
+) -> Result<Vec<u8>> {
     if !options.raw_develop {
         match crate::raw::read_preview(path) {
             Ok(preview) => return bytes_to_jpeg(&preview, options, page_size),
@@ -382,14 +399,61 @@ fn decode_with_ffmpeg(path: &Path, options: &ImageOptions) -> Result<DynamicImag
 fn dpi_target_for_dimensions(
     width: u32,
     height: u32,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
     image_dpi: u32,
 ) -> Option<(u32, u32)> {
     if image_dpi == 0 {
         return None;
     }
-    let (page_width, page_height) = crate::pdf::paper_size(page_size?).ok()?;
+    // A page that takes the image size never asks for fewer pixels.
+    let (page_width, page_height) = match page_size? {
+        PageSize::Fit => return None,
+        size => size.sheet(),
+    };
     fit_dimensions_for_dpi(width, height, page_width, page_height, image_dpi)
+}
+
+/// Re-encode a JPEG at the highest quality (at most `quality`) that keeps it
+/// within `limit` bytes; images that do not fit even at the lowest quality
+/// are also scaled down. The original is kept when it already fits.
+pub fn fit_jpeg_to_size(jpeg: Vec<u8>, limit: u64, quality: u8) -> Result<Vec<u8>> {
+    const LOWEST_QUALITY: u8 = 20;
+    if jpeg.len() as u64 <= limit {
+        return Ok(jpeg);
+    }
+    let mut image = decode_bytes(&jpeg)?;
+    let quality = quality.max(LOWEST_QUALITY);
+    loop {
+        let fits = |bytes: &Vec<u8>| bytes.len() as u64 <= limit;
+        let lowest = encode_jpeg_on_white(&image, LOWEST_QUALITY)?;
+        if fits(&lowest) {
+            // Invariant: `low` fits (its bytes in `best`), `high` does not.
+            let (mut low, mut high, mut best) = (LOWEST_QUALITY, quality + 1, lowest);
+            while high - low > 1 {
+                let middle = (low + high) / 2;
+                let bytes = encode_jpeg_on_white(&image, middle)?;
+                if fits(&bytes) {
+                    (low, best) = (middle, bytes);
+                } else {
+                    high = middle;
+                }
+            }
+            return Ok(best);
+        }
+        let (width, height) = image.dimensions();
+        if width <= 16 || height <= 16 {
+            bail!(
+                "cannot reduce the image to {limit} bytes; the smallest JPEG was {} bytes",
+                lowest.len()
+            );
+        }
+        // JPEG size grows roughly with the pixel count.
+        let scale = ((limit as f64) / (lowest.len() as f64))
+            .sqrt()
+            .clamp(0.3, 0.9);
+        let (width, height) = scaled(width, height, scale);
+        image = resize(&image, width, height, FilterType::Lanczos3);
+    }
 }
 
 /// Encode as baseline JPEG. Grayscale stays single-channel and so do colour
@@ -596,7 +660,7 @@ pub(crate) fn resize(
 pub(crate) fn apply_transformations(
     mut image: DynamicImage,
     options: &ImageOptions,
-    page_size: Option<&str>,
+    page_size: Option<PageSize>,
 ) -> Result<Vec<u8>> {
     if let Some(orient) = options.orient {
         let (width, height) = image.dimensions();
@@ -712,10 +776,35 @@ mod tests {
     #[test]
     fn decoded_external_image_uses_the_common_page_dpi_target() {
         assert_eq!(
-            dpi_target_for_dimensions(2400, 1600, Some("A4"), 150),
+            dpi_target_for_dimensions(2400, 1600, Some(PageSize::A4), 150),
             Some((1754, 1169))
         );
-        assert_eq!(dpi_target_for_dimensions(2400, 1600, Some("A4"), 0), None);
+        assert_eq!(
+            dpi_target_for_dimensions(2400, 1600, Some(PageSize::A4), 0),
+            None
+        );
+        assert_eq!(
+            dpi_target_for_dimensions(2400, 1600, Some(PageSize::Fit), 150),
+            None
+        );
+    }
+
+    #[test]
+    fn jpeg_size_fitting_lowers_quality_then_size() {
+        let mut seed = 3u32;
+        let noisy = DynamicImage::ImageRgb8(RgbImage::from_fn(600, 400, |_, _| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let value = (seed >> 16) as u8;
+            Rgb([value, value.wrapping_add(80), value.wrapping_mul(3)])
+        }));
+        let original = encode_jpeg_on_white(&noisy, 95).unwrap();
+        let unchanged = fit_jpeg_to_size(original.clone(), u64::MAX, 95).unwrap();
+        assert_eq!(unchanged, original);
+        for limit in [original.len() as u64 / 2, 20_000] {
+            let fitted = fit_jpeg_to_size(original.clone(), limit, 95).unwrap();
+            assert!(fitted.len() as u64 <= limit, "{} > {limit}", fitted.len());
+        }
+        assert!(fit_jpeg_to_size(original, 100, 95).is_err());
     }
 
     #[test]

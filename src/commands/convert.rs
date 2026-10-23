@@ -11,14 +11,15 @@ use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
 use crate::formats::{self, Format, InputFormatSet};
 use crate::html::{self, HtmlOptions, Viewport};
-use crate::imageconv::{self, ImageOptions, Orientation};
+use crate::imageconv::{self, ImageOptions};
 use crate::pdf::image::{self as pdf_image, Selection};
-use crate::{output, pdf};
+use crate::{output, parallel, pdf};
 
 #[derive(Debug)]
 enum Plan {
     Image(PathBuf),
     Html(PathBuf),
+    Svg(PathBuf),
     Tiff,
     Pdf(Option<String>),
 }
@@ -30,6 +31,7 @@ struct Converter<'a> {
     image_options: ImageOptions,
     html: HtmlOptions,
     viewport: Viewport,
+    max_size: Option<u64>,
     registry: Mutex<OutputRegistry>,
 }
 
@@ -38,7 +40,7 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
     let mut image_options = config.image_options();
     image_options.long_edge = args.long_edge;
     image_options.short_edge = args.short_edge;
-    image_options.orient = args.orient.as_deref().map(Orientation::parse).transpose()?;
+    image_options.orient = args.orient;
     if let Some(quality) = args.quality {
         image_options.jpeg_quality = quality;
         image_options.force_reencode = true;
@@ -67,6 +69,7 @@ pub fn run(args: ConvertArgs, config: &Config, fail_fast: bool) -> Result<()> {
             timeout: Duration::from_secs(config.html_timeout_seconds),
         },
         viewport,
+        max_size: args.max_size,
         registry: Mutex::new(registry),
     };
     let results = batch(&plans, fail_fast, |(input, plan)| {
@@ -113,11 +116,15 @@ fn build_plans(
                     Ok(Plan::Image(output))
                 }
                 Some(Format::Pdf) => Ok(Plan::Pdf(spec.pages.clone())),
-                Some(Format::Html) => {
+                Some(format @ (Format::Html | Format::Svg)) => {
                     spec.reject_pages()?;
                     let output = output_name(&input, output_dir, None)?;
                     registry.reserve(&input, &output, force)?;
-                    Ok(Plan::Html(output))
+                    Ok(if format == Format::Svg {
+                        Plan::Svg(output)
+                    } else {
+                        Plan::Html(output)
+                    })
                 }
                 _ => bail!("unsupported convert input: {}", input.display()),
             })();
@@ -131,10 +138,15 @@ impl Converter<'_> {
         match plan {
             Plan::Image(output) => {
                 output::info(format!("Converting {}", input.display()));
-                write_output(
-                    output,
-                    &imageconv::to_jpeg(input, &self.image_options, None)?,
-                )?;
+                let jpeg = imageconv::to_jpeg(input, &self.image_options, None)?;
+                write_output(output, &self.limit(jpeg)?)?;
+                Ok(1)
+            }
+            Plan::Svg(output) => {
+                output::info(format!("Drawing {}", input.display()));
+                let png = html::svg_screenshot(input, &self.html)?;
+                let jpeg = imageconv::bytes_to_jpeg(&png, &self.image_options, None)?;
+                write_output(output, &self.limit(jpeg)?)?;
                 Ok(1)
             }
             Plan::Html(output) => {
@@ -145,10 +157,8 @@ impl Converter<'_> {
                     self.viewport.height
                 ));
                 let png = html::screenshot(input, &self.html, self.viewport)?;
-                write_output(
-                    output,
-                    &imageconv::bytes_to_jpeg(&png, &self.image_options, None)?,
-                )?;
+                let jpeg = imageconv::bytes_to_jpeg(&png, &self.image_options, None)?;
+                write_output(output, &self.limit(jpeg)?)?;
                 Ok(1)
             }
             Plan::Tiff => {
@@ -236,6 +246,16 @@ impl Converter<'_> {
         }
     }
 
+    /// Keep a JPEG within `--max-size`.
+    fn limit(&self, jpeg: Vec<u8>) -> Result<Vec<u8>> {
+        match self.max_size {
+            Some(limit) => {
+                imageconv::fit_jpeg_to_size(jpeg, limit, self.image_options.jpeg_quality)
+            }
+            None => Ok(jpeg),
+        }
+    }
+
     /// Reserve every destination first, so a name clash writes nothing.
     fn write_all(
         &self,
@@ -244,19 +264,17 @@ impl Converter<'_> {
         message: &str,
     ) -> Result<usize> {
         {
-            let mut registry = self
-                .registry
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut registry = parallel::lock(&self.registry);
             for (path, _) in &outputs {
                 registry.reserve(input, path, self.force)?;
             }
         }
-        for (path, bytes) in &outputs {
+        let count = outputs.len();
+        for (path, bytes) in outputs {
             output::info(format!("{message} {}", path.display()));
-            write_output(path, bytes)?;
+            write_output(&path, &self.limit(bytes)?)?;
         }
-        Ok(outputs.len())
+        Ok(count)
     }
 }
 
@@ -277,15 +295,8 @@ fn output_name(input: &Path, output_dir: Option<&Path>, tag: Option<&str>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-
     use super::*;
-
-    fn sample_png(path: &Path) {
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(path, ImageFormat::Png)
-            .unwrap();
-    }
+    use crate::commands::common::test_utils::{sample_jpeg_default, sample_png};
 
     fn args(inputs: &[&Path], out: Option<PathBuf>, force: bool) -> ConvertArgs {
         ConvertArgs {
@@ -299,6 +310,7 @@ mod tests {
             short_edge: None,
             orient: None,
             quality: None,
+            max_size: None,
             render: false,
             viewport: None,
         }
@@ -308,9 +320,7 @@ mod tests {
     fn refuses_in_place_conversion_without_force() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("photo.jpg");
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(&input, ImageFormat::Jpeg)
-            .unwrap();
+        sample_jpeg_default(&input);
         let error = run(args(&[&input], None, false), &Config::default(), true).unwrap_err();
         assert!(format!("{error:#}").contains("--force"));
     }
@@ -319,11 +329,28 @@ mod tests {
     fn force_allows_in_place_conversion() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("photo.jpg");
-        DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([10, 20, 30])))
-            .save_with_format(&input, ImageFormat::Jpeg)
-            .unwrap();
+        sample_jpeg_default(&input);
         run(args(&[&input], None, true), &Config::default(), false).unwrap();
         assert!(input.is_file());
+    }
+
+    #[test]
+    fn max_size_keeps_each_jpeg_within_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("noise.png");
+        let mut seed = 11u32;
+        image::RgbImage::from_fn(800, 600, |_, _| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let value = (seed >> 16) as u8;
+            image::Rgb([value, value.wrapping_mul(7), value.wrapping_add(50)])
+        })
+        .save(&input)
+        .unwrap();
+        let mut arguments = args(&[&input], Some(directory.path().join("out")), false);
+        arguments.max_size = Some(60_000);
+        run(arguments, &Config::default(), true).unwrap();
+        let written = fs::metadata(directory.path().join("out").join("noise.jpg")).unwrap();
+        assert!(written.len() <= 60_000, "{}", written.len());
     }
 
     #[test]

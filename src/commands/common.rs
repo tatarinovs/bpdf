@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,22 @@ use crate::{output, parallel, pdf};
 
 pub const DOCUMENT_SEPARATOR: &str = "\n\n---\n\n";
 
+/// Some inputs of a batch failed while others succeeded; bpdf then exits
+/// with code 2 instead of 1.
+#[derive(Debug)]
+pub struct PartialFailure {
+    pub failed: usize,
+    pub total: usize,
+}
+
+impl fmt::Display for PartialFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} of {} files failed", self.failed, self.total)
+    }
+}
+
+impl std::error::Error for PartialFailure {}
+
 pub fn finish_batch(operation: &str, total: usize, failed: usize, outputs: usize) -> Result<()> {
     let succeeded = total - failed;
     output::result(
@@ -27,10 +44,11 @@ pub fn finish_batch(operation: &str, total: usize, failed: usize, outputs: usize
             "outputs": outputs,
         }),
     );
-    if failed != 0 {
-        bail!("{failed} of {total} files failed");
+    match failed {
+        0 => Ok(()),
+        _ if failed == total => bail!("{failed} of {total} files failed"),
+        _ => Err(PartialFailure { failed, total }.into()),
     }
-    Ok(())
 }
 
 /// Run `work` for every item. Independent items are processed in parallel;
@@ -44,13 +62,62 @@ pub fn batch<'a, T, R, F>(
 where
     T: Sync,
     R: Send + 'a,
-    F: Fn(&'a T) -> R + Sync + 'a,
+    F: Fn(&'a T) -> R + Sync + Clone + 'a,
 {
+    lazy_when(fail_fast, items.iter().map(work.clone()), || {
+        parallel::map(items, parallel::cpu_jobs(), work)
+    })
+}
+
+/// The `sequential` results one at a time with `fail_fast` (nothing after
+/// the first failure runs), otherwise all of them computed by `all`.
+pub fn lazy_when<'a, R: 'a>(
+    fail_fast: bool,
+    sequential: impl Iterator<Item = R> + 'a,
+    all: impl FnOnce() -> Vec<R>,
+) -> Box<dyn Iterator<Item = R> + 'a> {
     if fail_fast {
-        Box::new(items.iter().map(work))
+        Box::new(sequential)
     } else {
-        Box::new(parallel::map(items, parallel::cpu_jobs(), work).into_iter())
+        Box::new(all().into_iter())
     }
+}
+
+/// Driver of batch commands that write one edited file per input (`strip`,
+/// `rotate`, `resize`): every destination is checked before anything is
+/// written, then `edit` returns the new bytes, or `None` to skip the input.
+pub fn edit_each<F>(
+    operation: &str,
+    suffix: &str,
+    formats: InputFormatSet,
+    inputs: &[String],
+    output: &OutputArgs,
+    fail_fast: bool,
+    edit: F,
+) -> Result<()>
+where
+    F: Fn(&InputSpec) -> Result<Option<Vec<u8>>> + Sync,
+{
+    let specs = expand(inputs, formats)?;
+    let destinations = edited_outputs(output, &specs, suffix)?;
+    let jobs = specs.iter().zip(&destinations).collect::<Vec<_>>();
+    let edit = &edit;
+    let results = batch(&jobs, fail_fast, |(spec, destination)| {
+        let written = edit(spec).and_then(|bytes| match bytes {
+            Some(bytes) => write_output(destination, &bytes).map(|()| true),
+            None => Ok(false),
+        });
+        (&spec.path, written)
+    });
+    let mut outputs = 0usize;
+    let failures = handle_results(
+        results,
+        fail_fast,
+        "failed to process",
+        "error processing",
+        |written| outputs += usize::from(written),
+    )?;
+    finish_batch(operation, specs.len(), failures, outputs)
 }
 
 pub fn handle_results<T, P>(
@@ -217,11 +284,11 @@ impl OutputRegistry {
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("output");
-            let extension = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            candidate = path.with_file_name(format!("{stem}_{index}.{extension}"));
+            let name = match path.extension().and_then(|value| value.to_str()) {
+                Some(extension) => format!("{stem}_{index}.{extension}"),
+                None => format!("{stem}_{index}"),
+            };
+            candidate = path.with_file_name(name);
             index += 1;
         }
         candidate
@@ -265,30 +332,20 @@ where
     J: Fn(&Path) -> Result<Vec<u8>> + Sync,
 {
     pub fn run(&self, inputs: &[String], fail_fast: bool) -> Result<()> {
-        let specs = expand(inputs, self.formats)?;
-        let destinations = edited_outputs(self.output, &specs, self.suffix)?;
-        let jobs = specs.iter().zip(&destinations).collect::<Vec<_>>();
-        let results = batch(&jobs, fail_fast, |(spec, destination)| {
-            (&spec.path, self.edit_one(spec, destination))
-        });
-        let failures = handle_results(
-            results,
-            fail_fast,
-            "failed to process",
-            "error processing",
-            drop,
-        )?;
-        finish_batch(
+        edit_each(
             self.operation,
-            specs.len(),
-            failures,
-            specs.len() - failures,
+            self.suffix,
+            self.formats,
+            inputs,
+            self.output,
+            fail_fast,
+            |spec| self.edit_one(spec).map(Some),
         )
     }
 
-    fn edit_one(&self, spec: &InputSpec, destination: &Path) -> Result<()> {
+    fn edit_one(&self, spec: &InputSpec) -> Result<Vec<u8>> {
         let input = &spec.path;
-        let bytes = match formats::detect(input) {
+        Ok(match formats::detect(input) {
             Some(Format::Pdf) => {
                 let pages = spec.pages.as_deref().unwrap_or(self.pages);
                 pdf::transform_file(input, |document| (self.edit_pdf)(document, pages))?
@@ -301,8 +358,7 @@ where
                 (self.edit_jpeg)(input)?
             }
             _ => bail!("unsupported input: {}", input.display()),
-        };
-        write_output(destination, &bytes)
+        })
     }
 }
 
@@ -342,7 +398,7 @@ pub mod test_utils {
 
     pub fn sample_pdf(path: &Path) {
         let jpeg = sample_jpeg_bytes(2, 2);
-        let mut document = crate::pdf::jpeg_document(jpeg, "A4").unwrap();
+        let mut document = crate::pdf::jpeg_document(jpeg, crate::pdf::PageSize::A4).unwrap();
         document.save(path).unwrap();
     }
 }

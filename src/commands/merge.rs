@@ -29,11 +29,7 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         return merge_text(&specs, &output, fail_fast);
     }
 
-    let page_size = args.size.unwrap_or_else(|| config.page_size.clone());
-    let keep_original_size = matches!(
-        page_size.to_ascii_lowercase().as_str(),
-        "none" | "original" | "keep"
-    );
+    let page_size = args.size.unwrap_or(config.page_size);
     let options = LoadOptions {
         image: config.image_options(),
         office: OfficeOptions {
@@ -45,70 +41,89 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
             timeout: Duration::from_secs(config.html_timeout_seconds),
         },
         text: TextOptions {
-            page_size: page_size.clone(),
+            page_size,
             font_path: config.font_path.clone(),
             ..TextOptions::default()
         },
     };
 
     output::info(format!("Reading {} input file(s)...", specs.len()));
+    let remove_blank = args.remove_blank;
     let loads = batch(&specs, fail_fast, |spec| {
         output::info(format!("Reading {}", spec.path.display()));
-        (
-            &spec.path,
-            input::load(spec, &options).map(|doc| (spec.path.clone(), doc)),
-        )
+        let loaded = input::load(spec, &options).map(|document| {
+            let blank = if remove_blank {
+                pdf::blank::blank_pages(&document)
+            } else {
+                Vec::new()
+            };
+            (&spec.path, document, blank)
+        });
+        (&spec.path, loaded)
     });
-    let mut documents = Vec::with_capacity(specs.len());
-    let mut bookmarks = Vec::new();
-    let mut current_page = 1u32;
+    let mut loaded = Vec::with_capacity(specs.len());
+    let failures = handle_results(loads, fail_fast, "failed to load", "Skipping", |source| {
+        loaded.push(source);
+    })?;
+    // Blank pages go before merging, so no bookmark points at one. A file
+    // with nothing but blank pages (a single blank scan) is left out, unless
+    // that would leave nothing at all.
+    let is_all_blank = |(_, document, blank): &(&PathBuf, lopdf::Document, Vec<u32>)| {
+        !blank.is_empty() && blank.len() == document.get_pages().len()
+    };
+    if !loaded.is_empty() && loaded.iter().all(is_all_blank) {
+        output::warn("every page looks blank; none were removed");
+        loaded.iter_mut().for_each(|(_, _, blank)| blank.clear());
+    }
     let generate_bookmarks = MergeArgs::switch(args.bookmarks, args.no_bookmarks, config.bookmarks);
+    let mut sources = Vec::with_capacity(loaded.len());
+    for source in loaded {
+        if is_all_blank(&source) {
+            output::info(format!("Left out blank {}", source.0.display()));
+            continue;
+        }
+        let (path, mut document, blank) = source;
+        if !blank.is_empty() {
+            pdf::blank::drop_pages(&mut document, &blank)?;
+            output::info(format!(
+                "Removed blank pages of {}: {}",
+                path.display(),
+                join_numbers(&blank)
+            ));
+        }
+        // Each file's bookmark holds the outline the file had.
+        let title = generate_bookmarks.then(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("document")
+                .to_owned()
+        });
+        sources.push((document, title));
+    }
 
-    let failures = handle_results(
-        loads,
-        fail_fast,
-        "failed to load",
-        "Skipping",
-        |(path, document)| {
-            if generate_bookmarks {
-                let title = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("document")
-                    .to_owned();
-                let page_count = document.get_pages().len() as u32;
-                if page_count > 0 {
-                    bookmarks.push((title, current_page));
-                    current_page += page_count;
-                }
-            }
-            documents.push(document);
-        },
-    )?;
-
-    if documents.is_empty() {
+    if sources.is_empty() {
         return finish_batch("merge", specs.len(), failures, 0);
     }
 
     output::info("Merging page trees...");
-    let mut document = pdf::merge_documents(documents)?;
-    if generate_bookmarks && !bookmarks.is_empty() {
-        output::info("Adding outline bookmarks...");
-        transform::create_bookmarks(&mut document, &bookmarks)?;
-    }
+    let mut document = if sources.len() == 1 && !generate_bookmarks {
+        sources.remove(0).0
+    } else {
+        pdf::merge_outlined(sources)?
+    };
     if MergeArgs::switch(args.auto_rotate, args.no_auto_rotate, config.auto_rotate) {
         let pages = transform::auto_rotate(&mut document)?;
         if !pages.is_empty() {
             output::info(format!("Auto-rotated pages: {}", join_numbers(&pages)));
         }
     }
-    if !keep_original_size {
+    if page_size.is_paper() {
         output::info(format!("Resizing pages to {page_size}..."));
-        transform::resize_pages(&mut document, &page_size, "all")?;
+        transform::resize_pages(&mut document, page_size.sheet(), "all")?;
     }
     if MergeArgs::switch(args.optimize, args.no_optimize, config.optimize) {
         output::info("Optimizing document...");
-        optimize_document(&mut document, config);
+        optimize_document(&mut document, config.image_dpi, config.jpeg_quality, false);
     }
     if MergeArgs::switch(args.strip_meta, args.no_strip_meta, config.strip_metadata) {
         output::info("Stripping document metadata...");
@@ -116,7 +131,10 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
     }
     transform::set_info_properties(&mut document, &config.author, &config.creator)?;
 
-    write_output(&output, &super::pdf_bytes(document, config, args.max_size)?)?;
+    write_output(
+        &output,
+        &super::pdf_bytes(document, config, args.max_size, false)?,
+    )?;
     finish_batch("merge", specs.len(), failures, 1)
 }
 

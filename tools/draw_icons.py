@@ -21,6 +21,19 @@ def draw_star(draw, cx, cy, r_outer, r_inner, fill):
         points.append((x, y))
     draw.polygon(points, fill=fill)
 
+def draw_padlock(draw, keyhole, opened):
+    # Bold white padlock filling the tile, legible at 16 px. An open lock
+    # has its shackle lifted, with only the left leg still in the body.
+    white = (255, 255, 255, 255)
+    lift = 22 if opened else 0
+    draw.arc([82, 34 - lift, 174, 126 - lift], start=180, end=360, fill=white, width=24)
+    draw.line([(94, 80 - lift), (94, 124)], fill=white, width=24)
+    right_end = 92 - lift if opened else 124
+    draw.line([(162, 80 - lift), (162, right_end)], fill=white, width=24)
+    draw.rounded_rectangle([54, 116, 202, 230], radius=20, fill=white)
+    draw.ellipse([112, 142, 144, 174], fill=keyhole)
+    draw.polygon([(118, 164), (138, 164), (144, 208), (112, 208)], fill=keyhole)
+
 def create_icon_perfect(action):
     img = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -54,6 +67,8 @@ def create_icon_perfect(action):
         "number": c_pink,
         "watermark": (70, 110, 160, 255),
         "ocr-inplace": (25, 135, 84, 255),
+        "protect": (157, 30, 70, 255),
+        "unlock": (20, 150, 120, 255),
         "bpdf": (18, 57, 184, 255)
     }
     bg_color = color_map.get(action, c_blue)
@@ -193,6 +208,12 @@ def create_icon_perfect(action):
         draw.arc([156, 156, 224, 224], start=40, end=320, fill=white, width=14)
         draw.polygon([(232, 178), (204, 160), (226, 206)], fill=white)
 
+    elif action == "protect":
+        draw_padlock(draw, keyhole=bg_color, opened=False)
+
+    elif action == "unlock":
+        draw_padlock(draw, keyhole=bg_color, opened=True)
+
     elif action == "bpdf":
         c_dark_blue = (18, 57, 184, 255)
         # Clear the background previously drawn
@@ -219,7 +240,7 @@ def main():
 
     icons_data = [
         "merge", "ocr", "strip", "split", "extract", "inspect", "rotate", "resize", "text", "doctor", "stamp", "optimize", "metadata", "convert",
-        "number", "watermark", "ocr-inplace"
+        "number", "watermark", "ocr-inplace", "protect", "unlock"
     ]
     sizes_buttons = [(16, 16), (24, 24), (32, 32)]
     for name in icons_data:

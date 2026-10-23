@@ -2,8 +2,8 @@
 
 use std::cell::Cell;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 
 /// Worker count for CPU-bound image work. Capped because every worker holds a
@@ -19,6 +19,12 @@ thread_local! {
     /// nested parallel stages (a CBZ inside a parallel merge) cannot multiply
     /// the thread count and the decoded images held at once.
     static IN_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Lock `mutex`. A thread that panicked while holding it cannot have left
+/// bpdf's simple state half-updated, so a poisoned lock is used as is.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// Apply `work` to every item with at most `jobs` threads; results keep the
@@ -49,7 +55,7 @@ where
                         break;
                     };
                     let result = work(item);
-                    results.lock().unwrap_or_else(|error| error.into_inner())[index] = Some(result);
+                    lock(&results)[index] = Some(result);
                 }
             });
         }

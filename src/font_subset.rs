@@ -3,8 +3,9 @@
 //! Glyph ids are preserved (so `CIDToGIDMap /Identity` stays valid): unused
 //! glyph outlines are emptied, tables PDF viewers do not need for rendering
 //! (layout, kerning, device metrics) are dropped, and `loca` is rewritten in
-//! the long format. Anything unexpected returns `None` and the caller embeds
-//! the original font.
+//! the long format. The first font of a TrueType collection (`.ttc`) is
+//! written out as a standalone font. Anything unexpected returns `None` and
+//! the caller embeds [`standalone_truetype`] instead.
 
 use std::collections::BTreeSet;
 
@@ -20,11 +21,7 @@ struct Table<'a> {
 }
 
 pub fn subset_truetype(font: &[u8], used_glyphs: &BTreeSet<u16>) -> Option<Vec<u8>> {
-    // Only plain TrueType outlines; CFF ('OTTO') and collections are kept whole.
-    if !matches!(read_u32(font, 0)?, 0x0001_0000 | 0x7472_7565) {
-        return None;
-    }
-    let tables = read_tables(font)?;
+    let tables = read_tables(font, face_offset(font)?)?;
     let table = |tag: &[u8; 4]| {
         tables
             .iter()
@@ -87,7 +84,7 @@ pub fn subset_truetype(font: &[u8], used_glyphs: &BTreeSet<u16>) -> Option<Vec<u
         .get_mut(50..52)?
         .copy_from_slice(&1u16.to_be_bytes());
 
-    let mut output_tables = tables
+    let output_tables = tables
         .iter()
         .filter(|table| KEPT_TABLES.contains(&&table.tag))
         .map(|table| {
@@ -100,9 +97,55 @@ pub fn subset_truetype(font: &[u8], used_glyphs: &BTreeSet<u16>) -> Option<Vec<u
             (table.tag, data)
         })
         .collect::<Vec<_>>();
-    output_tables.sort_by_key(|(tag, _)| *tag);
-    let mut font = write_font(&output_tables)?;
+    finish_font(output_tables)
+}
 
+/// The font as a standalone TrueType file: unchanged for a `.ttf`, the first
+/// font of a collection otherwise. `None` for CFF outlines and broken files.
+pub fn standalone_truetype(font: &[u8]) -> Option<Vec<u8>> {
+    let offset = face_offset(font)?;
+    if offset == 0 {
+        return Some(font.to_vec());
+    }
+    let tables = read_tables(font, offset)?
+        .iter()
+        .map(|table| {
+            let data = if &table.tag == b"head" {
+                let mut head = table.data.to_vec();
+                head.get_mut(8..12)?.fill(0);
+                head
+            } else {
+                table.data.to_vec()
+            };
+            Some((table.tag, data))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    finish_font(
+        tables
+            .iter()
+            .map(|(tag, data)| (*tag, data.as_slice()))
+            .collect(),
+    )
+}
+
+/// Offset of the table directory of the (first) TrueType font in `font`;
+/// `None` for CFF outlines ('OTTO') and unknown files.
+fn face_offset(font: &[u8]) -> Option<usize> {
+    match read_u32(font, 0)? {
+        0x0001_0000 | 0x7472_7565 => Some(0),
+        // 'ttcf': the first entry of the collection's offset table.
+        0x7474_6366 => {
+            let offset = read_u32(font, 12)? as usize;
+            matches!(read_u32(font, offset)?, 0x0001_0000 | 0x7472_7565).then_some(offset)
+        }
+        _ => None,
+    }
+}
+
+/// Write the tables sorted by tag and fix the whole-font checksum.
+fn finish_font(mut tables: Vec<([u8; 4], &[u8])>) -> Option<Vec<u8>> {
+    tables.sort_by_key(|(tag, _)| *tag);
+    let mut font = write_font(&tables)?;
     let adjustment = 0xB1B0_AFBAu32.wrapping_sub(checksum(&font));
     let head_offset = head_offset(&font)?;
     font.get_mut(head_offset + 8..head_offset + 12)?
@@ -110,11 +153,13 @@ pub fn subset_truetype(font: &[u8], used_glyphs: &BTreeSet<u16>) -> Option<Vec<u
     Some(font)
 }
 
-fn read_tables(font: &[u8]) -> Option<Vec<Table<'_>>> {
-    let count = usize::from(read_u16(font, 4)?);
+/// Table records of the font whose directory starts at `directory`; table
+/// offsets are relative to the start of the file, also in collections.
+fn read_tables(font: &[u8], directory: usize) -> Option<Vec<Table<'_>>> {
+    let count = usize::from(read_u16(font, directory + 4)?);
     (0..count)
         .map(|index| {
-            let record = 12 + index * 16;
+            let record = directory + 12 + index * 16;
             let tag = font.get(record..record + 4)?.try_into().ok()?;
             let offset = read_u32(font, record + 8)? as usize;
             let length = read_u32(font, record + 12)? as usize;
@@ -243,5 +288,48 @@ mod tests {
             assert_eq!(parsed.glyph_hor_advance(id), face.glyph_hor_advance(id));
         }
         assert_eq!(checksum(&subset), 0xB1B0_AFBA);
+    }
+
+    /// A tiny hand-made collection: a header pointing at one font whose
+    /// tables sit after the header, as in real `.ttc` files.
+    fn collection_of(font: &[u8]) -> Vec<u8> {
+        let mut collection = b"ttcf\0\x01\0\0\0\0\0\x01\0\0\0\x10".to_vec();
+        let shift = collection.len() as u32;
+        let mut copy = font.to_vec();
+        let count = usize::from(read_u16(font, 4).unwrap());
+        for index in 0..count {
+            let record = 12 + index * 16 + 8;
+            let offset = read_u32(font, record).unwrap() + shift;
+            copy[record..record + 4].copy_from_slice(&offset.to_be_bytes());
+        }
+        collection.extend_from_slice(&copy);
+        collection
+    }
+
+    #[test]
+    fn collections_give_a_standalone_font() {
+        let Some(path) = crate::textpdf::find_font(None).ok() else {
+            return;
+        };
+        let font = std::fs::read(path).unwrap();
+        if face_offset(&font) != Some(0) {
+            return;
+        }
+        let collection = collection_of(&font);
+        let standalone = standalone_truetype(&collection).unwrap();
+        assert_eq!(face_offset(&standalone), Some(0));
+        let original = ttf_parser::Face::parse(&font, 0).unwrap();
+        let parsed = ttf_parser::Face::parse(&standalone, 0).unwrap();
+        assert_eq!(parsed.number_of_glyphs(), original.number_of_glyphs());
+        assert_eq!(checksum(&standalone), 0xB1B0_AFBA);
+
+        let used = BTreeSet::from([original.glyph_index('A').unwrap().0]);
+        let subset = subset_truetype(&collection, &used).unwrap();
+        assert!(ttf_parser::Face::parse(&subset, 0).is_ok());
+    }
+
+    #[test]
+    fn cff_fonts_are_refused() {
+        assert_eq!(standalone_truetype(b"OTTO\0\x01\0\0\0\0\0\0"), None);
     }
 }

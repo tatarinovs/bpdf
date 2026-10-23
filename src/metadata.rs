@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
@@ -54,28 +54,22 @@ pub fn strip_jpeg(input: &[u8], keep_icc: bool) -> Result<Vec<u8>> {
     let mut output = Vec::with_capacity(input.len());
     output.extend_from_slice(&[0xff, 0xd8]);
     let mut position = 2usize;
-    let mut pending_marker = None;
 
     loop {
-        let marker = if let Some(marker) = pending_marker.take() {
-            marker
-        } else {
-            while position < input.len() && input[position] != 0xff {
-                position += 1;
-            }
-            if position >= input.len() {
-                break;
-            }
-            while position < input.len() && input[position] == 0xff {
-                position += 1;
-            }
-            if position >= input.len() {
-                bail!("truncated JPEG marker");
-            }
-            let marker = input[position];
+        while position < input.len() && input[position] != 0xff {
             position += 1;
-            marker
-        };
+        }
+        if position >= input.len() {
+            break;
+        }
+        while position < input.len() && input[position] == 0xff {
+            position += 1;
+        }
+        if position >= input.len() {
+            bail!("truncated JPEG marker");
+        }
+        let marker = input[position];
+        position += 1;
 
         if marker == 0xd8 || marker == 0xd9 || (0xd0..=0xd7).contains(&marker) || marker == 0x01 {
             output.extend_from_slice(&[0xff, marker]);
@@ -114,35 +108,31 @@ pub fn strip_jpeg(input: &[u8], keep_icc: bool) -> Result<Vec<u8>> {
         position = segment_end;
 
         if marker == 0xda {
-            // Copy entropy-coded data in runs up to the next 0xFF.
-            loop {
-                let rest = &input[position..];
-                let Some(offset) = memchr::memchr(0xff, rest) else {
-                    bail!("truncated JPEG entropy data");
-                };
-                output.extend_from_slice(&rest[..offset]);
-                let ff_start = position + offset;
-                position = ff_start + 1;
-                while position < input.len() && input[position] == 0xff {
-                    position += 1;
-                }
-                if position >= input.len() {
-                    bail!("truncated JPEG entropy marker");
-                }
-                let next = input[position];
-                position += 1;
-
-                if next == 0x00 || (0xd0..=0xd7).contains(&next) {
-                    output.extend_from_slice(&input[ff_start..position]);
-                } else {
-                    pending_marker = Some(next);
-                    break;
-                }
-            }
+            let end = entropy_end(input, position).context("truncated JPEG entropy data")?;
+            output.extend_from_slice(&input[position..end]);
+            position = end;
         }
     }
 
     Ok(output)
+}
+
+/// Position of the marker that ends entropy-coded JPEG data starting at
+/// `start`: the first 0xFF (after fill bytes) not followed by stuffing (0x00)
+/// or a restart marker. `None` when the data is truncated.
+pub(crate) fn entropy_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut position = start;
+    loop {
+        let marker = position + memchr::memchr(0xff, bytes.get(position..)?)?;
+        let mut next = marker + 1;
+        while bytes.get(next) == Some(&0xff) {
+            next += 1;
+        }
+        match bytes.get(next)? {
+            0x00 | 0xd0..=0xd7 => position = next + 1,
+            _ => return Some(marker),
+        }
+    }
 }
 
 /// Physical resolution recorded in PNG pHYs, JFIF or EXIF metadata.

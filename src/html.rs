@@ -71,16 +71,105 @@ pub fn convert_to_pdf(path: &Path, options: &HtmlOptions, page_ratio: f64) -> Re
 /// PNG of the page as it appears in a browser window of `viewport` size.
 pub fn screenshot(path: &Path, options: &HtmlOptions, viewport: Viewport) -> Result<Vec<u8>> {
     let workspace = tempfile::tempdir()?;
-    let window_size = format!("--window-size={},{}", viewport.width, viewport.height);
-    run_browser(
-        path,
+    capture(path, path, options, workspace.path(), viewport, 1.0)
+}
+
+/// Long edge, in pixels, an SVG is drawn at when converted to an image
+/// (smaller drawings are scaled up, larger ones keep their size).
+const SVG_RASTER_EDGE: f64 = 1600.0;
+
+/// PNG of an SVG drawing at its own aspect ratio, at least
+/// `SVG_RASTER_EDGE` pixels on the long edge.
+pub fn svg_screenshot(path: &Path, options: &HtmlOptions) -> Result<Vec<u8>> {
+    let (width, height) = svg_size(path)?;
+    let workspace = tempfile::tempdir()?;
+    let page = svg_page(path, workspace.path(), (width, height), false)?;
+    let viewport = Viewport {
+        width: (width.ceil() as u32).clamp(1, 16384),
+        height: (height.ceil() as u32).clamp(1, 16384),
+    };
+    let scale = (SVG_RASTER_EDGE / width.max(height)).clamp(1.0, 8.0);
+    capture(&page, path, options, workspace.path(), viewport, scale)
+}
+
+/// PDF of an SVG drawing on one page of its own size.
+pub fn svg_to_pdf(path: &Path, options: &HtmlOptions) -> Result<Document> {
+    let size = svg_size(path)?;
+    let workspace = tempfile::tempdir()?;
+    let page = svg_page(path, workspace.path(), size, true)?;
+    let pdf = run_browser(
+        &page,
         path,
         options,
         workspace.path(),
+        "page.pdf",
+        &[
+            "--no-pdf-header-footer",
+            "--print-to-pdf-no-header",
+            "--virtual-time-budget=1000",
+        ],
+        "--print-to-pdf",
+    )?;
+    if !pdf.starts_with(b"%PDF-") {
+        bail!("browser output for {} is not a PDF", path.display());
+    }
+    let mut document = Document::load_mem(&pdf)
+        .with_context(|| format!("browser output for {} is invalid", path.display()))?;
+    // Rounding can push a sliver onto a second sheet.
+    if document.get_pages().len() > 1 {
+        crate::pdf::select_pages(&mut document, "1")?;
+    }
+    Ok(document)
+}
+
+/// An HTML page showing the SVG as an image of `size` CSS pixels; for
+/// printing, on a sheet of exactly that size.
+fn svg_page(
+    path: &Path,
+    workspace: &Path,
+    (width, height): (f64, f64),
+    print: bool,
+) -> Result<PathBuf> {
+    let source = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let paper = if print {
+        format!("@page{{size:{width:.3}px {height:.3}px;margin:0}}")
+    } else {
+        String::new()
+    };
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>{paper}\
+         html,body{{margin:0;background:#fff}}\
+         img{{display:block;width:{width:.3}px;height:{height:.3}px}}</style></head>\
+         <body><img src=\"{}\"></body></html>",
+        path_url(&source)
+    );
+    let page = workspace.join("drawing.html");
+    std::fs::write(&page, html)?;
+    Ok(page)
+}
+
+/// Screenshot of `page` in a window of `viewport` CSS pixels, `scale`
+/// device pixels each.
+fn capture(
+    page: &Path,
+    source: &Path,
+    options: &HtmlOptions,
+    workspace: &Path,
+    viewport: Viewport,
+    scale: f64,
+) -> Result<Vec<u8>> {
+    let window_size = format!("--window-size={},{}", viewport.width, viewport.height);
+    let scale = format!("--force-device-scale-factor={scale:.4}");
+    run_browser(
+        page,
+        source,
+        options,
+        workspace,
         "page.png",
         &[
             "--hide-scrollbars",
-            "--force-device-scale-factor=1",
+            &scale,
             &window_size,
             // Lets web fonts, images and start-up scripts settle before the
             // capture; virtual time also waits for pending network loads.
@@ -88,6 +177,90 @@ pub fn screenshot(path: &Path, options: &HtmlOptions, viewport: Viewport) -> Res
         ],
         "--screenshot",
     )
+}
+
+/// Size in CSS pixels of an SVG drawing, from the `width`, `height` and
+/// `viewBox` of its root element; 300x150 (the browser default) without them.
+pub fn svg_size(path: &Path) -> Result<(f64, f64)> {
+    let text = crate::encoding::read_text(path)?;
+    let start = text
+        .match_indices("<svg")
+        .map(|(index, _)| index)
+        .find(|&index| {
+            text[index + 4..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_whitespace() || next == '>')
+        })
+        .with_context(|| format!("{} has no <svg> element", path.display()))?;
+    let tag = &text[start..start + text[start..].find('>').unwrap_or(text.len() - start)];
+    let width = attribute(tag, "width").and_then(css_pixels);
+    let height = attribute(tag, "height").and_then(css_pixels);
+    let view_box = attribute(tag, "viewBox").and_then(|value| {
+        let numbers = value
+            .split(|character: char| character.is_whitespace() || character == ',')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<f64>().ok())
+            .collect::<Option<Vec<_>>>()?;
+        match numbers.as_slice() {
+            [_, _, width, height] if *width > 0.0 && *height > 0.0 => Some((*width, *height)),
+            _ => None,
+        }
+    });
+    Ok(match (width, height, view_box) {
+        (Some(width), Some(height), _) => (width, height),
+        (Some(width), None, Some((box_width, box_height))) => {
+            (width, width * box_height / box_width)
+        }
+        (None, Some(height), Some((box_width, box_height))) => {
+            (height * box_width / box_height, height)
+        }
+        (None, None, Some(size)) => size,
+        _ => (300.0, 150.0),
+    })
+}
+
+/// Value of attribute `name` in a start tag.
+fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(offset) = tag[from..].find(name) {
+        let at = from + offset;
+        from = at + name.len();
+        // `width` must not match the end of `stroke-width`.
+        if !tag[..at].ends_with(|character: char| character.is_whitespace()) {
+            continue;
+        }
+        let rest = tag[from..].trim_start().strip_prefix('=')?.trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|quote| *quote == '"' || *quote == '\'')?;
+        let value = &rest[1..];
+        return value.find(quote).map(|end| &value[..end]);
+    }
+    None
+}
+
+/// A CSS length in pixels; `None` for percentages and unknown units.
+fn css_pixels(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !(character.is_ascii_digit() || ".+-".contains(character)))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let factor = match unit.trim() {
+        "" | "px" => 1.0,
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "mm" => 96.0 / 25.4,
+        "cm" => 96.0 / 2.54,
+        "in" => 96.0,
+        "em" => 16.0,
+        "ex" => 8.0,
+        _ => return None,
+    };
+    let pixels = number.parse::<f64>().ok()? * factor;
+    (pixels.is_finite() && pixels > 0.0).then_some(pixels)
 }
 
 /// Runs the browser on `page` and returns its output file. `source` is the
@@ -220,7 +393,16 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// `file:` URL of a directory, with the trailing slash that makes relative
 /// links resolve inside it.
 fn file_url(directory: &Path) -> String {
-    let path = directory.to_string_lossy().replace('\\', "/");
+    let mut url = path_url(directory);
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url
+}
+
+/// `file:` URL of an absolute path.
+fn path_url(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
     let mut url = String::from(if path.starts_with('/') {
         "file://"
     } else {
@@ -232,9 +414,6 @@ fn file_url(directory: &Path) -> String {
         } else {
             url.push_str(&format!("%{byte:02X}"));
         }
-    }
-    if !url.ends_with('/') {
-        url.push('/');
     }
     url
 }
@@ -383,6 +562,28 @@ mod tests {
             file_url(Path::new(r"D:\PROJECT\ник ель")),
             "file:///D:/PROJECT/%D0%BD%D0%B8%D0%BA%20%D0%B5%D0%BB%D1%8C/"
         );
+    }
+
+    #[test]
+    fn svg_sizes_follow_attributes_and_view_box() {
+        let directory = tempfile::tempdir().unwrap();
+        let size = |root: &str| {
+            let path = directory.path().join("drawing.svg");
+            std::fs::write(
+                &path,
+                format!("<?xml version=\"1.0\"?>\n{root}<rect/></svg>"),
+            )
+            .unwrap();
+            svg_size(&path).unwrap()
+        };
+        assert_eq!(size("<svg width=\"200\" height=\"100px\">"), (200.0, 100.0));
+        assert_eq!(size("<svg viewBox='0 0 40 30' width='80'>"), (80.0, 60.0));
+        assert_eq!(
+            size("<svg stroke-width=\"3\" viewBox=\"0,0,24,24\">"),
+            (24.0, 24.0)
+        );
+        assert_eq!(size("<svg width=\"1in\" height=\"72pt\">"), (96.0, 96.0));
+        assert_eq!(size("<svg width=\"100%\">"), (300.0, 150.0));
     }
 
     #[test]

@@ -102,30 +102,9 @@ fn parse_jpeg_stream(bytes: &[u8]) -> Option<(&[u8], u32, u32)> {
             dimensions = Some((width, height));
         }
 
-        // Start of Scan (SOS): image entropy data follows
+        // Start of Scan (SOS): entropy data runs up to the next real marker.
         if marker == 0xDA {
-            pos += length;
-            // Scan through entropy data until next non-stuffed 0xFF marker
-            while pos + 1 < bytes.len() {
-                if bytes[pos] == 0xFF {
-                    let next = bytes[pos + 1];
-                    // 0x00 is byte stuffing, 0xD0..=0xD7 are restart markers (RSTm)
-                    if next == 0x00 || (0xD0..=0xD7).contains(&next) {
-                        pos += 2;
-                        continue;
-                    }
-                    // End of Image marker
-                    if next == 0xD9 {
-                        let (w, h) = dimensions?;
-                        return Some((&bytes[..pos + 2], w, h));
-                    }
-                    if next != 0xFF {
-                        // Another marker encountered
-                        break;
-                    }
-                }
-                pos += 1;
-            }
+            pos = crate::metadata::entropy_end(bytes, pos + length)?;
             continue;
         }
 
