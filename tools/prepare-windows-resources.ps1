@@ -41,8 +41,7 @@ $versionInclude += [Environment]::NewLine
     [Text.UTF8Encoding]::new($false)
 )
 
-$icoDir = Join-Path $projectRoot 'ico'
-$hasIcons = (Test-Path $icoDir) -and ((Get-ChildItem $icoDir -Filter *.ico).Count -ge 14)
+$hasIcons = (Test-Path $resourcesDir) -and ((Get-ChildItem $resourcesDir -Filter *.ico).Count -ge 20)
 
 if (-not $hasIcons) {
     Write-Output "Generating icon assets..."

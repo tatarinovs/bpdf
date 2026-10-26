@@ -1,35 +1,34 @@
 # bpdf — Fast, Lightweight PDF & Document Toolkit in Rust
 
-[![Version](https://img.shields.io/badge/Version-0.8.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/github/v/release/tatarinovs/bpdf?label=Version&color=blue)](https://github.com/tatarinovs/bpdf/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue.svg?logo=windows)]()
 [![Language](https://img.shields.io/badge/Язык-Русский-blue.svg)](README.md)
 
 **bpdf** is a high-performance, single-binary CLI tool written in Rust for comprehensive processing of PDF files, images, text documents, e-books, and Microsoft Office files (Word, Excel, PowerPoint).
 
-Designed for speed, low memory footprint, safe atomic file operations, and flexible scripting automation (NDJSON streaming, natural file sorting, input manifests, and environment variable expansion).
+Designed for speed, low memory footprint, safe atomic file operations, and flexible scripting automation (NDJSON streaming, input manifests `@list.txt`, and environment variable expansion).
 
 ---
 
 ## Key Features
 
-- **Universal Merge:** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP), HTML pages, Office documents (Word, Excel, PowerPoint, OpenDocument), and text/source-code files into a single PDF or merged text document.
-- **Multipage Images & Animation Frames:** All TIFF pages, comic book archives (CBZ with natural sort), and all frames of GIF, APNG, and animated WebP become distinct sequential PDF pages.
-- **OCR & Searchable (Sandwich) PDF:** Extract text to Markdown or create a PDF with an invisible searchable text layer (`-o searchable.pdf` / `--in-place`) using cloud **Groq Vision** (Qwen / Llama) or native local **Windows Media OCR** (offline, zero external API keys).
-- **Table of Contents & Bookmarks:** One outline entry per merged file holding that file's own outline (`merge --bookmarks`); named links of every document keep working.
+- **Universal Merge (`merge`):** Seamlessly combine PDFs, standard images, comic archives (CBZ), JPEG 2000 / JPEG-LS / JPEG XR, HEIC/AVIF/PSD, camera RAW photos, e-books (EPUB, FB2, FB2.ZIP, HTMLZ), HTML pages, Office documents (Word, Excel, PowerPoint, OpenDocument), and text files into a single PDF.
+- **Multipage Images & Animations:** All TIFF pages, comic book archives (CBZ with natural sort), and all frames of GIF, APNG, and animated WebP become distinct sequential PDF pages.
+- **OCR & Searchable PDF:** Extract text to Markdown or create a PDF with an invisible searchable text layer (`-o searchable.pdf` / `-i`) using cloud **Groq Vision** (Qwen / Llama) or native local **Windows Media OCR** (offline, zero external API keys).
+- **Table of Contents & Bookmarks:** Automatic generation of PDF Outlines upon merging (`merge --bookmarks`) with preservation of internal named links.
 - **Content-Addressed OCR Cache:** SHA-256 hash-based disk caching (image hash + engine/model + prompt). Repetitive tasks and concurrent workers resolve instantly with zero redundant network requests.
-- **Network Proxy Support:** Full HTTP and SOCKS5 proxy compatibility for bypassing network restrictions or corporate firewalls.
-- **Stamps:** Overlay transparent PNG (or JPEG) stamps with precise anchor positioning (`br`, `center`, or millimeter X,Y offsets), or with the mouse (`--pick`), scale factors, opacity, and blend modes (`multiply` for authentic wet-ink appearance).
-- **Page Normalization & Resizing:** Fit and center pages to A3–A6, B4, B5, Letter, Legal, Tabloid or a custom size, unify orientation by majority vote, preserve native dimensions (`keep`) or size pages to their images (`fit`). Drop blank scanned pages (`--remove-blank`).
-- **Lossless Metadata Stripping (Strip):** Remove EXIF / metadata from JPEG and PNG without re-encoding pixels; sanitize PDF properties, XMP and EXIF of embedded images.
-- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), DPI-aware image optimization (`optimize`) including fitting a target file size (`--max-size`) and grayscale images (`--gray`), and AES-256 passwords and restrictions (`protect`, `unlock`).
-- **Page Numbers & Watermarks:** Template page numbers (`number`) and text watermarks such as "COPY" (`watermark`), kept horizontal on rotated pages.
-- **Phone Photos:** EXIF orientation is honoured by merge, convert and OCR, so photos never end up sideways.
-- **Parallel Processing:** Batch inputs and images inside PDFs are processed on all cores (up to 8 threads).
-- **Safe In-Place Edits:** Atomic temporary write-and-rename semantics prevent data corruption. Editing commands write a suffixed copy by default; `-i` edits in place.
-- **PDF Info & Properties:** Page sizes, rotation, fonts, images and properties (`info`); update Title, Author, Subject, Keywords and Creator (`metadata`).
-- **System Diagnostics (`doctor`):** Inspect runtime environment, configuration validity, helper binaries (`ffmpeg`, `powershell`, MS Office), and verify Groq API connectivity without consuming OCR quotas.
-- **Automation & Total Commander:** Optimized for **Total Commander** workflows with a button bar (`bpdf.bar`, generated by `make_bar.bat`), embedded action icons, and `@list.txt` / `@"%UL"` list file support. Features silent mode (`--quiet`), NDJSON streaming (`--json`), glob expansion (`*.jpg`), and natural alphanumeric sorting (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`).
+- **Stamps (`stamp`):** Overlay transparent PNG or JPEG stamps using coordinates, anchor positions (`br`, `center`), scale factors, opacity, realistic wet-ink appearance (`multiply`), or interactive visual positioning in a browser window (`--pick`).
+- **Page Formatting & Normalization:** Fit and center pages to A3–A6, B4, B5, Letter, Legal, Tabloid or custom sizes, unify orientation by majority vote, preserve native dimensions (`keep`) or size pages to their images (`fit`). Detection and removal of blank scanned pages (`--remove-blank`).
+- **Lossless Metadata Stripping (`strip`):** Remove EXIF / metadata from JPEG and PNG without re-encoding pixels; sanitize PDF properties, XMP, and EXIF of embedded images.
+- **PDF Manipulation Suite:** Page splitting (`split`), range extraction (`extract`), rotation (`rotate`), resizing (`resize`), DPI-aware image optimization (`optimize`), fitting a target file size (`--max-size`), grayscale conversion (`--gray`), and AES-256 passwords and restrictions (`protect`, `unlock`).
+- **Page Numbers & Watermarks:** Template-based page numbers (`number`) and text watermarks (`watermark`) with automatic horizontal orientation on rotated pages.
+- **EXIF Auto-Orientation:** Phone photo orientation is respected during merge, convert, and OCR — pictures never end up sideways.
+- **Parallel Processing:** Batch inputs and images inside PDFs are processed concurrently across all available CPU cores.
+- **Safe In-Place Edits:** Atomic temporary write-and-rename semantics prevent data corruption on interruptions or failures.
+- **Document Properties & Info:** Inspect PDF structure, fonts, images, and metadata (`info`); update Title, Author, Subject, Keywords, and Creator (`metadata`).
+- **Diagnostics (`doctor`):** Inspect runtime environment, configuration validity, helper binaries (`ffmpeg`, `powershell`, MS Office, browser), and verify Groq API connectivity without consuming OCR quotas.
+- **Total Commander Integration:** Ready-to-use button bar `bpdf.bar` (generated by `make_bar.bat`), embedded action icons, and `@list.txt` / `@"%UL"` list file support.
 
 ---
 
@@ -37,22 +36,22 @@ Designed for speed, low memory footprint, safe atomic file operations, and flexi
 
 | Feature / Format | Windows | Linux / macOS | Notes |
 | :--- | :--- | :--- | :--- |
-| **Core (PDF, JPEG, PNG, BMP, GIF, WebP, APNG)** | Native Pure Rust | Native Pure Rust | No external dependencies required. |
-| **TIFF (single and multi-page)** | Native WIC | Native Pure Rust | Windows decodes TIFF through Windows Imaging Component. |
-| **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Native Pure Rust | Native Pure Rust | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
-| **Windows Formats (JPEG XR `.jxr`, `.wdp`, `.hdp`, `.ico`)** | Native WIC | — | Uses Windows Imaging Component. |
-| **HEIC/HEIF, AVIF** | Native WIC, FFmpeg fallback | FFmpeg | Windows uses the HEIF Image Extension (plus HEVC Video Extension for HEIC, AV1 Video Extension for AVIF) and falls back to FFmpeg when the codec is missing or fails. |
-| **PSD/PSB** | Pure Rust, FFmpeg fallback | Pure Rust, FFmpeg fallback | The merged composite (8/16-bit RGB, CMYK, grayscale, indexed) is read natively; 32-bit, bitmap and ZIP-compressed documents go to FFmpeg. Layers are not rendered. |
-| **Extended Formats (JPEG 2000/HDR/EXR/etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or the `ffmpeg` path in `config.toml`. |
-| **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust Fallback | Accurate layout via COM automation if MS Office is installed; otherwise fast built-in XML text extractor. |
-| **HTML pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Laid out by a headless Chromium-based browser (Edge ships with Windows 10/11) with CSS, images and JavaScript; set `browser` to override. The paper follows the layout: a page that fits one sheet of `page_size` proportions becomes a single PDF page of its exact size (a 1200×1600 card is one uncropped page), a longer one is split into sheets of its width; an explicit CSS `@page { size }` wins. `--size keep` keeps that size instead of fitting `page_size`. Without a browser, the page text is extracted and rendered as a text PDF. |
-| **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Native Pure Rust | Native Pure Rust | Built-in ZIP/XML parsing and chapter structure extraction; Windows-1251 and declared XML encodings are supported. |
-| **HTML to JPEG (`convert page.html`)** | Edge / Chrome | Chrome / Chromium | Viewport-sized screenshot; no fallback without a browser. |
-| **SVG (`.svg`)** | Edge / Chrome | Chrome / Chromium | `merge` puts the drawing on a page of its own size (`width`, `height`, `viewBox`); `convert` draws it at least 1600 px on the long edge. No fallback without a browser. |
-| **JPEG XL (`.jxl`)** | WIC (JPEG XL extension), FFmpeg fallback | FFmpeg | Not every FFmpeg build has a JXL decoder. `.jfif` and `.jpe` are read as JPEG. |
-| **PDF page rendering (`convert --render`)** | Native Windows renderer | — | Image extraction from PDFs works everywhere. |
-| **OCR (Windows Media OCR)** | Native Windows 10/11 | — | Offline, built-in, no API keys needed. |
-| **OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or environment variable. |
+| **Core Formats (PDF, JPEG, PNG, BMP, GIF, WebP, APNG)** | Pure Rust (built-in) | Pure Rust (built-in) | No external utilities or dependencies required. |
+| **TIFF (single and multi-page)** | Windows Imaging Component | Pure Rust (built-in) | Windows decodes TIFF via native WIC. |
+| **Camera RAW (`.cr2`, `.nef`, `.arw`, `.dng`, `.raf`, etc.)** | Pure Rust (built-in) | Pure Rust (built-in) | Instant extraction of full-size hardware JPEG preview. Optional sensor development on Windows via WIC (`raw_develop = true`). |
+| **Windows Formats (`.jxr`, `.wdp`, `.hdp`, `.ico`)** | Windows Imaging Component | — | Native Windows Imaging Component (WIC). |
+| **HEIC/HEIF, AVIF** | WIC, FFmpeg fallback | FFmpeg | Windows uses system HEIF/AV1 extensions; falls back to `ffmpeg` if codecs are missing. |
+| **PSD/PSB** | Pure Rust, FFmpeg fallback | Pure Rust, FFmpeg fallback | The merged composite image is read natively; 32-bit and ZIP-compressed documents go to `ffmpeg`. Layers are not rendered. |
+| **Extended Formats (JPEG 2000, JPEG-LS, HDR, EXR, QOI, TGA, etc.)** | FFmpeg | FFmpeg | Requires `ffmpeg` in `PATH` or the `ffmpeg` path set in `config.toml`. |
+| **Office Docs (DOCX, XLSX, PPTX, RTF, ODT, ODS, ODP)** | MS Office / Pure Rust | Pure Rust fallback | High-fidelity rendering via COM automation if MS Office is installed; otherwise fast built-in XML parsing. |
+| **HTML Pages (`.html`, `.htm`, `.xhtml`)** | Edge / Chrome / Pure Rust | Chrome / Chromium / Pure Rust | Rendered by a headless Chromium-based browser (Edge ships with Windows 10/11); without a browser, text content is extracted. |
+| **E-books (EPUB, FB2, FB2.ZIP, HTMLZ)** | Pure Rust (built-in) | Pure Rust (built-in) | Built-in parsing of chapters, structure, and character encodings (including Windows-1251). |
+| **HTML to JPEG (`convert page.html`)** | Edge / Chrome | Chrome / Chromium | Viewport-sized screenshot (window dimensions configured via `--viewport`). |
+| **SVG (`.svg`)** | Edge / Chrome | Chrome / Chromium | Vector rendering via browser. |
+| **JPEG XL (`.jxl`)** | WIC (JPEG XL extension), FFmpeg | FFmpeg | Requires system WIC codec or an FFmpeg build with JXL support. |
+| **PDF Page Rendering (`convert --render`)** | Native Windows renderer | — | Extracting embedded raster images from PDFs works on all platforms. |
+| **Local OCR (Windows Media OCR)** | Windows 10/11 | — | Fully offline, built-in, no API keys needed. |
+| **Cloud OCR (Groq Cloud Vision)** | Supported | Supported | Requires `groq_api_key` in `config.toml` or `%GROQ_API_KEY%` environment variable. |
 
 ---
 
@@ -65,23 +64,22 @@ cargo build --release
 cargo test --all-targets
 ```
 
-On Windows the build needs no C/C++ compiler (TLS uses the system SChannel). On Linux/macOS TLS uses `rustls` with `ring`, which requires a C compiler (`cc`/`clang`).
+On Windows, the build requires no C/C++ compiler (TLS uses the system SChannel). On Linux/macOS, TLS uses `rustls` with `ring`, which requires a C compiler (`cc`/`clang`).
 
-### Windows Optimized Build Script
+### Windows Release Build Script
 
-To build an optimized Windows binary with embedded version information, application icon, and long path manifest:
+To build an optimized Windows executable with embedded resources (multi-resolution icons, UTF-8 long paths manifest, version info):
 
 ```powershell
 .\build.bat
 ```
 
 The script will:
-1. Validate and compile the multi-resolution icon (16x16 – 256x256 px).
+1. Prepare Windows resources (icons from `resources/`, version metadata).
 2. Read the package version from `Cargo.toml`.
-3. Compile Windows resource manifests using `rc.exe` (Windows SDK).
+3. Compile resources using `rc.exe` (Windows SDK).
 4. Run `cargo build --release --locked`.
-5. Package the executable, `make_bar.bat`, sample config, and documentation into the `dist/` directory.
-6. Pack the same files into the release archive `dist\bpdf-<version>-win-x64.zip` (`config.toml` from `dist` is not included).
+5. Package the executable, `make_bar.bat`, sample config, and documentation into `dist/` and create the release ZIP archive.
 
 ---
 
@@ -90,8 +88,8 @@ The script will:
 Global flags can be passed before any subcommand:
 
 - `--config <PATH>` — Path to custom configuration file (defaults to `config.toml` beside `bpdf.exe`).
-- `--quiet` — Silent mode; suppresses progress meters and informative messages.
-- `--json` — Output results and progress events as streamable NDJSON objects (one JSON object per line).
+- `--quiet` — Silent mode; suppresses progress meters and informative messages (conflicts with `--json`).
+- `--json` — Output results and progress events as newline-delimited JSON (NDJSON, one object per line).
 - `--fail-fast` — Abort batch operations immediately upon the first error. Without this flag, remaining items continue processing and errors are summarized at the end.
 - `-h, --help` — Print help information.
 - `-V, --version` — Print version.
@@ -100,207 +98,326 @@ Global flags can be passed before any subcommand:
 
 ## Commands & Usage
 
-### Where results are written
+### Output and In-Place Overwrite Rules
 
-Commands that change a file (`strip`, `rotate`, `resize`, `optimize`, `stamp`, `number`, `watermark`, `metadata`) share one rule:
-- no flag — a sibling `<name>_<action>.<ext>` is created (`doc_stamped.pdf`, `photo_rotated.jpg`);
-- `-o <FILE>` — write that file (one input only);
-- `-o <DIR>` — write into an existing directory under the source names (several inputs);
-- `-i, --in-place` — overwrite the source.
+Commands that modify files (`strip`, `rotate`, `resize`, `optimize`, `stamp`, `number`, `watermark`, `metadata`) follow unified semantics:
+- **Default (no flags):** A sibling copy `<name>_<action>.<ext>` is created (`doc_stamped.pdf`, `photo_rotated.jpg`).
+- `-o, --out <FILE>` — Write output to the specified file (single input only).
+- `-o, --out <DIR>` — Write processed files into an existing directory under their original names.
+- `-i, --in-place` — Overwrite the source file in place.
 
-Only `-i` replaces the source: when `-o` names the source itself or the folder it is in, the command fails without writing anything. A batch in which two inputs would write the same file (same-named files from different folders into one `-o` directory) is refused as well.
+> **Safety Guarantee:** A source file is overwritten only when `-i` is explicitly passed (or `--force` for `convert`). If `-o` points to the input file itself or multiple inputs collide onto the same output, the command aborts before writing anything. All writes are atomic (performed via a temporary file).
+
+---
 
 ### 1. `bpdf merge`
-Merge PDFs, images, Office documents, HTML, e-books and text files into one PDF.
+Merge PDFs, images, Office documents, HTML, e-books, and text files into a single PDF.
 
 ```powershell
 bpdf merge <INPUTS>... [OPTIONS]
 ```
 
-- `-o, --out <PATH>` — Output file. Default: `<name>.pdf` for one non-PDF input, otherwise `<first>_merged.pdf`; existing files are never overwritten, the next free name (`_merged_2.pdf`) is used.
-- `-s, --size <SIZE>` — `A3`, `A4`, `A5`, `A6`, `B4`, `B5`, `Letter`, `Legal`, `Tabloid`, a custom `WIDTHxHEIGHT` in `mm` (default), `cm`, `in` or `pt` (`210x297mm`, `8.5x11in`), `keep` (keep source PDF page sizes) or `fit` (each image on a page of its size at its DPI, else 96 DPI; PDF pages keep theirs). Default: `page_size`.
-- `--auto-rotate` / `--no-auto-rotate` — Turn pages to the majority orientation. Default: `auto_rotate`.
-- `--optimize` / `--no-optimize` — Downsample images to `image_dpi` and tidy the structure. Default: `optimize`.
-- `--strip-meta` / `--no-strip-meta` — Remove metadata from the result. Default: `strip_metadata`.
-- `--bookmarks` / `--no-bookmarks` — One outline entry per merged file, holding that file's own outline (collapsed). Without it the files' outlines follow each other. Default: `bookmarks`.
-- `--max-size <SIZE>` — Largest acceptable PDF (`10MB`, `500KB`); image resolution and quality are lowered step by step until it fits.
-- `--remove-blank` — Drop blank scanned pages (see `optimize`). A file whose pages are all blank is left out; when everything is blank, nothing is removed.
+- `<INPUTS>...` — Input files, folders, globs (`*.jpg`), page ranges (`doc.pdf:1-5`), or manifests (`@list.txt`).
+- `-o, --out <PATH>` — Destination file. Default: `<name>.pdf` (for single inputs) or `<first>_merged.pdf`. Existing files are never overwritten — the next free suffix is used (`_merged_2.pdf`).
+- `-s, --size <SIZE>` — Page size: `A3`–`A6`, `B4`, `B5`, `Letter`, `Legal`, `Tabloid`, custom `WIDTHxHEIGHT` (`210x297mm`, `8.5x11in`), `keep` (retain source PDF dimensions), or `fit` (size sheet to image by its DPI, else 96 DPI). Defaults to `page_size` from config.
+- `--auto-rotate` / `--no-auto-rotate` — Rotate pages to majority orientation.
+- `--optimize` / `--no-optimize` — Downsample images to `image_dpi` and tidy PDF structure.
+- `--strip-meta` / `--no-strip-meta` — Remove document metadata from the result.
+- `--bookmarks` / `--no-bookmarks` — Add an outline bookmark for each merged document.
+- `--max-size <SIZE>` — Target maximum file size (`10MB`, `500KB`): resolution and quality are stepped down until the file fits.
+- `--remove-blank` — Drop blank scanned pages (pages with plain paper background noise).
 
-Each page keeps its own orientation when fitted to the sheet. Named links of every document keep working; clashing names are renamed. Author and creator come from the configuration; stamps are applied with the `stamp` command.
+---
 
 ### 2. `bpdf ocr`
-Recognise scans and images with cloud Groq Vision or local Windows OCR. PDFs are judged page by page: pages with their own text layer are used as they are, only scanned pages are recognised.
+Extract text or create searchable PDFs using cloud Groq Vision or local Windows OCR. PDF pages with existing text are kept as-is without network overhead.
 
 ```powershell
 bpdf ocr <INPUTS>... [OPTIONS]
 ```
 
-- `-o, --out <PATH>` — `.pdf` creates a **searchable PDF**; any other extension one combined Markdown file; without `-o`, a `.md` beside every input; when that file exists or names clash, `_2`, `_3` is added, so existing files are never overwritten.
-- `-i, --in-place` — Add the text layer to the source PDFs. A page range in the input (`doc.pdf:2-4`) selects the pages to recognise; the other pages stay in the file.
-- `-e, --engine <ENGINE>` — `groq`, `windows` or `auto` (default `ocr_engine`).
-- `--lang <LANG>` — Windows OCR language (`ru`, `en-US`; default `ocr_lang`). The Windows engine reads one language at a time: with a Russian profile Latin text may come out as look-alike Cyrillic letters, so pass `--lang en-US` for English documents.
-- `--force-ocr` — Also recognise pages that already have text.
-- `--no-cache` — Do not use the OCR cache.
-- `--clear-cache` — Empty the OCR cache (inputs are optional). Only cache files are deleted; anything else in `ocr_cache_dir` stays.
+- `-o, --out <PATH>`:
+  - `.pdf` — create a **Searchable PDF** with an invisible text layer;
+  - `.md` (or other extension) — single combined Markdown file;
+  - omitted — creates individual `.md` files beside each input.
+- `-i, --in-place` — Inject the searchable text layer directly into source PDFs (specifying `doc.pdf:2-4` limits OCR to the given range).
+- `-e, --engine <ENGINE>` — `groq`, `windows`, or `auto` (default: `ocr_engine`). In `auto` mode, network or key failures trigger an automatic fallback to Windows OCR.
+- `--lang <LANG>` — Windows OCR language tag (`ru`, `en-US`; default: `ocr_lang`).
+- `--force-ocr` — Force recognition of pages that already contain a text layer.
+- `--no-cache` — Bypass the on-disk OCR cache.
+- `--clear-cache` — Empty the OCR cache.
 
-`-o` must not name an input; use `-i` for a layer in the source. Model, prompt, proxy, endpoint and parallel requests are configured in `config.toml`. Server errors (500–504) and rate limits are retried; an answer cut off by `ocr_max_tokens` is marked and reported. In `auto` mode Groq is no longer asked after it refuses the key. The text layer follows rotated and cropped pages and, on pages with several images, the place of each image; running `ocr -i` again does not duplicate a layer bpdf added.
+---
 
 ### 3. `bpdf split`
-`bpdf split <INPUT> [-o <DIR>] [--force]` — one PDF per page (`<name>_01.pdf`, …), in the source folder by default. Existing page files are replaced only with `--force`.
+Split a PDF into individual single-page documents `<name>_01.pdf`, `<name>_02.pdf`, …
+
+```powershell
+bpdf split <INPUT> [-o <DIR>] [--force]
+```
+
+- `-o, --out <DIR>` — Target directory (defaults to source file directory).
+- `--force` — Allow replacing existing page files.
+
+---
 
 ### 4. `bpdf extract`
-`bpdf extract <INPUT> <PAGES> [-o <OUT> | -i]` — selected pages, in the given order and with repeats (`5,1-4`, `1,1`, `reverse`), into `<name>_extracted.pdf`; `-o` and `-i` work as for the editing commands.
+Extract selected pages into a new PDF with custom ordering and duplication.
+
+```powershell
+bpdf extract <INPUT> <PAGES> [-o <OUT> | -i]
+```
+
+- `<PAGES>` — Page selection: `1-5`, `5,1-4`, `odd`, `even`, `reverse` (see [Page Selection Syntax](#page-selection-syntax)).
+
+---
 
 ### 5. `bpdf info`
-`bpdf info <INPUT>` — PDF version, size (pt and mm), rotation, font and image counts of every page, and the document properties.
+Display detailed PDF specifications: PDF version, page dimensions (pt and mm), rotations, font/image counts per page, and document metadata.
+
+```powershell
+bpdf info <INPUT>
+```
+
+---
 
 ### 6. `bpdf text`
-`bpdf text <INPUT> [-o <OUT>]` — the existing text layer, offline. Warns when there is none; `-o` must not name the PDF itself.
+Extract an existing text layer from a PDF quickly without network access.
+
+```powershell
+bpdf text <INPUT> [-o <OUT>]
+```
+
+Prints to stdout when `-o` is omitted.
+
+---
 
 ### 7. `bpdf strip`
-`bpdf strip <INPUTS>... [-o <OUT> | -i]` — remove metadata from JPEG, PNG and PDF without re-encoding pixels; other files are skipped. In PDFs this covers document properties, XMP and private data of every object, `/ID` (unencrypted files) and EXIF/XMP of embedded JPEGs. ICC profiles stay when `keep_icc = true`.
+Remove metadata from JPEG, PNG, and PDF files without re-encoding pixels.
+
+```powershell
+bpdf strip <INPUTS>... [-o <OUT> | -i]
+```
+
+Removes PDF document properties, XMP metadata, private application data, and EXIF/XMP from embedded images. ICC profiles are preserved when `keep_icc = true`.
+
+---
 
 ### 8. `bpdf rotate`
+Rotate PDF pages or JPEG images by multiples of 90°, or towards a target orientation.
+
 ```powershell
 bpdf rotate <INPUTS>... -a <ANGLE> [-p <PAGES>] [-o <OUT> | -i]
 ```
-- `-a, --angle` — Clockwise `90`, `180`, `270`, `-90`, or `portrait` / `landscape` to turn only pages of the other orientation.
-- `-p, --pages` — PDF pages (default `all`).
 
-JPEGs are rotated **losslessly** through the EXIF orientation tag; pixels and other metadata stay untouched. They are re-encoded only when EXIF exists without an orientation tag.
+- `-a, --angle <ANGLE>` — Rotation: `90`, `180`, `270`, `-90`, or orientation `portrait` / `landscape`.
+- `-p, --pages <PAGES>` — Target pages for PDF (default: `all`).
+
+> JPEG images are rotated **losslessly** by updating the EXIF orientation tag without pixel recompression.
+
+---
 
 ### 9. `bpdf resize`
+Fit and center PDF pages onto a chosen paper sheet or resize JPEG dimensions.
+
 ```powershell
 bpdf resize <INPUTS>... [-s <SIZE>] [--long-edge <PX>] [--short-edge <PX>] [-p <PAGES>] [-o <OUT> | -i]
 ```
-PDF: the visible page area is fitted and centred on the sheet (A4 by default; other sizes as for `merge`), keeping each page's orientation; pages already of that size are untouched. Annotations (highlights and ink included) and link and bookmark targets move with the content. JPEG: `--long-edge` (longest side at most) or `--short-edge` (shortest side exactly) is required, not both.
+
+- `-s, --size <SIZE>` — Sheet format for PDF (default: `A4`). Annotations and links automatically shift with page content.
+- `--long-edge <PX>` / `--short-edge <PX>` — Bound maximum long or short edge for JPEG.
+
+---
 
 ### 10. `bpdf optimize`
-`bpdf optimize <INPUT> [--max-size <SIZE>] [--gray] [--remove-blank] [-o <OUT> | -i]` — tidy the structure and downsample images to `image_dpi` at `jpeg_quality`, measured at the size each image is drawn on the page (a large photo in a small frame shrinks to the frame) (lossless graphics with up to 256 colours stay lossless); `--max-size` steps down from 300 DPI / 85 to 72 DPI / 35 until the file fits.
-- `--gray` — Turn colour images gray (even when that does not save space); text, vector graphics and images with a transparency mask keep their colours.
-- `--remove-blank` — Drop blank scanned pages: no text, no annotations, nothing drawn but images of a plain sheet (scanner shadows at the edges, noise and dust are fine). Pages with vector graphics stay. When every page looks blank, none is removed.
+Tidy PDF structure and downsample embedded images to `image_dpi` at `jpeg_quality`.
+
+```powershell
+bpdf optimize <INPUT> [--max-size <SIZE>] [--gray] [--remove-blank] [-o <OUT> | -i]
+```
+
+- `--max-size <SIZE>` — Fit file under a size limit (`10MB`, `500KB`).
+- `--gray` — Convert colour images to grayscale (text and vector graphics retain colors).
+- `--remove-blank` — Remove blank scanned pages (pages with only scanner paper noise).
+
+---
 
 ### 11. `bpdf stamp`
+Apply a transparent PNG or JPEG stamp over PDF pages.
+
 ```powershell
 bpdf stamp <INPUT> <STAMP> [OPTIONS]
 ```
-- `--position` — `br` (default), `bl`, `tr`, `tl`, `c`, `tc`, `bc`, `l`, `r` or `X,Y` mm from the bottom-right corner (`--position="-130,30"`).
-- `--scale` — Multiplier of the physical size; `0` fits up to a quarter of the page.
-- `--dpi` — Stamp resolution (default from PNG/JPEG metadata, else 96).
-- `--opacity` — 0 to 1 (default 1).
-- `--blend` — `normal`, `multiply` (realistic ink over text), `screen`, `overlay`, `darken`, `lighten`, `color-dodge`, `color-burn`, `hard-light`, `soft-light`, `difference`, `exclusion`.
-- `-p, --pages` — Pages (default `all`).
-- `--pick` — Place the stamp with the mouse in an Edge/Chrome window; the window also shows the equivalent `--position`, `--scale` and `--pages`.
 
-The stamp is always drawn over the page. Placement follows the visible, upright page; oversized phone scans are scaled to the real sheet.
+- `--position <POS>` — Anchor positions (`br`, `bl`, `tr`, `tl`, `c`, `tc`, `bc`, `l`, `r`) or `X,Y` mm offset from bottom-right (default: `br`).
+- `--scale <SCALE>` — Scale factor (default: physical size; `0` fits into a page quarter).
+- `--dpi <DPI>` — Stamp resolution (default from image metadata, else 96).
+- `--opacity <0-1>` — Opacity (default: `1.0`).
+- `--blend <MODE>` — Blend mode: `normal`, `multiply` (realistic ink on paper), `screen`, `overlay`, etc.
+- `-p, --pages <PAGES>` — Target pages (default: `all`).
+- `--pick` — Interactive visual stamp placement with the mouse in a browser window.
+
+---
 
 ### 12. `bpdf number`
-`bpdf number <INPUT> [--format "Page {n} of {total}"] [--start N] [-p PAGES] [--position bc] [--size 10] [--color black] [--opacity 1]` — `--start` is the number of the first numbered page and `{total}` the last number, so `-p 2-last` skips a cover.
+Add template-based page numbering with automatic horizontal orientation across rotated pages.
+
+```powershell
+bpdf number <INPUT> [OPTIONS]
+```
+
+- `--format <TEXT>` — Template: `{n}` is current page, `{total}` is total pages (default: `{n}`).
+- `--start <N>` — Initial page number (default: `1`).
+- `--position <POS>` — Position anchor (default: `bc` — bottom center).
+- `--size <PT>` — Font size in points (default: `10`).
+- `--color <COLOR>` — Color: `black`, `gray`, `red`, `blue`, `green`, `white`, or `#RRGGBB`.
+- `--opacity <0-1>` — Opacity (default: `1.0`).
+- `-p, --pages <PAGES>` — Target pages (e.g. `2-last` to skip cover page).
+
+---
 
 ### 13. `bpdf watermark`
-`bpdf watermark <INPUT> <TEXT> [--size 0] [--angle 45] [--position c] [--color gray] [--opacity 0.3] [-p PAGES]` — text drawn over the pages; size `0` fits the page.
+Add a diagonal or positioned text watermark across pages.
+
+```powershell
+bpdf watermark <INPUT> <TEXT> [OPTIONS]
+```
+
+- `--size <PT>` — Font size (`0` auto-fits text to page diagonal).
+- `--angle <DEG>` — Counter-clockwise angle in degrees (default: `45`).
+- `--position <POS>` — Position anchor (default: `c` — center).
+- `--color <COLOR>` — Text color (default: `gray`).
+- `--opacity <0-1>` — Opacity (default: `0.3`).
+
+---
 
 ### 14. `bpdf metadata`
-`bpdf metadata <INPUT> [--title] [--author] [--subject] [--keywords] [--creator] [-o <OUT> | -i]` — set document properties; an empty value removes a field. `bpdf info` shows the current values. An outdated XMP packet is removed, since readers prefer it over the properties.
+Set PDF document properties (unspecified fields remain intact; an empty value removes the field).
+
+```powershell
+bpdf metadata <INPUT> [--title ..] [--author ..] [--subject ..] [--keywords ..] [--creator ..] [-o <OUT> | -i]
+```
+
+---
 
 ### 15. `bpdf protect` and `bpdf unlock`
+Manage AES-256 encryption (PDF 2.0 standard).
+
 ```powershell
 bpdf protect <INPUT> [--password <PW>] [--owner-password <PW>] [--no-print] [--no-copy] [--no-modify] [-o <OUT> | -i]
 bpdf unlock <INPUT> [--password <PW>] [-o <OUT> | -i]
 ```
-`protect` encrypts with AES-256 (PDF 2.0): an open password and/or restrictions on printing, copying and editing. Without `--owner-password` the restrictions get a random owner password (or the open password when there are none). Restrictions are honoured by readers, not enforced by the cipher: `unlock` and other tools lift them with the open password alone. `unlock` takes the open or owner password (none for restriction-only files). Protection survives edits by other bpdf commands; the built-in Windows renderer (`convert --render`, `stamp --pick`) cannot read AES-256 and gets a decrypted copy.
+
+- `--password` — Password required to open the document.
+- `--owner-password` — Owner password required to alter restrictions.
+- `--no-print`, `--no-copy`, `--no-modify` — Restrict printing, content copying, and editing.
+
+---
 
 ### 16. `bpdf convert`
-`bpdf convert <INPUTS>... [-o <DIR>] [--force] [--long-edge PX] [--short-edge PX] [--orient MODE] [-q 1-100] [--max-size SIZE] [--render] [--viewport WxH]` — images, PDF pages/images, HTML pages and SVG drawings to JPEG. Multipage TIFF gives one JPEG per page; PDFs give the largest image of each page, or rendered pages for text pages and with `--render` (Windows only), named `doc_page_3.jpg`; size, orientation and quality options apply to them too. `--max-size 500KB` keeps every JPEG within the limit: the quality is found by binary search (not below 20), then the image is scaled down if needed.
+Export images, PDF pages, HTML, and SVG to JPEG format.
+
+```powershell
+bpdf convert <INPUTS>... [OPTIONS]
+```
+
+- `-o, --out <DIR>` — Target directory for JPEG files.
+- `--render` — Render entire PDF pages instead of extracting embedded images.
+- `--long-edge <PX>` / `--short-edge <PX>` — Scale by maximum long or short edge.
+- `--orient <MODE>` — Enforce target orientation (`landscape` or `portrait`).
+- `-q, --quality <1-100>` — JPEG compression quality (default: `jpeg_quality`).
+- `--max-size <SIZE>` — Constrain maximum size per JPEG (e.g. `500KB`).
+- `--viewport <WxH>` — Browser window dimensions for HTML rendering (default: `1200x1600`).
+- `--force` — Overwrite existing files.
+
+---
 
 ### 17. `bpdf doctor`
-Checks the configuration and integrations. Required parts (font, OCR cache, the configured OCR engine) report `FAIL` and a non-zero exit code; missing optional ones (FFmpeg, Office, browser, an unused engine) report `WARN`.
+Environment diagnostic: validates configuration, checks external dependencies (FFmpeg, PowerShell, MS Office, browser), and tests Groq API connectivity without spending OCR quotas.
 
-## Overwrite Rules
+```powershell
+bpdf doctor
+```
 
-- Writes are atomic: the result goes to a temporary file next to the target and replaces it in one step, so an interrupted command never leaves a half-written file.
-- Sources change only with `-i/--in-place` (`--force` for `convert`). `merge` and `extract` never write to their inputs; `merge` and `ocr` without `-o` never overwrite existing files and take the next free name instead.
-- The default names `<name>_<action>` of editing commands and `<name>_01.pdf` of `split` are overwritten when a command runs again.
-- An encrypted PDF that opens without a password (only printing or copying is restricted) stays encrypted after an edit, with the same owner password and restrictions. A `merge` of several files is not encrypted. PDFs that need a password to open are refused; remove the password first (`bpdf unlock`).
-- Exit codes: `0` success, `1` failure, `2` some files of a batch failed while others succeeded.
+---
 
-## Security
+## Input Formats & Page Syntax
 
-bpdf is meant for documents from any source, but some formats are handled by external programs, with these consequences:
+### Page Selection Syntax
+Used in `-p, --pages`, the `extract` command, and directly in input paths (`doc.pdf:1-3`):
+- `all` — all pages;
+- `first` — first page;
+- `last` (or `l`) — last page;
+- `even` / `odd` — even or odd pages only;
+- `reverse` — reversed page order;
+- Combinations and ranges: `1-5,8,last`, `2-last`, `5-` (from page 5 to end), `5-1` (backwards).
 
-- **Office.** Documents open in MS Office through COM with macros disabled. So that Office does not open the file in Protected View (where PDF export is impossible), the "downloaded from the internet" mark is removed from the temporary copy; the source is not changed. A document from an untrusted source is therefore opened as if you had clicked "Enable Editing": vulnerabilities in Office itself, external templates and links to network shares remain a risk. Keep Office updated; for suspicious files use a computer without Office, where the text fallback is used.
-- **HTML.** Pages are laid out by the browser in a separate temporary profile, with JavaScript and network access: a saved page or e-mail can load images and trackers from the web (revealing your IP address). The page cannot read other local files.
-- **FFmpeg.** Only image demuxers and the local `file` protocol are allowed: playlists and `concat` scripts disguised as images are refused.
-- **Size limits.** Images inside PDFs above 300 megapixels, archive entries above 256 MB and CBZ archives above 2 GB are not unpacked, so a "bomb" file cannot exhaust memory.
-
-## Page Selection Syntax
-
-`all`, `first`, `last` (`l`), `even`, `odd`, `reverse`, and lists such as `1-5,8,last`, `2-last`, `5-` (to the end) or `5-1` (backwards). `extract` and per-input specifiers keep the given order and repeats. Used by `-p/--pages`, `extract`, and per-input specifiers (`doc.pdf:1-3`) in `merge`, `ocr`, `convert`, `rotate` and `resize`.
-
-### Per-Input Page Specifier
 ```powershell
 bpdf merge scan.jpg report.pdf:1-3,last notes.txt -o result.pdf
 ```
 
-### File Lists (`@manifest.txt`)
+### File Lists (Manifests `@list.txt`)
+Pass a list of files in a text file prefixed with `@`:
+
 ```powershell
 bpdf merge @files.txt -o output.pdf
 ```
+
+Example `files.txt`:
 ```text
 # Comments are ignored
 C:\docs\cover.jpg
 C:\docs\report.pdf:1-10
+C:\docs\appendix.pdf:even
 ```
-Relative paths are relative to the folder of the list. Globs and folders take only files of known formats the command reads (no folders, extensionless or empty files); name such files explicitly.
+
+### Path Globs & Natural Sorting
+File patterns (`*.jpg`, `scans/*.pdf`) are expanded with natural alphanumeric ordering (`scan_1.jpg`, `scan_2.jpg`, `scan_10.jpg`).
 
 ### Total Commander Integration
-- **Button Bar:** `bpdf.bar` with buttons for all common actions. Run `make_bar.bat` next to `bpdf.exe` and it writes `bpdf.bar` with paths to that `bpdf.exe`. Then drag `bpdf.bar` onto the Total Commander toolbar (a drop-down button) or pick it under Configuration → Button bar.
-  - When `bpdf.exe` is inside the Total Commander folder, paths are written as `%COMMANDER_PATH%\...`. The folder comes from `%COMMANDER_PATH%`, or, when not started from Total Commander, from `TOTALCMD64.EXE`/`TOTALCMD.EXE` in a parent folder. Otherwise paths are absolute; rerun the script after moving `bpdf.exe`.
-  - `make_bar.bat /default` always writes `%COMMANDER_PATH%\tools\bpdf`.
-  - Put `stamp.png` next to `bpdf.exe` for the stamp button. Button captions are Russian; the script and the generated bar are windows-1251, keep that encoding when editing `make_bar.bat`.
-- **List File Support:** `@"%UL"` (UTF-8 list of selected files) or a single `%P%N`.
-- `info` and `doctor` started from a file manager wait for Enter before the window closes, as do failed commands.
+1. Copy `bpdf` into your tools folder (e.g. `%COMMANDER_PATH%\tools\bpdf\`).
+2. Run `make_bar.bat` — creates `bpdf.bar` with portable relative paths.
+3. Drag `bpdf.bar` onto the Total Commander toolbar or add it via *Configuration → Button bar*.
+4. All common actions feature dedicated buttons with embedded icons and support for selected file lists `@"%UL"`.
 
 ---
 
 ## Configuration (`config.toml`)
 
-1. Path passed via `--config <PATH>`;
-2. `config.toml` beside `bpdf.exe`.
+Configuration lookup order:
+1. Path passed explicitly via `--config <PATH>`.
+2. File `config.toml` situated beside `bpdf.exe`.
 
-The working directory is not searched: a file manager starts bpdf among your documents, where a `config.toml` of another program may live. Unknown keys (typos such as `jpeg_qualty`) are reported as errors, and so are invalid `page_size` (same values as `merge -s`) and `ocr_engine` values.
-
-`%NAME%` environment variables are expanded in `groq_api_key`, `proxy` and the paths (`ffmpeg`, `powershell`, `font_path`, `browser`, `ocr_cache_dir`), inside double quotes too. `font_path` must be a TrueType font (`.ttf`, or `.ttc` whose first font is used).
+String parameters automatically expand system environment variables formatted as `%NAME%`.
 
 ### Example `config.toml`
 
 ```toml
-# Groq API Key for Vision OCR
+# Groq API key for Vision OCR (expanded from environment variable)
 groq_api_key = "%GROQ_API_KEY%"
 
-# Proxy Server (HTTP or SOCKS5)
+# Proxy server (HTTP or SOCKS5)
 proxy = ""
 # proxy = "socks5://127.0.0.1:10808"
 
-# Default Metadata
+# Default metadata for generated PDFs
 author = "My Company"
 creator = "bpdf toolkit"
 
-# PDF Processing Defaults
+# PDF processing parameters
 auto_rotate = false
 keep_icc = false
 optimize = false
 strip_metadata = false
 bookmarks = false
 page_size = "A4"
-jpeg_quality = 95 # JPEG quality for merge and optimize
-image_dpi = 150   # Target DPI for downsampling; 0 disables downsampling
+jpeg_quality = 95
+image_dpi = 150
 raw_develop = false # false = fast pure Rust preview, true = WIC sensor development
 
-# OCR Settings
-ocr_engine = "groq" # "groq" (cloud vision), "windows" (local WinOCR), or "auto"
+# OCR settings
+ocr_engine = "groq" # "groq", "windows", or "auto"
 ocr_model = "qwen/qwen3.8-27b"
-# ocr_prompt = '''Extract all text exactly as it appears...'''
 ocr_endpoint = "https://api.groq.com/openai/v1/chat/completions"
 ocr_jobs = 1
 ocr_cache = true
@@ -308,54 +425,105 @@ ocr_cache = true
 ocr_timeout_seconds = 120
 ocr_max_tokens = 4096
 
-# Third-party tools
+# External utilities and paths
 ffmpeg = 'ffmpeg'
 powershell = 'powershell.exe'
+# font_path = '%WINDIR%\Fonts\arial.ttf'
 office_timeout_seconds = 120
-# Browser for HTML pages (Edge, Chrome or Chromium are found automatically)
-# browser = '/usr/bin/chromium'
+# browser = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 html_timeout_seconds = 60
-html_viewport = "1200x1600" # window size for `convert page.html`
+html_viewport = "1200x1600"
 ```
 
-See [`config.example.toml`](config.example.toml) for complete descriptions of all parameters.
+For full parameter definitions and defaults, see [`config.example.toml`](config.example.toml).
 
 ---
 
 ## Practical Examples
 
+### Document Merging & Conversion to PDF
 ```powershell
-# Merge images, scanned PDF, and notes into a single PDF
+# Combine pictures, report excerpts, and notes into one PDF
 bpdf merge scan.jpg invoice.pdf:1-3 notes.txt -o result.pdf
 
-# Merge all images in folder to A4 with auto-rotation and DPI optimization
+# Merge all folder JPGs to A4 with auto-rotation and downsampling
 bpdf merge *.jpg -s A4 --auto-rotate --optimize -o scans.pdf
 
-# Recognize scanned document with Groq Vision to Markdown
+# Combine e-books and Office presentations into a PDF
+bpdf merge book.epub presentation.pptx table.xlsx -o bundle.pdf
+
+# Render saved web page to PDF via headless Edge/Chrome
+bpdf merge page.html -o page.pdf
+```
+
+### Optical Character Recognition (OCR)
+```powershell
+# Recognize scanned image to Markdown using Groq Vision
 bpdf ocr scan.jpg -o scan.md
 
-# Create Searchable PDF with invisible text layer
-bpdf ocr scan.pdf -o searchable.pdf
+# Inject searchable text layer into scanned PDFs using local Windows OCR
+bpdf ocr scans/*.pdf -e windows -i
 
-# In-place Searchable PDF generation across multiple files
-bpdf ocr doc1.pdf doc2.pdf -i
+# Create standalone Searchable PDF from multi-page scan
+bpdf ocr document.pdf -o document_searchable.pdf
 
-# Convert camera RAW files to JPEG instantly (Pure Rust preview extraction)
-bpdf convert photo.cr3 photo.nef photo.arw --out converted/
+# Extract existing text layer offline without network
+bpdf text document.pdf -o extracted_text.txt
+```
 
-# Render HTML product cards to 1200x1600 JPEGs
-bpdf convert cards/ --out jpg/
+### Page Editing & Geometry
+```powershell
+# Split PDF into single-page files
+bpdf split document.pdf -o pages/
 
+# Extract first 5 pages and the last page
+bpdf extract document.pdf 1-5,last -o summary.pdf
+
+# Rotate all even pages by 90 degrees in place
+bpdf rotate document.pdf -a 90 -p even -i
+
+# Normalize PDF pages to Letter format with centering
+bpdf resize document.pdf --size Letter
+```
+
+### Optimization, Stamps & Styling
+```powershell
+# Optimize PDF to fit under target size limit
+bpdf optimize document.pdf --max-size 5MB --remove-blank -i
+
+# Apply realistic wet-ink stamp to bottom-right corner
+bpdf stamp contract.pdf seal.png --blend multiply -i
+
+# Visually position stamp with mouse in interactive browser window
+bpdf stamp contract.pdf seal.png --pick --blend multiply -i
+
+# Number pages starting from second page (skipping cover)
+bpdf number report.pdf -p 2-last --format "Page {n} of {total}" -i
+
+# Apply semi-transparent red watermark "COPY"
+bpdf watermark contract.pdf "COPY" --color red --opacity 0.25 -i
+```
+
+### Metadata, Security & Export
+```powershell
 # Strip EXIF metadata from all photos in folder in-place
 bpdf strip photos/*.jpg -i
 
-# Apply realistic wet-ink stamp to PDF
-bpdf stamp contract.pdf seal.png --position br --blend multiply
+# Update document title and author
+bpdf metadata doc.pdf --title "Report 2026" --author "John Doe" -i
 
-# System & integrations health check
-bpdf doctor
+# Protect PDF with password and restrict printing/copying
+bpdf protect doc.pdf --password "secret123" --no-print --no-copy -i
+
+# Remove password and permissions restrictions
+bpdf unlock doc.pdf --password "secret123" -i
+
+# Export PDF pages and HTML to JPEG images
+bpdf convert doc.pdf page.html --out converted_images/
 ```
+
+---
 
 ## License
 
-[MIT](LICENSE).
+Distributed under the [MIT](LICENSE) License.
