@@ -7,6 +7,7 @@
 !/tools/benchmark-v1.ps1
 !/tools/draw_icons.py
 !/tools/prepare-windows-resources.ps1
+!/tools/bpdf_shell/
 
 # Local test documents and outputs.
 *.pdf
@@ -19,4 +20,5 @@
 *.br2
 *.zip
 *.7z
+*.dll
 !/resources/**
