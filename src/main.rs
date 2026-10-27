@@ -18,6 +18,10 @@ fn main() {
 fn owns_console() -> bool {
     #[cfg(windows)]
     {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            return false;
+        }
         // SAFETY: Querying console process list into fixed-size array
         let mut processes = [0u32; 2];
         let count =
@@ -31,7 +35,7 @@ fn owns_console() -> bool {
 }
 
 fn pause_if(standalone: bool) {
-    if !standalone || bpdf::is_json_mode() {
+    if !standalone || bpdf::is_json_mode() || bpdf::is_no_pause() || std::env::var_os("BPDF_NO_PAUSE").is_some() {
         return;
     }
     println!("\nPress Enter to exit...");

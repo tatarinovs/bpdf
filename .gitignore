@@ -2,13 +2,6 @@
 /dist/
 /stamps/
 
-# Only the build and maintenance scripts in tools/ are part of the project.
-/tools/*
-!/tools/benchmark-v1.ps1
-!/tools/draw_icons.py
-!/tools/prepare-windows-resources.ps1
-!/tools/bpdf_shell/
-
 # Local test documents and outputs.
 *.pdf
 *.xls*
@@ -21,4 +14,5 @@
 *.zip
 *.7z
 *.dll
+*.exe
 !/resources/**

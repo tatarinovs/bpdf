@@ -1,9 +1,9 @@
 [package]
 name = "bpdf"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 rust-version = "1.89"
-description = "Second-generation loss-conscious PDF and image processing toolkit"
+description = "PDF and image processing toolkit"
 license = "MIT"
 repository = "https://github.com/tatarinovs/bpdf"
 keywords = ["pdf", "merge", "ocr", "image", "cli"]

@@ -35,6 +35,10 @@ pub struct Cli {
     #[arg(long, global = true, help_heading = "Global options")]
     pub fail_fast: bool,
 
+    /// Never pause at exit.
+    #[arg(long, global = true, help_heading = "Global options")]
+    pub no_pause: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
