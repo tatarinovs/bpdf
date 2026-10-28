@@ -211,13 +211,10 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
         guiCmd.append(numBuf);
     }
 
-    StrW fullPath, dir, name, ext;
-    SplitPathParts(files[0], fullPath, dir, name, ext);
-
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
 
-    if (CreateProcessW(NULL, (LPWSTR)guiCmd.c_str(), NULL, NULL, FALSE, 0, NULL, dir.length() ? dir.c_str() : NULL, &si, &pi)) {
+    if (CreateProcessW(NULL, (LPWSTR)guiCmd.c_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     } else {

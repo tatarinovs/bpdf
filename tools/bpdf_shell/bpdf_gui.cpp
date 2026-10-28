@@ -348,6 +348,12 @@ static DWORD WINAPI WorkerThreadProc(LPVOID param)
 
         int validLen = Utf8CompletePrefix((const unsigned char*)procBuf, procLen);
 
+        // If the last byte of the chunk is '\r', hold it back so that '\r\n'
+        // is never split across two chunks (which would produce '\r\r\n' in NormalizeLineEndings).
+        if (validLen > 0 && procBuf[validLen - 1] == '\r') {
+            validLen--;
+        }
+
         if (validLen < procLen) {
             carryLen = procLen - validLen;
             if (carryLen > (int)sizeof(carryBuf)) carryLen = (int)sizeof(carryBuf);
@@ -399,11 +405,16 @@ static DWORD WINAPI WorkerThreadProc(LPVOID param)
     }
 
     if (carryLen > 0) {
-        int wChars = MultiByteToWideChar(GetOEMCP(), 0, carryBuf, carryLen, NULL, 0);
+        int wChars = MultiByteToWideChar(CP_UTF8, 0, carryBuf, carryLen, NULL, 0);
+        UINT cp = CP_UTF8;
+        if (wChars <= 0) {
+            cp = GetOEMCP();
+            wChars = MultiByteToWideChar(cp, 0, carryBuf, carryLen, NULL, 0);
+        }
         if (wChars > 0) {
             wchar_t* wBuf = (wchar_t*)malloc((wChars + 1) * sizeof(wchar_t));
             if (wBuf) {
-                MultiByteToWideChar(GetOEMCP(), 0, carryBuf, carryLen, wBuf, wChars);
+                MultiByteToWideChar(cp, 0, carryBuf, carryLen, wBuf, wChars);
                 wBuf[wChars] = L'\0';
                 int normLen = 0;
                 wchar_t* normBuf = NormalizeLineEndings(wBuf, wChars, normLen);
@@ -712,18 +723,19 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item)
     fullCmdLine.append(expanded.c_str());
 
     if (!hasFilePlaceholder) {
-        fullCmdLine.append(L" \"");
+        fullCmdLine.append(L" ");
         if (ctx->files.size() > 1) {
             if (!CreateManifestFile(ctx->files, manifestPath, ARRAYSIZE(manifestPath))) {
                 MessageBoxW(ctx->hwnd, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
                 return;
             }
-            fullCmdLine.append(L"@");
-            fullCmdLine.append(manifestPath);
+            StrW atManifest;
+            atManifest.append(L"@");
+            atManifest.append(manifestPath);
+            AppendQuotedArg(fullCmdLine, atManifest.c_str());
         } else {
-            fullCmdLine.append(fullPath.c_str());
+            AppendQuotedArg(fullCmdLine, ctx->files[0]);
         }
-        fullCmdLine.append(L"\"");
     }
 
     if (ctx->cmdLine) free(ctx->cmdLine);

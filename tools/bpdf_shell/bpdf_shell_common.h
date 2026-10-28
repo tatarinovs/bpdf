@@ -20,9 +20,12 @@
 
 #ifndef BPDF_CUSTOM_NEW_DELETE_DEFINED
 #define BPDF_CUSTOM_NEW_DELETE_DEFINED
-inline void* operator new(size_t size) { return calloc(1, size); }
+inline void* operator new(size_t size) noexcept { return calloc(1, size); }
+inline void* operator new[](size_t size) noexcept { return calloc(1, size); }
 inline void operator delete(void* p) noexcept { if (p) free(p); }
 inline void operator delete(void* p, size_t) noexcept { if (p) free(p); }
+inline void operator delete[](void* p) noexcept { if (p) free(p); }
+inline void operator delete[](void* p, size_t) noexcept { if (p) free(p); }
 #endif
 
 // -----------------------------------------------------------------------------
@@ -45,8 +48,8 @@ enum GuiMode {
 };
 
 struct MenuItemDef {
-    wchar_t title[128];
-    wchar_t cmd[512];
+    wchar_t title[256];
+    wchar_t cmd[2048];
     int iconIndex; // -1 for separator
     GuiMode guiMode;
 
@@ -172,23 +175,29 @@ static inline FileKind ClassifyPath(const wchar_t* path)
 {
     if (!path || !path[0]) return KIND_UNSUPPORTED;
 
+    // Fast check: ends with slash -> directory
+    size_t len = wcslen(path);
+    if (path[len - 1] == L'\\' || path[len - 1] == L'/') {
+        return KIND_DIRECTORY;
+    }
+
+    // Fast check by extension first (avoiding network/disk I/O in Explorer)
+    const wchar_t* dot = PathFindExtensionW(path);
+    if (dot && dot[0] && dot[1]) {
+        const wchar_t* ext = dot + 1;
+        if (StrCmpIW(ext, L"pdf") == 0) return KIND_PDF;
+        if (MatchExt(ext, L".jpg.jpeg.png.webp.bmp.gif.tif.tiff.avif.heic.heif.cr2.nef.arw.dng.raf.")) return KIND_IMAGE;
+        if (MatchExt(ext, L".docx.xlsx.pptx.rtf.odt.ods.odp.doc.xls.ppt.")) return KIND_OTHER_SUPPORTED;
+        if (MatchExt(ext, L".html.htm.xhtml.svg.")) return KIND_OTHER_SUPPORTED;
+        if (MatchExt(ext, L".epub.fb2.htmlz.djvu.xps.oxps.cbz.")) return KIND_OTHER_SUPPORTED;
+        if (MatchExt(ext, L".txt.md.")) return KIND_OTHER_SUPPORTED;
+    }
+
+    // Only if extension is absent or unknown, check if path is a directory (e.g. C:\Folder or Report.2024)
     DWORD attrs = GetFileAttributesW(path);
     if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         return KIND_DIRECTORY;
     }
-
-    const wchar_t* dot = PathFindExtensionW(path);
-    if (!dot || !dot[0] || !dot[1]) {
-        return KIND_UNSUPPORTED;
-    }
-    const wchar_t* ext = dot + 1;
-
-    if (StrCmpIW(ext, L"pdf") == 0) return KIND_PDF;
-    if (MatchExt(ext, L".jpg.jpeg.png.webp.bmp.gif.tif.tiff.avif.heic.heif.cr2.nef.arw.dng.raf.")) return KIND_IMAGE;
-    if (MatchExt(ext, L".docx.xlsx.pptx.rtf.odt.ods.odp.doc.xls.ppt.")) return KIND_OTHER_SUPPORTED;
-    if (MatchExt(ext, L".html.htm.xhtml.svg.")) return KIND_OTHER_SUPPORTED;
-    if (MatchExt(ext, L".epub.fb2.htmlz.djvu.xps.oxps.cbz.")) return KIND_OTHER_SUPPORTED;
-    if (MatchExt(ext, L".txt.md.")) return KIND_OTHER_SUPPORTED;
 
     return KIND_UNSUPPORTED;
 }
@@ -221,6 +230,28 @@ static inline void GetSectionForFiles(const WStringList& files, wchar_t* outSect
 // Exe, GUI & INI Path Discovery
 // -----------------------------------------------------------------------------
 
+static inline bool SearchInPathEnv(const wchar_t* fileName, wchar_t* outPath, size_t maxLen)
+{
+    DWORD envLen = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    if (envLen == 0) return false;
+
+    wchar_t* envPath = (wchar_t*)malloc(envLen * sizeof(wchar_t));
+    if (!envPath) return false;
+
+    bool found = false;
+    if (GetEnvironmentVariableW(L"PATH", envPath, envLen) > 0) {
+        wchar_t searchPath[MAX_PATH * 2] = {0};
+        if (SearchPathW(envPath, fileName, NULL, ARRAYSIZE(searchPath), searchPath, NULL) > 0) {
+            if (PathFileExistsW(searchPath)) {
+                lstrcpynW(outPath, searchPath, (int)maxLen);
+                found = true;
+            }
+        }
+    }
+    free(envPath);
+    return found;
+}
+
 static inline bool FindBpdfExe(wchar_t* outPath, size_t maxLen, HMODULE hMod = NULL)
 {
     wchar_t baseDir[MAX_PATH * 2] = {0};
@@ -244,16 +275,8 @@ static inline bool FindBpdfExe(wchar_t* outPath, size_t maxLen, HMODULE hMod = N
         }
     }
 
-    // 3. В системном PATH
-    wchar_t searchPath[MAX_PATH * 2] = {0};
-    if (SearchPathW(NULL, L"bpdf.exe", NULL, ARRAYSIZE(searchPath), searchPath, NULL) > 0) {
-        if (PathFileExistsW(searchPath)) {
-            lstrcpynW(outPath, searchPath, (int)maxLen);
-            return true;
-        }
-    }
-
-    return false;
+    // 3. В системном PATH (безопасный поиск только по переменной PATH, исключая текущую папку процесса)
+    return SearchInPathEnv(L"bpdf.exe", outPath, maxLen);
 }
 
 static inline bool FindBpdfGui(wchar_t* outPath, size_t maxLen, HMODULE hMod = NULL)
@@ -296,16 +319,8 @@ static inline bool FindBpdfGui(wchar_t* outPath, size_t maxLen, HMODULE hMod = N
         }
     }
 
-    // 4. В системном PATH
-    wchar_t searchPath[MAX_PATH * 2] = {0};
-    if (SearchPathW(NULL, L"bpdf-gui.exe", NULL, ARRAYSIZE(searchPath), searchPath, NULL) > 0) {
-        if (PathFileExistsW(searchPath)) {
-            lstrcpynW(outPath, searchPath, (int)maxLen);
-            return true;
-        }
-    }
-
-    return false;
+    // 4. В системном PATH (безопасный поиск только по переменной PATH)
+    return SearchInPathEnv(L"bpdf-gui.exe", outPath, maxLen);
 }
 
 static inline bool FindBpdfIni(wchar_t* outPath, size_t maxLen, HMODULE hMod = NULL)
@@ -357,7 +372,7 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
         return false;
     }
 
-    char* buf = (char*)malloc(size + 1);
+    char* buf = (char*)malloc(size + 2);
     if (!buf) { CloseHandle(hFile); return false; }
 
     DWORD bytesRead = 0;
@@ -365,6 +380,18 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
     CloseHandle(hFile);
     if (!ok) { free(buf); return false; }
     buf[bytesRead] = '\0';
+    buf[bytesRead + 1] = '\0';
+
+    // Check UTF-16 LE BOM (FF FE)
+    if (bytesRead >= 2 && (unsigned char)buf[0] == 0xFF && (unsigned char)buf[1] == 0xFE) {
+        size_t charCount = (bytesRead - 2) / sizeof(wchar_t);
+        outText.reserve(charCount);
+        wmemcpy(outText.data, (const wchar_t*)(buf + 2), charCount);
+        outText.data[charCount] = L'\0';
+        outText.len = charCount;
+        free(buf);
+        return true;
+    }
 
     int offset = 0;
     if (bytesRead >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) {
@@ -379,7 +406,7 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
         MultiByteToWideChar(CP_ACP, 0, buf + offset, (int)bytesRead - offset, outText.data, wLen);
     } else {
         outText.reserve(wLen);
-        MultiByteToWideChar(CP_UTF8, 0, buf + offset, (int)bytesRead - offset, outText.data, wLen);
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf + offset, (int)bytesRead - offset, outText.data, wLen);
     }
     outText.data[wLen] = L'\0';
     outText.len = wLen;
@@ -405,8 +432,9 @@ static inline void ParseItemFields(const wchar_t* line, MenuItemDef& item)
     item.iconIndex = 0;
     item.guiMode = GUI_AUTO;
 
-    wchar_t buf[1024];
-    lstrcpynW(buf, line, ARRAYSIZE(buf));
+    if (!line || !line[0]) return;
+    wchar_t* buf = _wcsdup(line);
+    if (!buf) return;
 
     wchar_t* token = buf;
     while (token && *token) {
@@ -437,6 +465,7 @@ static inline void ParseItemFields(const wchar_t* line, MenuItemDef& item)
         }
         token = nextBar;
     }
+    free(buf);
 }
 
 static inline size_t ParseIniSection(const wchar_t* iniContent, const wchar_t* targetSection, MenuItemDef* outItems, size_t maxItems)
@@ -523,17 +552,61 @@ static inline void SanitizePathForQuotes(StrW& str)
     }
 }
 
+// Аргумент в кавычках: хвостовые '\' перед закрывающей кавычкой удваиваются (канон Windows CommandLineToArgvW)
+static inline void AppendQuotedArg(StrW& out, const wchar_t* s)
+{
+    if (!s) return;
+    size_t n = wcslen(s), tail = 0;
+    while (tail < n && s[n - 1 - tail] == L'\\') tail++;
+    out.append(L'"');
+    out.append(s, n);
+    for (size_t i = 0; i < tail; i++) out.append(L'\\');
+    out.append(L'"');
+}
+
 static inline void SplitPathParts(const wchar_t* path, StrW& outFullPath, StrW& outDir, StrW& outName, StrW& outExt)
 {
     outFullPath.assign(path);
-    SanitizePathForQuotes(outFullPath);
+    outExt.clear();
 
+    if (!path || !path[0]) {
+        outDir.clear();
+        outName.clear();
+        return;
+    }
+
+    // Check if path is a drive root like "D:\" or "D:/"
+    if (path[0] && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/') && path[3] == L'\0') {
+        outDir.assign(path);
+        wchar_t driveLetter[3] = { path[0], L':', L'\0' };
+        outName.assign(driveLetter);
+        return;
+    }
+
+    // Check if path is a directory
+    bool isDirectory = (ClassifyPath(path) == KIND_DIRECTORY);
+
+    if (isDirectory) {
+        outDir.assign(path);
+        SanitizePathForQuotes(outDir);
+
+        const wchar_t* p = outDir.c_str();
+        const wchar_t* lastSlash = wcsrchr(p, L'\\');
+        const wchar_t* lastFSlash = wcsrchr(p, L'/');
+        if (lastFSlash > lastSlash) lastSlash = lastFSlash;
+        const wchar_t* dirName = lastSlash ? (lastSlash + 1) : p;
+        outName.assign(dirName);
+        return;
+    }
+
+    // Regular file
     outDir.assign(path);
     if (outDir.data) {
         wchar_t* lastSlash = wcsrchr(outDir.data, L'\\');
         wchar_t* lastFSlash = wcsrchr(outDir.data, L'/');
         if (lastFSlash > lastSlash) lastSlash = lastFSlash;
         if (lastSlash) {
+            // If file is in root like "D:\file.pdf", preserve "D:\"
             if (lastSlash == outDir.data + 2 && outDir.data[1] == L':') {
                 *(lastSlash + 1) = L'\0';
             } else {
@@ -542,16 +615,17 @@ static inline void SplitPathParts(const wchar_t* path, StrW& outFullPath, StrW& 
             outDir.len = wcslen(outDir.data);
         }
     }
-    SanitizePathForQuotes(outDir);
+    if (outDir.len > 3) {
+        SanitizePathForQuotes(outDir);
+    }
 
-    const wchar_t* p = path ? path : L"";
+    const wchar_t* p = path;
     const wchar_t* lastSlash = wcsrchr(p, L'\\');
     const wchar_t* lastFSlash = wcsrchr(p, L'/');
     if (lastFSlash > lastSlash) lastSlash = lastFSlash;
     const wchar_t* fileName = lastSlash ? (lastSlash + 1) : p;
 
     outName.assign(fileName);
-    outExt.clear();
 
     const wchar_t* dot = wcsrchr(outName.c_str(), L'.');
     if (dot && dot > outName.c_str()) {
@@ -567,17 +641,32 @@ static inline void ExpandCommand(const wchar_t* pattern, const wchar_t* fullPath
     outHasFile = false;
     if (!pattern) return;
 
+    bool inQuotes = false;
     const wchar_t* p = pattern;
     while (*p) {
+        if (*p == L'"') {
+            inQuotes = !inQuotes;
+            outCmd.append(*p);
+            p++;
+            continue;
+        }
+
         if (*p == L'{') {
             if (wcsncmp(p, L"{file}", 6) == 0) {
-                outCmd.append(fullPath);
                 outHasFile = true;
                 p += 6;
+                if (inQuotes) {
+                    outCmd.append(fullPath);
+                } else {
+                    AppendQuotedArg(outCmd, fullPath);
+                }
                 continue;
             } else if (wcsncmp(p, L"{dir}", 5) == 0) {
                 outCmd.append(dir);
                 p += 5;
+                if (*p == L'\\' && dir && dir[0] && dir[wcslen(dir) - 1] == L'\\') {
+                    p++;
+                }
                 continue;
             } else if (wcsncmp(p, L"{name}", 6) == 0) {
                 outCmd.append(name);
@@ -611,8 +700,12 @@ static inline bool CreateManifestFile(const WStringList& files, wchar_t* outPath
     if (!GetTempFileNameW(tempDir, L"bpdf", 0, tempFile)) return false;
 
     HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DeleteFileW(tempFile);
+        return false;
+    }
 
+    bool writeOk = true;
     DWORD written = 0;
     for (size_t i = 0; i < files.size(); i++) {
         int utf8Len = WideCharToMultiByte(CP_UTF8, 0, files[i], -1, NULL, 0, NULL, NULL);
@@ -620,14 +713,25 @@ static inline bool CreateManifestFile(const WStringList& files, wchar_t* outPath
             char* utf8Buf = (char*)malloc(utf8Len);
             if (utf8Buf) {
                 WideCharToMultiByte(CP_UTF8, 0, files[i], -1, utf8Buf, utf8Len, NULL, NULL);
-                WriteFile(hFile, utf8Buf, utf8Len - 1, &written, NULL);
-                WriteFile(hFile, "\r\n", 2, &written, NULL);
+                if (!WriteFile(hFile, utf8Buf, utf8Len - 1, &written, NULL) ||
+                    !WriteFile(hFile, "\r\n", 2, &written, NULL))
+                {
+                    writeOk = false;
+                }
                 free(utf8Buf);
+                if (!writeOk) break;
+            } else {
+                writeOk = false;
+                break;
             }
         }
     }
 
     CloseHandle(hFile);
+    if (!writeOk) {
+        DeleteFileW(tempFile);
+        return false;
+    }
     lstrcpynW(outPath, tempFile, (int)maxLen);
     return true;
 }
