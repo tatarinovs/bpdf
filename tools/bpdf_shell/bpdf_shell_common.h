@@ -40,7 +40,8 @@ enum FileKind {
 enum GuiMode {
     GUI_AUTO = 0,
     GUI_INFO = 1,
-    GUI_KEEP = 2
+    GUI_KEEP = 2,
+    GUI_NONE = 3
 };
 
 struct MenuItemDef {
@@ -66,6 +67,8 @@ struct StrW {
 
     StrW() : data(NULL), len(0), cap(0) {}
     ~StrW() { if (data) free(data); }
+    StrW(const StrW&) = delete;
+    StrW& operator=(const StrW&) = delete;
 
     void clear() {
         len = 0;
@@ -125,6 +128,8 @@ struct WStringList {
 
     WStringList() : items(NULL), count(0), cap(0) {}
     ~WStringList() { clear(); }
+    WStringList(const WStringList&) = delete;
+    WStringList& operator=(const WStringList&) = delete;
 
     void clear() {
         if (items) {
@@ -366,7 +371,7 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
         offset = 3;
     }
 
-    int wLen = MultiByteToWideChar(CP_UTF8, 0, buf + offset, (int)bytesRead - offset, NULL, 0);
+    int wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf + offset, (int)bytesRead - offset, NULL, 0);
     if (wLen <= 0) {
         wLen = MultiByteToWideChar(CP_ACP, 0, buf + offset, (int)bytesRead - offset, NULL, 0);
         if (wLen <= 0) { free(buf); return false; }
@@ -424,6 +429,9 @@ static inline void ParseItemFields(const wchar_t* line, MenuItemDef& item)
             else if (StrCmpIW(key, L"gui") == 0) {
                 if (StrCmpIW(val, L"info") == 0) item.guiMode = GUI_INFO;
                 else if (StrCmpIW(val, L"keep") == 0) item.guiMode = GUI_KEEP;
+                else if (StrCmpIW(val, L"none") == 0 || StrCmpIW(val, L"hide") == 0 ||
+                         StrCmpIW(val, L"off") == 0 || StrCmpIW(val, L"false") == 0 ||
+                         StrCmpIW(val, L"no") == 0) item.guiMode = GUI_NONE;
                 else item.guiMode = GUI_AUTO;
             }
         }
@@ -507,7 +515,53 @@ static inline void SanitizePathForQuotes(wchar_t* path)
     }
 }
 
-static inline void ExpandCommand(const wchar_t* pattern, const wchar_t* fullPath, const wchar_t* dir, const wchar_t* name, const wchar_t* ext, StrW& outCmd, bool& outHasFile)
+static inline void SanitizePathForQuotes(StrW& str)
+{
+    if (!str.data) return;
+    while (str.len > 0 && str.data[str.len - 1] == L'\\') {
+        str.data[--str.len] = L'\0';
+    }
+}
+
+static inline void SplitPathParts(const wchar_t* path, StrW& outFullPath, StrW& outDir, StrW& outName, StrW& outExt)
+{
+    outFullPath.assign(path);
+    SanitizePathForQuotes(outFullPath);
+
+    outDir.assign(path);
+    if (outDir.data) {
+        wchar_t* lastSlash = wcsrchr(outDir.data, L'\\');
+        wchar_t* lastFSlash = wcsrchr(outDir.data, L'/');
+        if (lastFSlash > lastSlash) lastSlash = lastFSlash;
+        if (lastSlash) {
+            if (lastSlash == outDir.data + 2 && outDir.data[1] == L':') {
+                *(lastSlash + 1) = L'\0';
+            } else {
+                *lastSlash = L'\0';
+            }
+            outDir.len = wcslen(outDir.data);
+        }
+    }
+    SanitizePathForQuotes(outDir);
+
+    const wchar_t* p = path ? path : L"";
+    const wchar_t* lastSlash = wcsrchr(p, L'\\');
+    const wchar_t* lastFSlash = wcsrchr(p, L'/');
+    if (lastFSlash > lastSlash) lastSlash = lastFSlash;
+    const wchar_t* fileName = lastSlash ? (lastSlash + 1) : p;
+
+    outName.assign(fileName);
+    outExt.clear();
+
+    const wchar_t* dot = wcsrchr(outName.c_str(), L'.');
+    if (dot && dot > outName.c_str()) {
+        outExt.assign(dot + 1);
+        outName.data[dot - outName.c_str()] = L'\0';
+        outName.len = dot - outName.c_str();
+    }
+}
+
+static inline void ExpandCommand(const wchar_t* pattern, const wchar_t* fullPath, const wchar_t* dir, const wchar_t* name, const wchar_t* ext, StrW& outCmd, bool& outHasFile, const wchar_t* exeDir = NULL)
 {
     outCmd.clear();
     outHasFile = false;
@@ -532,6 +586,14 @@ static inline void ExpandCommand(const wchar_t* pattern, const wchar_t* fullPath
             } else if (wcsncmp(p, L"{ext}", 5) == 0) {
                 outCmd.append(ext);
                 p += 5;
+                continue;
+            } else if (wcsncmp(p, L"{exe_dir}", 9) == 0) {
+                if (exeDir && exeDir[0]) outCmd.append(exeDir);
+                p += 9;
+                continue;
+            } else if (wcsncmp(p, L"{tool_dir}", 10) == 0) {
+                if (exeDir && exeDir[0]) outCmd.append(exeDir);
+                p += 10;
                 continue;
             }
         }
@@ -568,148 +630,6 @@ static inline bool CreateManifestFile(const WStringList& files, wchar_t* outPath
     CloseHandle(hFile);
     lstrcpynW(outPath, tempFile, (int)maxLen);
     return true;
-}
-
-// -----------------------------------------------------------------------------
-// Job File (.bpj) Serialization (Direct Action Invocation)
-// -----------------------------------------------------------------------------
-
-static inline bool CreateJobFile(
-    const wchar_t* title,
-    int iconIndex,
-    int guiMode,
-    const wchar_t* workDir,
-    const wchar_t* tempManifest,
-    const wchar_t* targetExe,
-    const wchar_t* cmdLine,
-    const WStringList& files,
-    wchar_t* outPath,
-    size_t maxLen
-)
-{
-    wchar_t tempDir[MAX_PATH] = {0};
-    GetTempPathW(ARRAYSIZE(tempDir), tempDir);
-
-    wchar_t tempFile[MAX_PATH] = {0};
-    if (!GetTempFileNameW(tempDir, L"bpj", 0, tempFile)) return false;
-
-    HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-
-    StrW content;
-    content.append(title ? title : L"Операция");
-    content.append(L"\n");
-
-    wchar_t numBuf[32];
-    wnsprintfW(numBuf, ARRAYSIZE(numBuf), L"%d\n", iconIndex);
-    content.append(numBuf);
-
-    wnsprintfW(numBuf, ARRAYSIZE(numBuf), L"%d\n", guiMode);
-    content.append(numBuf);
-
-    content.append(workDir ? workDir : L"");
-    content.append(L"\n");
-
-    content.append(tempManifest ? tempManifest : L"");
-    content.append(L"\n");
-
-    content.append(targetExe ? targetExe : L"");
-    content.append(L"\n");
-
-    content.append(cmdLine ? cmdLine : L"");
-    content.append(L"\n");
-
-    for (size_t i = 0; i < files.size(); i++) {
-        content.append(files[i]);
-        content.append(L"\n");
-    }
-
-    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), NULL, 0, NULL, NULL);
-    if (utf8Len > 0) {
-        char* buf = (char*)malloc(utf8Len);
-        if (buf) {
-            WideCharToMultiByte(CP_UTF8, 0, content.c_str(), (int)content.length(), buf, utf8Len, NULL, NULL);
-            DWORD written = 0;
-            WriteFile(hFile, buf, utf8Len, &written, NULL);
-            free(buf);
-        }
-    }
-
-    CloseHandle(hFile);
-    lstrcpynW(outPath, tempFile, (int)maxLen);
-    return true;
-}
-
-static inline bool ReadJobFile(
-    const wchar_t* path,
-    wchar_t* outTitle, size_t maxTitle,
-    int* outIconIndex,
-    GuiMode* outGuiMode,
-    wchar_t* outWorkDir, size_t maxWorkDir,
-    wchar_t* outManifest, size_t maxManifest,
-    wchar_t* outExe, size_t maxExe,
-    wchar_t** outCmdLine,
-    WStringList* outFiles
-)
-{
-    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-
-    DWORD size = GetFileSize(hFile, NULL);
-    if (size == 0 || size == INVALID_FILE_SIZE) {
-        CloseHandle(hFile);
-        return false;
-    }
-
-    char* buf = (char*)malloc(size + 1);
-    if (!buf) { CloseHandle(hFile); return false; }
-
-    DWORD bytesRead = 0;
-    bool ok = ReadFile(hFile, buf, size, &bytesRead, NULL) && bytesRead > 0;
-    CloseHandle(hFile);
-    if (!ok) { free(buf); return false; }
-    buf[bytesRead] = '\0';
-
-    int wLen = MultiByteToWideChar(CP_UTF8, 0, buf, (int)bytesRead, NULL, 0);
-    if (wLen <= 0) { free(buf); return false; }
-
-    wchar_t* wBuf = (wchar_t*)malloc((wLen + 1) * sizeof(wchar_t));
-    if (!wBuf) { free(buf); return false; }
-    MultiByteToWideChar(CP_UTF8, 0, buf, (int)bytesRead, wBuf, wLen);
-    wBuf[wLen] = L'\0';
-    free(buf);
-
-    wchar_t* p = wBuf;
-    int lineNum = 0;
-
-    while (p && *p) {
-        wchar_t* nextLine = wcschr(p, L'\n');
-        if (nextLine) {
-            *nextLine = L'\0';
-            nextLine++;
-        }
-        size_t lLen = wcslen(p);
-        if (lLen > 0 && p[lLen - 1] == L'\r') p[lLen - 1] = L'\0';
-
-        if (lineNum == 0 && outTitle) lstrcpynW(outTitle, p, (int)maxTitle);
-        else if (lineNum == 1 && outIconIndex) *outIconIndex = StrToIntW(p);
-        else if (lineNum == 2 && outGuiMode) *outGuiMode = (GuiMode)StrToIntW(p);
-        else if (lineNum == 3 && outWorkDir) lstrcpynW(outWorkDir, p, (int)maxWorkDir);
-        else if (lineNum == 4 && outManifest) lstrcpynW(outManifest, p, (int)maxManifest);
-        else if (lineNum == 5 && outExe) lstrcpynW(outExe, p, (int)maxExe);
-        else if (lineNum == 6 && outCmdLine) *outCmdLine = _wcsdup(p);
-        else if (lineNum >= 7 && outFiles) {
-            wchar_t* t = Trim(p);
-            if (*t) outFiles->add(t);
-        }
-
-        p = nextLine;
-        lineNum++;
-    }
-
-    free(wBuf);
-    DeleteFileW(path);
-    return (outCmdLine && *outCmdLine != NULL);
 }
 
 // -----------------------------------------------------------------------------

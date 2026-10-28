@@ -1,5 +1,10 @@
 #include "bpdf_shell_common.h"
 #include <shlobj.h>
+#include <olectl.h>
+
+#ifndef SELFREG_E_CLASS
+#define SELFREG_E_CLASS ((HRESULT)0x80040201L)
+#endif
 
 // CLSID: {B9DF0001-B000-4000-8000-000000000001}
 static const GUID CLSID_BpdfShell = 
@@ -9,31 +14,68 @@ static const wchar_t* CLSID_STRING = L"{B9DF0001-B000-4000-8000-000000000001}";
 
 static HINSTANCE g_hInst = NULL;
 static LONG g_refCount = 0;
-static CRITICAL_SECTION g_csIconCache;
+static CRITICAL_SECTION g_csShell;
 
-static inline bool FindDllBpdfExe(wchar_t* outPath, size_t maxLen)
-{
-    return FindBpdfExe(outPath, maxLen, g_hInst);
-}
+static wchar_t g_cachedExePath[MAX_PATH * 2] = {0};
+static bool g_cachedExeValid = false;
 
-static inline bool FindDllBpdfGui(wchar_t* outPath, size_t maxLen)
-{
-    return FindBpdfGui(outPath, maxLen, g_hInst);
-}
+static wchar_t g_cachedIniPath[MAX_PATH * 2] = {0};
+static bool g_cachedIniFound = false;
+static FILETIME g_cachedIniWriteTime = {0, 0};
+static StrW g_cachedIniContent;
 
-static inline bool FindDllBpdfIni(wchar_t* outPath, size_t maxLen)
+static bool GetCachedBpdfExe(wchar_t* outPath, size_t maxLen)
 {
-    return FindBpdfIni(outPath, maxLen, g_hInst);
+    EnterCriticalSection(&g_csShell);
+    if (g_cachedExeValid && GetFileAttributesW(g_cachedExePath) != INVALID_FILE_ATTRIBUTES) {
+        lstrcpynW(outPath, g_cachedExePath, (int)maxLen);
+        LeaveCriticalSection(&g_csShell);
+        return true;
+    }
+    LeaveCriticalSection(&g_csShell);
+
+    wchar_t exe[MAX_PATH * 2] = {0};
+    if (FindBpdfExe(exe, ARRAYSIZE(exe), g_hInst)) {
+        EnterCriticalSection(&g_csShell);
+        lstrcpynW(g_cachedExePath, exe, ARRAYSIZE(g_cachedExePath));
+        g_cachedExeValid = true;
+        lstrcpynW(outPath, exe, (int)maxLen);
+        LeaveCriticalSection(&g_csShell);
+        return true;
+    }
+    return false;
 }
 
 static size_t LoadMenuConfig(const wchar_t* targetSection, MenuItemDef* outItems, size_t maxItems)
 {
-    wchar_t iniPath[MAX_PATH * 2] = {0};
-    StrW iniContent;
-    if (FindDllBpdfIni(iniPath, ARRAYSIZE(iniPath)) && ReadTextFile(iniPath, iniContent)) {
-        return ParseIniSection(iniContent.c_str(), targetSection, outItems, maxItems);
+    EnterCriticalSection(&g_csShell);
+    if (!g_cachedIniFound || GetFileAttributesW(g_cachedIniPath) == INVALID_FILE_ATTRIBUTES) {
+        g_cachedIniFound = FindBpdfIni(g_cachedIniPath, ARRAYSIZE(g_cachedIniPath), g_hInst);
+        g_cachedIniWriteTime.dwLowDateTime = 0;
+        g_cachedIniWriteTime.dwHighDateTime = 0;
+        g_cachedIniContent.clear();
     }
-    return 0;
+
+    if (g_cachedIniFound) {
+        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+        if (GetFileAttributesExW(g_cachedIniPath, GetFileExInfoStandard, &fad)) {
+            if (fad.ftLastWriteTime.dwLowDateTime != g_cachedIniWriteTime.dwLowDateTime ||
+                fad.ftLastWriteTime.dwHighDateTime != g_cachedIniWriteTime.dwHighDateTime ||
+                g_cachedIniContent.length() == 0)
+            {
+                if (ReadTextFile(g_cachedIniPath, g_cachedIniContent)) {
+                    g_cachedIniWriteTime = fad.ftLastWriteTime;
+                }
+            }
+        }
+    }
+
+    size_t count = 0;
+    if (g_cachedIniContent.length() > 0) {
+        count = ParseIniSection(g_cachedIniContent.c_str(), targetSection, outItems, maxItems);
+    }
+    LeaveCriticalSection(&g_csShell);
+    return count;
 }
 
 // -----------------------------------------------------------------------------
@@ -97,10 +139,10 @@ static HBITMAP GetCachedMenuIcon(const wchar_t* exePath, int iconIndex)
 {
     if (iconIndex < 0 || iconIndex >= 32 || !exePath || !exePath[0]) return NULL;
 
-    EnterCriticalSection(&g_csIconCache);
+    EnterCriticalSection(&g_csShell);
     if (g_iconCacheInited[iconIndex]) {
         HBITMAP hBmp = g_iconCache[iconIndex];
-        LeaveCriticalSection(&g_csIconCache);
+        LeaveCriticalSection(&g_csShell);
         return hBmp;
     }
 
@@ -113,13 +155,13 @@ static HBITMAP GetCachedMenuIcon(const wchar_t* exePath, int iconIndex)
 
     g_iconCache[iconIndex] = hBmp;
     g_iconCacheInited[iconIndex] = true;
-    LeaveCriticalSection(&g_csIconCache);
+    LeaveCriticalSection(&g_csShell);
     return hBmp;
 }
 
 static void ClearIconCache()
 {
-    EnterCriticalSection(&g_csIconCache);
+    EnterCriticalSection(&g_csShell);
     for (int i = 0; i < 32; i++) {
         if (g_iconCache[i]) {
             DeleteObject(g_iconCache[i]);
@@ -127,25 +169,21 @@ static void ClearIconCache()
         }
         g_iconCacheInited[i] = false;
     }
-    LeaveCriticalSection(&g_csIconCache);
+    LeaveCriticalSection(&g_csShell);
 }
 
 // -----------------------------------------------------------------------------
 // Process Spawning (Async GUI Launcher)
 // -----------------------------------------------------------------------------
 
-// -----------------------------------------------------------------------------
-// Process Spawning (Async GUI Launcher)
-// -----------------------------------------------------------------------------
-
-static void ExecutePalette(const WStringList& files)
+static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
 {
     if (files.empty()) return;
 
     wchar_t guiExe[MAX_PATH * 2] = {0};
-    if (!FindDllBpdfGui(guiExe, ARRAYSIZE(guiExe))) {
+    if (!FindBpdfGui(guiExe, ARRAYSIZE(guiExe), g_hInst)) {
         MessageBoxW(
-            NULL,
+            hwndOwner,
             L"Исполняемый файл bpdf-gui.exe не найден.\n"
             L"Убедитесь, что bpdf-gui.exe находится рядом с bpdf_shell.dll или bpdf.exe.",
             L"bpdf",
@@ -156,138 +194,35 @@ static void ExecutePalette(const WStringList& files)
 
     wchar_t manifestPath[MAX_PATH * 2] = {0};
     if (!CreateManifestFile(files, manifestPath, ARRAYSIZE(manifestPath))) {
-        MessageBoxW(NULL, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
+        MessageBoxW(hwndOwner, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
         return;
     }
 
     StrW guiCmd;
     guiCmd.append(L"\"");
     guiCmd.append(guiExe);
-    guiCmd.append(L"\" --palette \"");
+    guiCmd.append(L"\" --manifest \"");
     guiCmd.append(manifestPath);
     guiCmd.append(L"\"");
 
-    wchar_t dir[MAX_PATH * 2] = {0};
-    lstrcpynW(dir, files[0], ARRAYSIZE(dir));
-    PathRemoveFileSpecW(dir);
+    if (itemIndex >= 0) {
+        wchar_t numBuf[32];
+        wnsprintfW(numBuf, ARRAYSIZE(numBuf), L" --item %d", itemIndex);
+        guiCmd.append(numBuf);
+    }
+
+    StrW fullPath, dir, name, ext;
+    SplitPathParts(files[0], fullPath, dir, name, ext);
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
 
-    if (CreateProcessW(NULL, (LPWSTR)guiCmd.c_str(), NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
+    if (CreateProcessW(NULL, (LPWSTR)guiCmd.c_str(), NULL, NULL, FALSE, 0, NULL, dir.length() ? dir.c_str() : NULL, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     } else {
         DeleteFileW(manifestPath);
-        MessageBoxW(NULL, L"Не удалось запустить bpdf-gui.exe", L"bpdf", MB_ICONERROR);
-    }
-}
-
-static void ExecuteCustomItem(const MenuItemDef& item, const WStringList& files)
-{
-    if (files.empty()) return;
-
-    wchar_t exe[MAX_PATH * 2] = {0};
-    if (!FindDllBpdfExe(exe, ARRAYSIZE(exe))) {
-        MessageBoxW(
-            NULL,
-            L"Исполняемый файл bpdf.exe не найден.\n"
-            L"Убедитесь, что bpdf.exe находится в одной папке с shell или добавлен в PATH.",
-            L"bpdf",
-            MB_ICONERROR
-        );
-        return;
-    }
-
-    wchar_t fullPath[MAX_PATH * 2] = {0};
-    wchar_t dir[MAX_PATH * 2] = {0};
-    wchar_t name[MAX_PATH * 2] = {0};
-    wchar_t ext[64] = {0};
-
-    lstrcpynW(fullPath, files[0], ARRAYSIZE(fullPath));
-    lstrcpynW(dir, files[0], ARRAYSIZE(dir));
-    PathRemoveFileSpecW(dir);
-
-    SanitizePathForQuotes(fullPath);
-    SanitizePathForQuotes(dir);
-
-    lstrcpynW(name, PathFindFileNameW(files[0]), ARRAYSIZE(name));
-    const wchar_t* dot = PathFindExtensionW(name);
-    if (dot && dot[0] == L'.') {
-        lstrcpynW(ext, dot + 1, ARRAYSIZE(ext));
-        PathRemoveExtensionW(name);
-    }
-
-    StrW expanded;
-    bool hasFilePlaceholder = false;
-    ExpandCommand(item.cmd, fullPath, dir, name, ext, expanded, hasFilePlaceholder);
-
-    wchar_t manifestPath[MAX_PATH * 2] = {0};
-    StrW fullCmdLine;
-    fullCmdLine.append(L"\"");
-    fullCmdLine.append(exe);
-    fullCmdLine.append(L"\" --no-pause ");
-    fullCmdLine.append(expanded.c_str());
-
-    if (!hasFilePlaceholder) {
-        fullCmdLine.append(L" \"");
-        if (files.size() > 1) {
-            if (!CreateManifestFile(files, manifestPath, ARRAYSIZE(manifestPath))) {
-                MessageBoxW(NULL, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
-                return;
-            }
-            fullCmdLine.append(L"@");
-            fullCmdLine.append(manifestPath);
-        } else {
-            fullCmdLine.append(fullPath);
-        }
-        fullCmdLine.append(L"\"");
-    }
-
-    wchar_t guiExe[MAX_PATH * 2] = {0};
-    if (FindDllBpdfGui(guiExe, ARRAYSIZE(guiExe))) {
-        wchar_t jobPath[MAX_PATH * 2] = {0};
-        if (CreateJobFile(
-                item.title[0] ? item.title : L"Операция",
-                item.iconIndex,
-                (int)item.guiMode,
-                dir,
-                manifestPath,
-                exe,
-                fullCmdLine.c_str(),
-                files,
-                jobPath,
-                ARRAYSIZE(jobPath)
-            ))
-        {
-            StrW guiCmd;
-            guiCmd.append(L"\"");
-            guiCmd.append(guiExe);
-            guiCmd.append(L"\" --job \"");
-            guiCmd.append(jobPath);
-            guiCmd.append(L"\"");
-
-            STARTUPINFOW si = { sizeof(si) };
-            PROCESS_INFORMATION pi = { 0 };
-            if (CreateProcessW(NULL, (LPWSTR)guiCmd.c_str(), NULL, NULL, FALSE, 0, NULL, dir[0] ? dir : NULL, &si, &pi)) {
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-                return;
-            } else {
-                DeleteFileW(jobPath);
-            }
-        }
-    }
-
-    // Fallback: direct console launch if bpdf-gui.exe is missing
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    if (CreateProcessW(NULL, (LPWSTR)fullCmdLine.c_str(), NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, dir[0] ? dir : NULL, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    } else {
-        if (manifestPath[0]) DeleteFileW(manifestPath);
-        MessageBoxW(NULL, L"Не удалось запустить команду bpdf", L"bpdf", MB_ICONERROR);
+        MessageBoxW(hwndOwner, L"Не удалось запустить bpdf-gui.exe", L"bpdf", MB_ICONERROR);
     }
 }
 
@@ -352,9 +287,15 @@ public:
                 HDROP hDrop = (HDROP)stg.hGlobal;
                 UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
                 for (UINT i = 0; i < count; i++) {
-                    wchar_t path[MAX_PATH * 4] = {0};
-                    if (DragQueryFileW(hDrop, i, path, ARRAYSIZE(path)) > 0) {
-                        m_files.add(path);
+                    UINT len = DragQueryFileW(hDrop, i, NULL, 0);
+                    if (len > 0) {
+                        wchar_t* path = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+                        if (path) {
+                            if (DragQueryFileW(hDrop, i, path, len + 1) > 0) {
+                                m_files.add(path);
+                            }
+                            free(path);
+                        }
                     }
                 }
                 ReleaseStgMedium(&stg);
@@ -370,7 +311,7 @@ public:
     }
 
     // IContextMenu
-    STDMETHODIMP QueryContextMenu(HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT /*idCmdLast*/, UINT uFlags) override
+    STDMETHODIMP QueryContextMenu(HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags) override
     {
         if ((uFlags & CMF_DEFAULTONLY) != 0 || m_files.empty()) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
@@ -391,49 +332,26 @@ public:
         }
 
         wchar_t exePath[MAX_PATH * 2] = {0};
-        FindDllBpdfExe(exePath, ARRAYSIZE(exePath));
+        GetCachedBpdfExe(exePath, ARRAYSIZE(exePath));
 
-        const wchar_t* targetSection = L"menu.single.default";
-        if (m_files.size() > 1) {
-            targetSection = L"menu.multi";
-        } else {
-            switch (firstKind) {
-            case KIND_PDF:       targetSection = L"menu.single.pdf"; break;
-            case KIND_IMAGE:     targetSection = L"menu.single.image"; break;
-            case KIND_DIRECTORY: targetSection = L"menu.single.directory"; break;
-            default:             targetSection = L"menu.single.default"; break;
-            }
-        }
+        wchar_t targetSection[64] = {0};
+        GetSectionForFiles(m_files, targetSection, ARRAYSIZE(targetSection));
 
         m_itemCount = LoadMenuConfig(targetSection, m_items, ARRAYSIZE(m_items));
+
+        UINT totalCommands = (UINT)m_itemCount;
+        if (idCmdFirst + totalCommands + 1 > idCmdLast) {
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+        }
 
         HMENU hSubMenu = CreatePopupMenu();
         if (!hSubMenu) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        // Submenu Item 0: Palette launcher
-        MENUITEMINFOW palMii = { sizeof(palMii) };
-        palMii.fMask = MIIM_STRING | MIIM_ID;
-        palMii.wID = idCmdFirst + 0;
-        palMii.dwTypeData = const_cast<LPWSTR>(L"Панель действий bpdf...");
         HBITMAP hLogoBmp = GetCachedMenuIcon(exePath, 0);
-        if (hLogoBmp) {
-            palMii.fMask |= MIIM_BITMAP;
-            palMii.hbmpItem = hLogoBmp;
-        }
-        InsertMenuItemW(hSubMenu, 0, TRUE, &palMii);
-
-        UINT totalCommands = 1;
 
         if (m_itemCount > 0) {
-            // Submenu Item 1: Separator
-            MENUITEMINFOW sepMii = { sizeof(sepMii) };
-            sepMii.fMask = MIIM_FTYPE;
-            sepMii.fType = MFT_SEPARATOR;
-            InsertMenuItemW(hSubMenu, 1, TRUE, &sepMii);
-
-            // Submenu Items 2..N: Custom actions
             for (size_t i = 0; i < m_itemCount; i++) {
                 MENUITEMINFOW mii = { sizeof(mii) };
                 if (m_items[i].iconIndex == -1) {
@@ -441,7 +359,7 @@ public:
                     mii.fType = MFT_SEPARATOR;
                 } else {
                     mii.fMask = MIIM_STRING | MIIM_ID;
-                    mii.wID = idCmdFirst + (UINT)(2 + i);
+                    mii.wID = idCmdFirst + (UINT)(i);
                     mii.dwTypeData = m_items[i].title;
 
                     HBITMAP hBmp = GetCachedMenuIcon(exePath, m_items[i].iconIndex);
@@ -450,9 +368,8 @@ public:
                         mii.hbmpItem = hBmp;
                     }
                 }
-                InsertMenuItemW(hSubMenu, (UINT)(2 + i), TRUE, &mii);
+                InsertMenuItemW(hSubMenu, (UINT)(i), TRUE, &mii);
             }
-            totalCommands = (UINT)(2 + m_itemCount);
         }
 
         // Parent cascaded menu item
@@ -481,21 +398,19 @@ public:
         if (!IS_INTRESOURCE(pici->lpVerb)) return E_FAIL;
 
         UINT verbOffset = LOWORD(pici->lpVerb);
-        UINT parentVerb = (m_itemCount > 0) ? (UINT)(2 + m_itemCount) : 1;
-
-        // Clicked Item 0 ("Панель действий bpdf...") or parent menu item
-        if (verbOffset == 0 || verbOffset == parentVerb) {
-            ExecutePalette(m_files);
-            return S_OK;
-        }
+        UINT parentVerb = (m_itemCount > 0) ? (UINT)(m_itemCount) : 0;
+        HWND hwndOwner = pici->hwnd;
 
         // Clicked individual action
-        if (m_itemCount > 0 && verbOffset >= 2 && verbOffset < 2 + m_itemCount) {
-            size_t idx = verbOffset - 2;
+        if (m_itemCount > 0 && verbOffset < m_itemCount) {
+            size_t idx = verbOffset;
             if (m_items[idx].iconIndex != -1) {
-                ExecuteCustomItem(m_items[idx], m_files);
+                LaunchGui(m_files, (int)idx, hwndOwner);
                 return S_OK;
             }
+        } else if (verbOffset == parentVerb) {
+            LaunchGui(m_files, -1, hwndOwner);
+            return S_OK;
         }
 
         return E_FAIL;
@@ -553,6 +468,7 @@ public:
     {
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
         CBpdfContextMenu* pExt = new CBpdfContextMenu();
+        if (!pExt) return E_OUTOFMEMORY;
         HRESULT hr = pExt->QueryInterface(riid, ppv);
         pExt->Release();
         return hr;
@@ -570,15 +486,17 @@ public:
 // DLL Exports & Self-Registration (HKCU - no admin rights required!)
 // -----------------------------------------------------------------------------
 
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hInst;
         DisableThreadLibraryCalls(hInst);
-        InitializeCriticalSection(&g_csIconCache);
+        InitializeCriticalSection(&g_csShell);
     } else if (reason == DLL_PROCESS_DETACH) {
-        ClearIconCache();
-        DeleteCriticalSection(&g_csIconCache);
+        if (!lpReserved) {
+            ClearIconCache();
+            DeleteCriticalSection(&g_csShell);
+        }
     }
     return TRUE;
 }
@@ -593,6 +511,7 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
     }
 
     CBpdfClassFactory* pFactory = new CBpdfClassFactory();
+    if (!pFactory) return E_OUTOFMEMORY;
     HRESULT hr = pFactory->QueryInterface(riid, ppv);
     pFactory->Release();
     return hr;
@@ -621,14 +540,20 @@ STDAPI DllRegisterServer(void)
     wchar_t inprocKey[160];
     wnsprintfW(inprocKey, ARRAYSIZE(inprocKey), L"%s\\InprocServer32", clsidKey);
 
-    SetRegString(HKEY_CURRENT_USER, clsidKey, NULL, L"bpdf Shell Extension");
-    SetRegString(HKEY_CURRENT_USER, inprocKey, NULL, dllPath);
-    SetRegString(HKEY_CURRENT_USER, inprocKey, L"ThreadingModel", L"Apartment");
+    bool ok = true;
+    ok &= SetRegString(HKEY_CURRENT_USER, clsidKey, NULL, L"bpdf Shell Extension");
+    ok &= SetRegString(HKEY_CURRENT_USER, inprocKey, NULL, dllPath);
+    ok &= SetRegString(HKEY_CURRENT_USER, inprocKey, L"ThreadingModel", L"Apartment");
 
-    SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
-    SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
-    SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
+    ok &= SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
+    ok &= SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
+    ok &= SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
 
+    if (!ok) {
+        return SELFREG_E_CLASS;
+    }
+
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return S_OK;
 }
 
@@ -643,5 +568,7 @@ STDAPI DllUnregisterServer(void)
     RegDeleteTreeW(HKEY_CURRENT_USER, clsidKey);
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\bpdf");
 
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return S_OK;
 }
+

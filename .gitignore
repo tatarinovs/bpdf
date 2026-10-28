@@ -13,6 +13,7 @@
 *.br2
 *.zip
 *.7z
+*.rar
 *.dll
 *.exe
 !/resources/**
