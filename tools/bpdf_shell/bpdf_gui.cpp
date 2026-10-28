@@ -34,9 +34,9 @@ struct GuiContext {
     HWND hTargetTitle;
     HWND hTargetSub;
     HWND hPaletteGroup;
-    HWND hActionBtns[24];
-    HIMAGELIST hActionIml[24];
-    MenuItemDef actionDefs[24];
+    HWND hActionBtns[MAX_SHELL_ACTIONS];
+    HIMAGELIST hActionIml[MAX_SHELL_ACTIONS];
+    MenuItemDef actionDefs[MAX_SHELL_ACTIONS];
     size_t actionCount;
 
     // Progress / Execution controls
@@ -75,7 +75,8 @@ struct GuiContext {
     volatile LONG isFinished;
     volatile LONG isCancelled;
     int autoActionIndex;
-    wchar_t initialManifest[MAX_PATH * 2];
+    bool hasCustomAction;
+    MenuItemDef customAction;
 
     GuiContext()
         : hwnd(NULL), state(STATE_PALETTE), isPaletteSession(false),
@@ -86,9 +87,9 @@ struct GuiContext {
           hBrushEdit(NULL), hIcon(NULL),
           cmdLine(NULL), iconIndex(0), guiMode(GUI_AUTO), autoCloseSeconds(0), dpi(96),
           hProcess(NULL), hWorkerThread(NULL), hJob(NULL), isFinished(0), isCancelled(0),
-          autoActionIndex(-1)
+          autoActionIndex(-1), hasCustomAction(false)
     {
-        for (int i = 0; i < 24; i++) {
+        for (int i = 0; i < MAX_SHELL_ACTIONS; i++) {
             hActionBtns[i] = NULL;
             hActionIml[i] = NULL;
         }
@@ -96,7 +97,7 @@ struct GuiContext {
         currentTitle[0] = L'\0';
         workDir[0] = L'\0';
         tempManifest[0] = L'\0';
-        initialManifest[0] = L'\0';
+        memset(&customAction, 0, sizeof(customAction));
     }
 
     ~GuiContext()
@@ -113,10 +114,9 @@ struct GuiContext {
         if (hProcess) CloseHandle(hProcess);
         if (cmdLine) free(cmdLine);
         if (tempManifest[0]) DeleteFileW(tempManifest);
-        if (initialManifest[0]) DeleteFileW(initialManifest);
         if (hIcon) DestroyIcon(hIcon);
 
-        for (size_t i = 0; i < 24; i++) {
+        for (size_t i = 0; i < MAX_SHELL_ACTIONS; i++) {
             if (hActionIml[i]) ImageList_Destroy(hActionIml[i]);
         }
 
@@ -445,7 +445,7 @@ static DWORD WINAPI WorkerThreadProc(LPVOID param)
 static void LoadPaletteForFiles(GuiContext* ctx)
 {
     // Clean up old action buttons
-    for (size_t i = 0; i < 24; i++) {
+    for (size_t i = 0; i < MAX_SHELL_ACTIONS; i++) {
         if (ctx->hActionBtns[i]) {
             DestroyWindow(ctx->hActionBtns[i]);
             ctx->hActionBtns[i] = NULL;
@@ -516,7 +516,7 @@ static void LoadPaletteForFiles(GuiContext* ctx)
         ReadTextFile(iniPath, iniContent);
     }
 
-    MenuItemDef items[24];
+    MenuItemDef items[MAX_SHELL_ACTIONS];
     size_t count = ParseIniSection(iniContent.c_str(), section, items, ARRAYSIZE(items));
 
     if (count == 0 && iniContent.length() == 0) {
@@ -527,7 +527,7 @@ static void LoadPaletteForFiles(GuiContext* ctx)
 
     // Create buttons for non-separator items
     size_t btnIndex = 0;
-    for (size_t i = 0; i < count && btnIndex < 24; i++) {
+    for (size_t i = 0; i < count && btnIndex < MAX_SHELL_ACTIONS; i++) {
         if (items[i].iconIndex == -1 || items[i].title[0] == L'\0') {
             continue;
         }
@@ -676,6 +676,284 @@ static void ReturnToPalette(GuiContext* ctx)
 }
 
 // -----------------------------------------------------------------------------
+// Interactive Parameter Prompt (InputBox)
+// -----------------------------------------------------------------------------
+
+#define ID_IB_EDIT 1001
+
+struct InputBoxParams {
+    const wchar_t* title;
+    const wchar_t* prompt;
+    const wchar_t* defVal;
+    wchar_t outVal[512];
+    bool isPassword;
+    HFONT hFont;
+    int dpi;
+    bool okPressed;
+};
+
+static LRESULT CALLBACK InputBoxWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    InputBoxParams* p = (InputBoxParams*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_CREATE: {
+        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+        p = (InputBoxParams*)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)p);
+
+        int dpi = p->dpi;
+        int m = MulDiv(14, dpi, 96);
+        int w = MulDiv(400, dpi, 96);
+        int promptH = MulDiv(34, dpi, 96);
+        int editH = MulDiv(24, dpi, 96);
+        int btnW = MulDiv(80, dpi, 96);
+        int btnH = MulDiv(26, dpi, 96);
+
+        HWND hPrompt = CreateWindowExW(0, L"STATIC", p->prompt,
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            m, m, w - m * 2, promptH, hwnd, NULL, cs->hInstance, NULL);
+        if (p->hFont) SendMessageW(hPrompt, WM_SETFONT, (WPARAM)p->hFont, TRUE);
+
+        DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL;
+        if (p->isPassword) editStyle |= ES_PASSWORD;
+
+        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", p->defVal ? p->defVal : L"",
+            editStyle,
+            m, m + promptH + MulDiv(4, dpi, 96), w - m * 2, editH, hwnd, (HMENU)(INT_PTR)ID_IB_EDIT, cs->hInstance, NULL);
+        if (p->hFont) SendMessageW(hEdit, WM_SETFONT, (WPARAM)p->hFont, TRUE);
+        SendMessageW(hEdit, EM_SETSEL, 0, -1);
+        SetFocus(hEdit);
+
+        int btnY = m + promptH + editH + MulDiv(14, dpi, 96);
+
+        HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            w - m - btnW * 2 - MulDiv(8, dpi, 96), btnY, btnW, btnH, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
+        if (p->hFont) SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)p->hFont, TRUE);
+
+        HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            w - m - btnW, btnY, btnW, btnH, hwnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
+        if (p->hFont) SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)p->hFont, TRUE);
+
+        return 0;
+    }
+
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDOK) {
+            if (p) {
+                HWND hEdit = GetDlgItem(hwnd, ID_IB_EDIT);
+                GetWindowTextW(hEdit, p->outVal, ARRAYSIZE(p->outVal));
+                p->okPressed = true;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        } else if (id == IDCANCEL) {
+            if (p) p->okPressed = false;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_CLOSE: {
+        if (p) p->okPressed = false;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static bool ShowInputBox(HWND hwndOwner, const wchar_t* title, const wchar_t* prompt, const wchar_t* defVal, wchar_t* outVal, size_t maxLen, bool isPassword, HFONT hFont, int dpi)
+{
+    static bool s_classRegistered = false;
+    HINSTANCE hInst = (HINSTANCE)GetModuleHandleW(NULL);
+    const wchar_t* IB_CLASS = L"BpdfInputBox";
+
+    if (!s_classRegistered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = InputBoxWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = IB_CLASS;
+        RegisterClassExW(&wc);
+        s_classRegistered = true;
+    }
+
+    InputBoxParams params;
+    params.title = title ? title : L"bpdf";
+    params.prompt = prompt ? prompt : L"";
+    params.defVal = defVal ? defVal : L"";
+    params.outVal[0] = L'\0';
+    params.isPassword = isPassword;
+    params.hFont = hFont;
+    params.dpi = (dpi > 0) ? dpi : 96;
+    params.okPressed = false;
+
+    int clientW = MulDiv(400, params.dpi, 96);
+    int clientH = MulDiv(135, params.dpi, 96);
+
+    RECT rc = { 0, 0, clientW, clientH };
+    DWORD dwStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    DWORD dwExStyle = WS_EX_DLGMODALFRAME;
+    AdjustWindowRectEx(&rc, dwStyle, FALSE, dwExStyle);
+
+    int winW = rc.right - rc.left;
+    int winH = rc.bottom - rc.top;
+
+    int posX = (GetSystemMetrics(SM_CXSCREEN) - winW) / 2;
+    int posY = (GetSystemMetrics(SM_CYSCREEN) - winH) / 2;
+
+    if (hwndOwner && IsWindowVisible(hwndOwner)) {
+        RECT parentRc;
+        GetWindowRect(hwndOwner, &parentRc);
+        posX = parentRc.left + ((parentRc.right - parentRc.left) - winW) / 2;
+        posY = parentRc.top + ((parentRc.bottom - parentRc.top) - winH) / 2;
+    }
+
+    HWND hDlg = CreateWindowExW(
+        dwExStyle,
+        IB_CLASS,
+        params.title,
+        dwStyle,
+        posX, posY, winW, winH,
+        hwndOwner,
+        NULL,
+        hInst,
+        &params
+    );
+
+    if (!hDlg) return false;
+
+    if (hwndOwner) EnableWindow(hwndOwner, FALSE);
+
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            params.okPressed = false;
+            DestroyWindow(hDlg);
+            break;
+        }
+        if (!IsDialogMessageW(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (hwndOwner) {
+        EnableWindow(hwndOwner, TRUE);
+        SetForegroundWindow(hwndOwner);
+    }
+
+    if (params.okPressed) {
+        lstrcpynW(outVal, params.outVal, (int)maxLen);
+        return true;
+    }
+    return false;
+}
+
+static bool ResolveCommandPrompts(HWND hwndOwner, const wchar_t* actionTitle, const wchar_t* inCmd, StrW& outCmd, HFONT hFont, int dpi)
+{
+    outCmd.clear();
+    if (!inCmd || !inCmd[0]) return true;
+
+    const wchar_t* p = inCmd;
+    while (*p) {
+        const wchar_t* askTag = wcsstr(p, L"{ask:");
+        const wchar_t* askPassTag = wcsstr(p, L"{ask_pass:");
+
+        const wchar_t* startTag = NULL;
+        bool isPass = false;
+        size_t tagPrefixLen = 0;
+
+        if (askTag && askPassTag) {
+            if (askTag < askPassTag) {
+                startTag = askTag;
+                tagPrefixLen = 5;
+            } else {
+                startTag = askPassTag;
+                isPass = true;
+                tagPrefixLen = 10;
+            }
+        } else if (askTag) {
+            startTag = askTag;
+            tagPrefixLen = 5;
+        } else if (askPassTag) {
+            startTag = askPassTag;
+            isPass = true;
+            tagPrefixLen = 10;
+        }
+
+        if (!startTag) {
+            outCmd.append(p);
+            break;
+        }
+
+        outCmd.append(p, startTag - p);
+
+        const wchar_t* endTag = wcschr(startTag, L'}');
+        if (!endTag) {
+            outCmd.append(startTag);
+            break;
+        }
+
+        const wchar_t* content = startTag + tagPrefixLen;
+        size_t contentLen = endTag - content;
+
+        wchar_t promptBuf[256] = {0};
+        wchar_t defValBuf[256] = {0};
+
+        const wchar_t* sep = wcschr(content, L':');
+        if (sep && sep < endTag) {
+            size_t pLen = sep - content;
+            if (pLen >= ARRAYSIZE(promptBuf)) pLen = ARRAYSIZE(promptBuf) - 1;
+            wmemcpy(promptBuf, content, pLen);
+            promptBuf[pLen] = L'\0';
+
+            size_t dLen = endTag - (sep + 1);
+            if (dLen >= ARRAYSIZE(defValBuf)) dLen = ARRAYSIZE(defValBuf) - 1;
+            wmemcpy(defValBuf, sep + 1, dLen);
+            defValBuf[dLen] = L'\0';
+        } else {
+            size_t pLen = contentLen;
+            if (pLen >= ARRAYSIZE(promptBuf)) pLen = ARRAYSIZE(promptBuf) - 1;
+            wmemcpy(promptBuf, content, pLen);
+            promptBuf[pLen] = L'\0';
+        }
+
+        wchar_t userVal[512] = {0};
+        if (!ShowInputBox(hwndOwner, actionTitle, promptBuf, defValBuf, userVal, ARRAYSIZE(userVal), isPass, hFont, dpi)) {
+            return false;
+        }
+
+        const wchar_t* trimmedVal = Trim(userVal);
+        bool needsQuotes = (wcschr(trimmedVal, L' ') != NULL);
+        if (needsQuotes && outCmd.len > 0 && outCmd.data[outCmd.len - 1] == L'"') {
+            needsQuotes = false;
+        }
+        if (needsQuotes) {
+            outCmd.append(L"\"");
+            outCmd.append(trimmedVal);
+            outCmd.append(L"\"");
+        } else {
+            outCmd.append(trimmedVal);
+        }
+        p = endTag + 1;
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
 // Transition: Start an Action from Palette or Job
 // -----------------------------------------------------------------------------
 
@@ -696,6 +974,15 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item)
         }
     }
 
+    // Resolve any interactive {ask:...} or {ask_pass:...} prompts
+    StrW cmdWithPrompts;
+    if (!ResolveCommandPrompts(ctx->hwnd, item.title, item.cmd, cmdWithPrompts, ctx->hFontUi, ctx->dpi)) {
+        if (ctx->autoActionIndex >= 0 || ctx->hasCustomAction) {
+            PostMessageW(ctx->hwnd, WM_CLOSE, 0, 0);
+        }
+        return;
+    }
+
     // Clean up previous temporary manifest if one was created
     if (ctx->tempManifest[0]) {
         DeleteFileW(ctx->tempManifest);
@@ -713,7 +1000,7 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item)
 
     StrW expanded;
     bool hasFilePlaceholder = false;
-    ExpandCommand(item.cmd, fullPath.c_str(), dir.c_str(), name.c_str(), ext.c_str(), expanded, hasFilePlaceholder, exeDir);
+    ExpandCommand(cmdWithPrompts.c_str(), fullPath.c_str(), dir.c_str(), name.c_str(), ext.c_str(), expanded, hasFilePlaceholder, exeDir);
 
     wchar_t manifestPath[MAX_PATH * 2] = {0};
     StrW fullCmdLine;
@@ -913,7 +1200,42 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         ShowWindow(ctx->hBtnClose, SW_SHOW);
         LoadPaletteForFiles(ctx);
 
-        if (ctx->autoActionIndex >= 0 && (size_t)ctx->autoActionIndex < ctx->actionCount) {
+        if (ctx->hasCustomAction) {
+            if (ctx->files.empty()) {
+                wchar_t fileBuf[32768] = {0};
+                OPENFILENAMEW ofn = { sizeof(ofn) };
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.djvu;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
+                ofn.lpstrFile = fileBuf;
+                ofn.nMaxFile = ARRAYSIZE(fileBuf);
+                ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                ofn.lpstrTitle = L"Выберите файл(ы) для выполнения команды";
+
+                if (GetOpenFileNameW(&ofn)) {
+                    wchar_t* p = fileBuf;
+                    wchar_t* dir = p;
+                    p += wcslen(dir) + 1;
+                    if (*p == L'\0') {
+                        ctx->files.add(dir);
+                    } else {
+                        while (*p) {
+                            wchar_t full[MAX_PATH * 2];
+                            wnsprintfW(full, ARRAYSIZE(full), L"%s\\%s", dir, p);
+                            ctx->files.add(full);
+                            p += wcslen(p) + 1;
+                        }
+                    }
+                } else {
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+            }
+            StartActionExecution(ctx, ctx->customAction);
+            if (ctx->customAction.guiMode == GUI_NONE) {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                return 0;
+            }
+        } else if (ctx->autoActionIndex >= 0 && (size_t)ctx->autoActionIndex < ctx->actionCount) {
             MenuItemDef item = ctx->actionDefs[ctx->autoActionIndex];
             StartActionExecution(ctx, item);
             if (item.guiMode == GUI_NONE) {
@@ -1055,7 +1377,7 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int id = LOWORD(wParam);
 
         // Click on Action Button in Palette mode
-        if (id >= ID_ACTION_BASE && id < ID_ACTION_BASE + 24 && ctx && ctx->state == STATE_PALETTE) {
+        if (id >= ID_ACTION_BASE && id < ID_ACTION_BASE + MAX_SHELL_ACTIONS && ctx && ctx->state == STATE_PALETTE) {
             size_t idx = id - ID_ACTION_BASE;
             if (idx < ctx->actionCount) {
                 StartActionExecution(ctx, ctx->actionDefs[idx]);
@@ -1178,6 +1500,48 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 // Entry Point (wWinMain)
 // -----------------------------------------------------------------------------
 
+static bool IsBpdfCommand(const wchar_t* s)
+{
+    if (!s) return false;
+    static const wchar_t* const cmds[] = {
+        L"merge", L"ocr", L"strip", L"split", L"extract",
+        L"info", L"rotate", L"resize", L"text", L"stamp",
+        L"optimize", L"convert", L"number", L"watermark",
+        L"protect", L"unlock", L"metadata", L"doctor"
+    };
+    for (size_t i = 0; i < ARRAYSIZE(cmds); i++) {
+        if (StrCmpIW(s, cmds[i]) == 0) return true;
+    }
+    return false;
+}
+
+static int GetDefaultIconForCommand(const wchar_t* cmd)
+{
+    if (!cmd) return 0;
+    while (*cmd == L' ' || *cmd == L'\t') cmd++;
+    if (_wcsnicmp(cmd, L"merge", 5) == 0) return 1;
+    if (_wcsnicmp(cmd, L"ocr", 3) == 0) {
+        if (wcsstr(cmd, L"windows")) return 17;
+        return 2;
+    }
+    if (_wcsnicmp(cmd, L"strip", 5) == 0) return 3;
+    if (_wcsnicmp(cmd, L"split", 5) == 0) return 4;
+    if (_wcsnicmp(cmd, L"extract", 7) == 0) return 5;
+    if (_wcsnicmp(cmd, L"info", 4) == 0) return 6;
+    if (_wcsnicmp(cmd, L"rotate", 6) == 0) return 7;
+    if (_wcsnicmp(cmd, L"resize", 6) == 0) return 8;
+    if (_wcsnicmp(cmd, L"text", 4) == 0) return 9;
+    if (_wcsnicmp(cmd, L"stamp", 5) == 0) return 11;
+    if (_wcsnicmp(cmd, L"optimize", 8) == 0) return 12;
+    if (_wcsnicmp(cmd, L"metadata", 8) == 0) return 13;
+    if (_wcsnicmp(cmd, L"convert", 7) == 0) return 14;
+    if (_wcsnicmp(cmd, L"number", 6) == 0) return 15;
+    if (_wcsnicmp(cmd, L"watermark", 9) == 0) return 16;
+    if (_wcsnicmp(cmd, L"protect", 7) == 0) return 18;
+    if (_wcsnicmp(cmd, L"unlock", 6) == 0) return 19;
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
@@ -1193,42 +1557,186 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 
     int autoActionIndex = -1;
-    wchar_t manifestPath[MAX_PATH * 2] = {0};
+    wchar_t tempManifestToDelete[MAX_PATH * 2] = {0};
+    StrW customCmd;
+    StrW customTitle;
+    int customIcon = -1;
+    GuiMode customGuiMode = GUI_AUTO;
+    bool hasCustomGuiMode = false;
+    int cmdStartIndex = -1;
 
     if (argv && argc >= 2) {
+        // Quick help dialog
         for (int i = 1; i < argc; i++) {
-            if ((StrCmpIW(argv[i], L"--manifest") == 0 || StrCmpIW(argv[i], L"--palette") == 0) && i + 1 < argc) {
-                lstrcpynW(manifestPath, argv[i + 1], ARRAYSIZE(manifestPath));
-                i++;
-            } else if (StrCmpIW(argv[i], L"--item") == 0 && i + 1 < argc) {
-                autoActionIndex = _wtoi(argv[i + 1]);
-                i++;
-            } else if (argv[i][0] != L'-') {
+            if (StrCmpIW(argv[i], L"--help") == 0 || StrCmpIW(argv[i], L"-h") == 0 || StrCmpW(argv[i], L"/?") == 0) {
+                MessageBoxW(
+                    NULL,
+                    L"bpdf-gui — Графический интерфейс действий и прогресса для bpdf\n\n"
+                    L"Использование:\n"
+                    L"  bpdf-gui.exe [файлы / @список] [команда] [параметры]\n"
+                    L"  bpdf-gui.exe [файлы] --cmd \"команда [параметры]\"\n"
+                    L"  bpdf-gui.exe --item <номер> [файлы / @список]\n"
+                    L"  bpdf-gui.exe [файлы / @список]  (открывает палитру)\n\n"
+                    L"Примеры:\n"
+                    L"  bpdf-gui.exe doc.pdf rotate -a {ask:Угол:90} -i\n"
+                    L"  bpdf-gui.exe @filelist.txt merge --optimize -s A4 -o merged.pdf\n"
+                    L"  bpdf-gui.exe doc.pdf watermark \"{file}\" \"{ask:Текст:КОПИЯ}\" --angle 45 -i\n"
+                    L"  bpdf-gui.exe doc.pdf optimize -i\n\n"
+                    L"Параметры диалогов в командах:\n"
+                    L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
+                    L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками\n\n"
+                    L"Кнопки Total Commander:\n"
+                    L"  Команда:    bpdf-gui.exe\n"
+                    L"  Параметры:  %P%N rotate -a {ask:Угол поворота (90, 180, 270, portrait):90} -i\n"
+                    L"  Для пачки:  @%WL merge --optimize -s A4 -o \"%P{ask:Имя файла:merged.pdf}\"",
+                    L"bpdf-gui",
+                    MB_OK | MB_ICONINFORMATION
+                );
+                LocalFree(argv);
+                return 0;
+            }
+        }
+
+        for (int i = 1; i < argc; i++) {
+            if (StrCmpIW(argv[i], L"--item") == 0 && i + 1 < argc) {
+                autoActionIndex = _wtoi(argv[++i]);
+            } else if (StrCmpIW(argv[i], L"--cmd") == 0 && i + 1 < argc) {
+                customCmd.assign(argv[++i]);
+            } else if (StrCmpIW(argv[i], L"--exec") == 0 && i + 1 < argc) {
+                customCmd.assign(argv[++i]);
+            } else if (StrCmpIW(argv[i], L"--title") == 0 && i + 1 < argc) {
+                customTitle.assign(argv[++i]);
+            } else if (StrCmpIW(argv[i], L"--icon") == 0 && i + 1 < argc) {
+                customIcon = _wtoi(argv[++i]);
+            } else if (StrCmpIW(argv[i], L"--gui") == 0 && i + 1 < argc) {
+                hasCustomGuiMode = true;
+                const wchar_t* mode = argv[++i];
+                if (StrCmpIW(mode, L"info") == 0) customGuiMode = GUI_INFO;
+                else if (StrCmpIW(mode, L"keep") == 0) customGuiMode = GUI_KEEP;
+                else if (StrCmpIW(mode, L"none") == 0) customGuiMode = GUI_NONE;
+                else customGuiMode = GUI_AUTO;
+            } else if (StrCmpW(argv[i], L"--") == 0) {
+                cmdStartIndex = i + 1;
+                break;
+            } else if (argv[i][0] == L'@') {
+                const wchar_t* listPath = argv[i] + 1;
+                StrW listText;
+                if (ReadTextFile(listPath, listText)) {
+                    wchar_t* p = listText.data;
+                    while (p && *p) {
+                        wchar_t* nl = wcschr(p, L'\n');
+                        if (nl) { *nl = L'\0'; nl++; }
+                        wchar_t* t = Trim(p);
+                        if (*t) ctx.files.add(t);
+                        p = nl;
+                    }
+                }
+                wchar_t tempDir[MAX_PATH] = {0};
+                GetTempPathW(ARRAYSIZE(tempDir), tempDir);
+                if (wcsstr(listPath, tempDir) && wcsstr(listPath, L"bpdf")) {
+                    lstrcpynW(tempManifestToDelete, listPath, ARRAYSIZE(tempManifestToDelete));
+                }
+            } else if (IsBpdfCommand(argv[i]) || argv[i][0] == L'-' || wcsstr(argv[i], L"{ask:") || wcsstr(argv[i], L"{ask_pass:")) {
+                cmdStartIndex = i;
+                break;
+            } else {
                 ctx.files.add(argv[i]);
+            }
+        }
+
+        // If an inline command was detected
+        if (cmdStartIndex >= 0 && customCmd.empty()) {
+            int cmdEndIndex = argc;
+            // If no files were provided before the command, check trailing arguments for files
+            if (ctx.files.empty()) {
+                while (cmdEndIndex > cmdStartIndex) {
+                    const wchar_t* lastArg = argv[cmdEndIndex - 1];
+                    if (lastArg[0] == L'@') {
+                        const wchar_t* listPath = lastArg + 1;
+                        StrW listText;
+                        if (ReadTextFile(listPath, listText)) {
+                            wchar_t* p = listText.data;
+                            while (p && *p) {
+                                wchar_t* nl = wcschr(p, L'\n');
+                                if (nl) { *nl = L'\0'; nl++; }
+                                wchar_t* t = Trim(p);
+                                if (*t) ctx.files.add(t);
+                                p = nl;
+                            }
+                        }
+                        cmdEndIndex--;
+                    } else if (lastArg[0] != L'-' && !wcsstr(lastArg, L"{ask") && (GetFileAttributesW(lastArg) != INVALID_FILE_ATTRIBUTES || wcschr(lastArg, L'.') != NULL)) {
+                        if (cmdEndIndex - 2 >= cmdStartIndex) {
+                            const wchar_t* prev = argv[cmdEndIndex - 2];
+                            if (prev[0] == L'-') {
+                                break;
+                            }
+                        }
+                        ctx.files.add(lastArg);
+                        cmdEndIndex--;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            for (int i = cmdStartIndex; i < cmdEndIndex; i++) {
+                if (!customCmd.empty()) customCmd.append(L" ");
+                const wchar_t* arg = argv[i];
+                if (wcschr(arg, L' ') != NULL && arg[0] != L'"') {
+                    customCmd.append(L"\"");
+                    customCmd.append(arg);
+                    customCmd.append(L"\"");
+                } else {
+                    customCmd.append(arg);
+                }
             }
         }
     }
     if (argv) LocalFree(argv);
 
-    if (manifestPath[0]) {
-        lstrcpynW(ctx.initialManifest, manifestPath, ARRAYSIZE(ctx.initialManifest));
-        StrW manifestText;
-        if (ReadTextFile(manifestPath, manifestText)) {
-            wchar_t* p = manifestText.data;
-            while (p && *p) {
-                wchar_t* nl = wcschr(p, L'\n');
-                if (nl) { *nl = L'\0'; nl++; }
-                wchar_t* t = Trim(p);
-                if (*t) ctx.files.add(t);
-                p = nl;
+    if (tempManifestToDelete[0]) {
+        DeleteFileW(tempManifestToDelete);
+    }
+
+    bool hasCustomAction = !customCmd.empty();
+    if (hasCustomAction) {
+        ctx.hasCustomAction = true;
+        lstrcpynW(ctx.customAction.cmd, customCmd.c_str(), ARRAYSIZE(ctx.customAction.cmd));
+
+        if (!customTitle.empty()) {
+            lstrcpynW(ctx.customAction.title, customTitle.c_str(), ARRAYSIZE(ctx.customAction.title));
+        } else {
+            wchar_t firstWord[64] = {0};
+            const wchar_t* p = customCmd.c_str();
+            while (*p == L' ' || *p == L'\t') p++;
+            size_t fwLen = 0;
+            while (p[fwLen] && p[fwLen] != L' ' && p[fwLen] != L'\t' && fwLen < ARRAYSIZE(firstWord) - 1) {
+                firstWord[fwLen] = p[fwLen];
+                fwLen++;
             }
+            firstWord[fwLen] = L'\0';
+            wnsprintfW(ctx.customAction.title, ARRAYSIZE(ctx.customAction.title), L"bpdf: %s", firstWord[0] ? firstWord : L"команда");
         }
-        DeleteFileW(manifestPath);
+
+        if (customIcon >= 0) {
+            ctx.customAction.iconIndex = customIcon;
+        } else {
+            ctx.customAction.iconIndex = GetDefaultIconForCommand(customCmd.c_str());
+        }
+
+        if (hasCustomGuiMode) {
+            ctx.customAction.guiMode = customGuiMode;
+        } else if (_wcsnicmp(customCmd.c_str(), L"info", 4) == 0) {
+            ctx.customAction.guiMode = GUI_INFO;
+        } else {
+            ctx.customAction.guiMode = GUI_AUTO;
+        }
     }
 
     ctx.autoActionIndex = autoActionIndex;
     ctx.state = STATE_PALETTE;
-    ctx.isPaletteSession = (autoActionIndex < 0);
+    ctx.isPaletteSession = (!hasCustomAction && autoActionIndex < 0);
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1240,7 +1748,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     RegisterClassExW(&wc);
 
     if (ctx.targetExe[0]) {
-        if (ctx.iconIndex >= 0) ExtractIconExW(ctx.targetExe, ctx.iconIndex, &ctx.hIcon, NULL, 1);
+        if (ctx.hasCustomAction && ctx.customAction.iconIndex >= 0) {
+            ExtractIconExW(ctx.targetExe, ctx.customAction.iconIndex, &ctx.hIcon, NULL, 1);
+        } else if (ctx.iconIndex >= 0) {
+            ExtractIconExW(ctx.targetExe, ctx.iconIndex, &ctx.hIcon, NULL, 1);
+        }
         if (!ctx.hIcon) ExtractIconExW(ctx.targetExe, 0, &ctx.hIcon, NULL, 1);
     }
 
@@ -1272,7 +1784,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     if (!hwnd) return 1;
 
-    if (!(ctx.autoActionIndex >= 0 && (size_t)ctx.autoActionIndex < ctx.actionCount && ctx.actionDefs[ctx.autoActionIndex].guiMode == GUI_NONE)) {
+    if (!(ctx.hasCustomAction && ctx.customAction.guiMode == GUI_NONE) &&
+        !(ctx.autoActionIndex >= 0 && (size_t)ctx.autoActionIndex < ctx.actionCount && ctx.actionDefs[ctx.autoActionIndex].guiMode == GUI_NONE)) {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }

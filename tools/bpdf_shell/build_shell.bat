@@ -53,16 +53,22 @@ echo Successfully built:
 echo   %OUT_DLL%
 echo   %OUT_GUI%
 
-set "DIST_SHELL=%~dp0..\..\dist\shell"
-if exist "%DIST_SHELL%" (
-  if exist "%DIST_SHELL%\bpdf_shell.dll" (
-    del /f /q "%DIST_SHELL%\bpdf_shell.dll.old*" 2>nul
-    move /y "%DIST_SHELL%\bpdf_shell.dll" "%DIST_SHELL%\bpdf_shell.dll.old" >nul 2>&1
+set "DIST_DIR=%~dp0..\..\dist"
+set "DIST_SHELL=%DIST_DIR%\shell"
+
+if exist "%DIST_DIR%" (
+  copy /y "%OUT_GUI%" "%DIST_DIR%\bpdf-gui.exe" >nul
+  echo Updated %DIST_DIR%\bpdf-gui.exe
+  if exist "%DIST_SHELL%" (
+    if exist "%DIST_SHELL%\bpdf_shell.dll" (
+      del /f /q "%DIST_SHELL%\bpdf_shell.dll.old*" 2>nul
+      move /y "%DIST_SHELL%\bpdf_shell.dll" "%DIST_SHELL%\bpdf_shell.dll.old" >nul 2>&1
+    )
+    copy /y "%OUT_DLL%" "%DIST_SHELL%\bpdf_shell.dll" >nul
+    copy /y "%~dp0bpdf_shell.ini" "%DIST_SHELL%\bpdf_shell.ini" >nul
+    del /f /q "%DIST_SHELL%\bpdf-gui.exe" 2>nul
+    echo Updated %DIST_SHELL%\bpdf_shell.dll and bpdf_shell.ini
   )
-  copy /y "%OUT_DLL%" "%DIST_SHELL%\bpdf_shell.dll" >nul
-  copy /y "%OUT_GUI%" "%DIST_SHELL%\bpdf-gui.exe" >nul
-  copy /y "%~dp0bpdf_shell.ini" "%DIST_SHELL%\bpdf_shell.ini" >nul
-  echo Updated %DIST_SHELL%\bpdf_shell.dll, bpdf-gui.exe and bpdf_shell.ini
 )
 
 exit /b 0

@@ -47,9 +47,11 @@ enum GuiMode {
     GUI_NONE = 3
 };
 
+#define MAX_SHELL_ACTIONS 32
+
 struct MenuItemDef {
-    wchar_t title[256];
-    wchar_t cmd[2048];
+    wchar_t title[128];
+    wchar_t cmd[512];
     int iconIndex; // -1 for separator
     GuiMode guiMode;
 
@@ -200,11 +202,6 @@ static inline FileKind ClassifyPath(const wchar_t* path)
     }
 
     return KIND_UNSUPPORTED;
-}
-
-static inline FileKind GetFileKind(const wchar_t* path)
-{
-    return ClassifyPath(path);
 }
 
 static inline void GetSectionForFiles(const WStringList& files, wchar_t* outSection, size_t maxLen)
@@ -573,6 +570,12 @@ static inline void SplitPathParts(const wchar_t* path, StrW& outFullPath, StrW& 
         outDir.clear();
         outName.clear();
         return;
+    }
+
+    wchar_t absBuf[MAX_PATH * 2] = {0};
+    if (GetFullPathNameW(path, ARRAYSIZE(absBuf), absBuf, NULL) > 0) {
+        path = absBuf;
+        outFullPath.assign(absBuf);
     }
 
     // Check if path is a drive root like "D:\" or "D:/"

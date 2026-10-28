@@ -84,7 +84,7 @@ if exist "%CD%\tools\bpdf_shell\bpdf_shell.dll" (
   )
   copy /y "%CD%\tools\bpdf_shell\bpdf_shell.ini" "%CD%\dist\shell\bpdf_shell.ini" >nul || goto :error
   if exist "%CD%\tools\bpdf_shell\bpdf-gui.exe" (
-    copy /y "%CD%\tools\bpdf_shell\bpdf-gui.exe" "%CD%\dist\shell\bpdf-gui.exe" >nul || goto :error
+    copy /y "%CD%\tools\bpdf_shell\bpdf-gui.exe" "%CD%\dist\bpdf-gui.exe" >nul || goto :error
   )
   copy /y "%CD%\tools\bpdf_shell\register.bat" "%CD%\dist\shell\register.bat" >nul || goto :error
   copy /y "%CD%\tools\bpdf_shell\unregister.bat" "%CD%\dist\shell\unregister.bat" >nul || goto :error
@@ -104,8 +104,8 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
   "$ErrorActionPreference = 'Stop'; $d = '%CD%\dist';" ^
   "$stage = Join-Path $env:TEMP ('bpdf_pkg_' + [Guid]::NewGuid().ToString());" ^
   "New-Item -ItemType Directory -Path (Join-Path $stage 'shell') -Force | Out-Null;" ^
-  "@('bpdf.exe', 'make_bar.bat', 'make_bar_en.bat', 'config.example.toml', 'README.md', 'README.en.md', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
-  "@('bpdf_shell.dll', 'bpdf-gui.exe', 'bpdf_shell.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
+  "@('bpdf.exe', 'bpdf-gui.exe', 'make_bar.bat', 'make_bar_en.bat', 'config.example.toml', 'README.md', 'README.en.md', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
+  "@('bpdf_shell.dll', 'bpdf_shell.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
   "Compress-Archive -Force -DestinationPath '%ZIP_FILE%' -Path (Join-Path $stage '*');" ^
   "Remove-Item -Recurse -Force $stage;"
 if errorlevel 1 goto :error

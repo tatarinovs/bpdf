@@ -14,33 +14,21 @@ static const wchar_t* CLSID_STRING = L"{B9DF0001-B000-4000-8000-000000000001}";
 
 static HINSTANCE g_hInst = NULL;
 static LONG g_refCount = 0;
-static CRITICAL_SECTION g_csShell;
 
 static wchar_t g_cachedExePath[MAX_PATH * 2] = {0};
-static bool g_cachedExeValid = false;
-
-static wchar_t g_cachedIniPath[MAX_PATH * 2] = {0};
-static bool g_cachedIniFound = false;
-static FILETIME g_cachedIniWriteTime = {0, 0};
-static StrW g_cachedIniContent;
+static volatile LONG g_cachedExeSearched = 0;
 
 static bool GetCachedBpdfExe(wchar_t* outPath, size_t maxLen)
 {
-    EnterCriticalSection(&g_csShell);
-    if (g_cachedExeValid && GetFileAttributesW(g_cachedExePath) != INVALID_FILE_ATTRIBUTES) {
-        lstrcpynW(outPath, g_cachedExePath, (int)maxLen);
-        LeaveCriticalSection(&g_csShell);
-        return true;
+    if (InterlockedCompareExchange(&g_cachedExeSearched, 0, 0) == 0) {
+        wchar_t exe[MAX_PATH * 2] = {0};
+        if (FindBpdfExe(exe, ARRAYSIZE(exe), g_hInst)) {
+            lstrcpynW(g_cachedExePath, exe, ARRAYSIZE(g_cachedExePath));
+        }
+        InterlockedExchange(&g_cachedExeSearched, 1);
     }
-    LeaveCriticalSection(&g_csShell);
-
-    wchar_t exe[MAX_PATH * 2] = {0};
-    if (FindBpdfExe(exe, ARRAYSIZE(exe), g_hInst)) {
-        EnterCriticalSection(&g_csShell);
-        lstrcpynW(g_cachedExePath, exe, ARRAYSIZE(g_cachedExePath));
-        g_cachedExeValid = true;
-        lstrcpynW(outPath, exe, (int)maxLen);
-        LeaveCriticalSection(&g_csShell);
+    if (g_cachedExePath[0]) {
+        lstrcpynW(outPath, g_cachedExePath, (int)maxLen);
         return true;
     }
     return false;
@@ -48,42 +36,20 @@ static bool GetCachedBpdfExe(wchar_t* outPath, size_t maxLen)
 
 static size_t LoadMenuConfig(const wchar_t* targetSection, MenuItemDef* outItems, size_t maxItems)
 {
-    EnterCriticalSection(&g_csShell);
-    if (!g_cachedIniFound || GetFileAttributesW(g_cachedIniPath) == INVALID_FILE_ATTRIBUTES) {
-        g_cachedIniFound = FindBpdfIni(g_cachedIniPath, ARRAYSIZE(g_cachedIniPath), g_hInst);
-        g_cachedIniWriteTime.dwLowDateTime = 0;
-        g_cachedIniWriteTime.dwHighDateTime = 0;
-        g_cachedIniContent.clear();
+    wchar_t iniPath[MAX_PATH * 2] = {0};
+    StrW iniContent;
+    if (FindBpdfIni(iniPath, ARRAYSIZE(iniPath), g_hInst)) {
+        ReadTextFile(iniPath, iniContent);
     }
-
-    if (g_cachedIniFound) {
-        WIN32_FILE_ATTRIBUTE_DATA fad = {0};
-        if (GetFileAttributesExW(g_cachedIniPath, GetFileExInfoStandard, &fad)) {
-            if (fad.ftLastWriteTime.dwLowDateTime != g_cachedIniWriteTime.dwLowDateTime ||
-                fad.ftLastWriteTime.dwHighDateTime != g_cachedIniWriteTime.dwHighDateTime ||
-                g_cachedIniContent.length() == 0)
-            {
-                if (ReadTextFile(g_cachedIniPath, g_cachedIniContent)) {
-                    g_cachedIniWriteTime = fad.ftLastWriteTime;
-                }
-            }
-        }
-    }
-
-    size_t count = 0;
-    if (g_cachedIniContent.length() > 0) {
-        count = ParseIniSection(g_cachedIniContent.c_str(), targetSection, outItems, maxItems);
-    }
-    LeaveCriticalSection(&g_csShell);
-    return count;
+    if (iniContent.length() == 0) return 0;
+    return ParseIniSection(iniContent.c_str(), targetSection, outItems, maxItems);
 }
 
 // -----------------------------------------------------------------------------
-// Icon Caching & Bitmap Conversion
+// Icon Caching & Bitmap Conversion (Lock-free thread-safe)
 // -----------------------------------------------------------------------------
 
 static HBITMAP g_iconCache[32] = {0};
-static bool g_iconCacheInited[32] = {0};
 
 static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
 {
@@ -102,26 +68,27 @@ static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HDC hdcMem = CreateCompatibleDC(NULL);
+    if (!hdcMem) return NULL;
+
     void* pBits = NULL;
     HBITMAP hBmp = CreateDIBSection(hdcMem, &bi, DIB_RGB_COLORS, &pBits, NULL, 0);
 
     if (hBmp && pBits) {
         HGDIOBJ hOld = SelectObject(hdcMem, hBmp);
-        memset(pBits, 0, cx * cy * 4);
         DrawIconEx(hdcMem, 0, 0, hIcon, cx, cy, 0, NULL, DI_NORMAL);
 
         DWORD* pPixels = (DWORD*)pBits;
         bool hasAlpha = false;
-        for (int i = 0; i < cx * cy; i++) {
+        int totalPixels = cx * cy;
+        for (int i = 0; i < totalPixels; i++) {
             if ((pPixels[i] & 0xFF000000) != 0) {
                 hasAlpha = true;
                 break;
             }
         }
         if (!hasAlpha) {
-            for (int i = 0; i < cx * cy; i++) {
+            for (int i = 0; i < totalPixels; i++) {
                 if ((pPixels[i] & 0x00FFFFFF) != 0) {
                     pPixels[i] |= 0xFF000000;
                 }
@@ -131,20 +98,16 @@ static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
     }
 
     DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
     return hBmp;
 }
 
-static HBITMAP GetCachedMenuIcon(const wchar_t* exePath, int iconIndex)
+static HBITMAP GetCachedMenuIcon(int iconIndex)
 {
-    if (iconIndex < 0 || iconIndex >= 32 || !exePath || !exePath[0]) return NULL;
+    if (iconIndex < 0 || iconIndex >= 32) return NULL;
+    if (g_iconCache[iconIndex]) return g_iconCache[iconIndex];
 
-    EnterCriticalSection(&g_csShell);
-    if (g_iconCacheInited[iconIndex]) {
-        HBITMAP hBmp = g_iconCache[iconIndex];
-        LeaveCriticalSection(&g_csShell);
-        return hBmp;
-    }
+    wchar_t exePath[MAX_PATH * 2] = {0};
+    if (!GetCachedBpdfExe(exePath, ARRAYSIZE(exePath))) return NULL;
 
     HICON hSmall = NULL;
     HBITMAP hBmp = NULL;
@@ -153,23 +116,22 @@ static HBITMAP GetCachedMenuIcon(const wchar_t* exePath, int iconIndex)
         DestroyIcon(hSmall);
     }
 
-    g_iconCache[iconIndex] = hBmp;
-    g_iconCacheInited[iconIndex] = true;
-    LeaveCriticalSection(&g_csShell);
+    if (hBmp) {
+        HBITMAP prev = (HBITMAP)InterlockedCompareExchangePointer((PVOID*)&g_iconCache[iconIndex], hBmp, NULL);
+        if (prev) {
+            DeleteObject(hBmp);
+            return prev;
+        }
+    }
     return hBmp;
 }
 
 static void ClearIconCache()
 {
-    EnterCriticalSection(&g_csShell);
     for (int i = 0; i < 32; i++) {
-        if (g_iconCache[i]) {
-            DeleteObject(g_iconCache[i]);
-            g_iconCache[i] = NULL;
-        }
-        g_iconCacheInited[i] = false;
+        HBITMAP h = (HBITMAP)InterlockedExchangePointer((PVOID*)&g_iconCache[i], NULL);
+        if (h) DeleteObject(h);
     }
-    LeaveCriticalSection(&g_csShell);
 }
 
 // -----------------------------------------------------------------------------
@@ -201,9 +163,12 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
     StrW guiCmd;
     guiCmd.append(L"\"");
     guiCmd.append(guiExe);
-    guiCmd.append(L"\" --manifest \"");
-    guiCmd.append(manifestPath);
-    guiCmd.append(L"\"");
+    guiCmd.append(L"\" ");
+
+    StrW atManifest;
+    atManifest.append(L"@");
+    atManifest.append(manifestPath);
+    AppendQuotedArg(guiCmd, atManifest.c_str());
 
     if (itemIndex >= 0) {
         wchar_t numBuf[32];
@@ -232,11 +197,10 @@ class CBpdfContextMenu final : public IShellExtInit, public IContextMenu
 private:
     LONG m_refCount;
     WStringList m_files;
-    MenuItemDef m_items[48];
-    size_t m_itemCount;
+    UINT m_actionCount;
 
 public:
-    CBpdfContextMenu() : m_refCount(1), m_itemCount(0)
+    CBpdfContextMenu() : m_refCount(1), m_actionCount(0)
     {
         InterlockedIncrement(&g_refCount);
     }
@@ -283,23 +247,16 @@ public:
             if (SUCCEEDED(pdtobj->GetData(&fmt, &stg))) {
                 HDROP hDrop = (HDROP)stg.hGlobal;
                 UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+                wchar_t path[MAX_PATH * 2];
                 for (UINT i = 0; i < count; i++) {
-                    UINT len = DragQueryFileW(hDrop, i, NULL, 0);
-                    if (len > 0) {
-                        wchar_t* path = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
-                        if (path) {
-                            if (DragQueryFileW(hDrop, i, path, len + 1) > 0) {
-                                m_files.add(path);
-                            }
-                            free(path);
-                        }
+                    if (DragQueryFileW(hDrop, i, path, ARRAYSIZE(path)) > 0) {
+                        m_files.add(path);
                     }
                 }
                 ReleaseStgMedium(&stg);
             }
-        }
-        if (m_files.empty() && pidlFolder) {
-            wchar_t folderPath[MAX_PATH * 4] = {0};
+        } else if (pidlFolder) {
+            wchar_t folderPath[MAX_PATH * 2] = {0};
             if (SHGetPathFromIDListW(pidlFolder, folderPath)) {
                 m_files.add(folderPath);
             }
@@ -314,30 +271,24 @@ public:
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        FileKind firstKind = ClassifyPath(m_files[0]);
-        bool anySupported = (firstKind != KIND_UNSUPPORTED);
-        if (!anySupported) {
-            for (size_t i = 1; i < m_files.size(); i++) {
-                if (ClassifyPath(m_files[i]) != KIND_UNSUPPORTED) {
-                    anySupported = true;
-                    break;
-                }
+        bool anySupported = false;
+        size_t checkCount = m_files.size() < 32 ? m_files.size() : 32;
+        for (size_t i = 0; i < checkCount; i++) {
+            if (ClassifyPath(m_files[i]) != KIND_UNSUPPORTED) {
+                anySupported = true;
+                break;
             }
         }
         if (!anySupported) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        wchar_t exePath[MAX_PATH * 2] = {0};
-        GetCachedBpdfExe(exePath, ARRAYSIZE(exePath));
-
         wchar_t targetSection[64] = {0};
         GetSectionForFiles(m_files, targetSection, ARRAYSIZE(targetSection));
 
-        m_itemCount = LoadMenuConfig(targetSection, m_items, ARRAYSIZE(m_items));
-
-        UINT totalCommands = (UINT)m_itemCount;
-        if (idCmdFirst + totalCommands + 1 > idCmdLast) {
+        MenuItemDef items[32];
+        size_t totalItems = LoadMenuConfig(targetSection, items, ARRAYSIZE(items));
+        if (totalItems == 0) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
@@ -346,36 +297,40 @@ public:
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        HBITMAP hLogoBmp = GetCachedMenuIcon(exePath, 0);
+        UINT actionIndex = 0;
+        for (size_t i = 0; i < totalItems; i++) {
+            MENUITEMINFOW mii = { sizeof(mii) };
+            if (items[i].iconIndex == -1 || items[i].title[0] == L'\0') {
+                mii.fMask = MIIM_FTYPE;
+                mii.fType = MFT_SEPARATOR;
+            } else {
+                mii.fMask = MIIM_STRING | MIIM_ID;
+                mii.wID = idCmdFirst + actionIndex;
+                mii.dwTypeData = items[i].title;
 
-        if (m_itemCount > 0) {
-            for (size_t i = 0; i < m_itemCount; i++) {
-                MENUITEMINFOW mii = { sizeof(mii) };
-                if (m_items[i].iconIndex == -1) {
-                    mii.fMask = MIIM_FTYPE;
-                    mii.fType = MFT_SEPARATOR;
-                } else {
-                    mii.fMask = MIIM_STRING | MIIM_ID;
-                    mii.wID = idCmdFirst + (UINT)(i);
-                    mii.dwTypeData = m_items[i].title;
-
-                    HBITMAP hBmp = GetCachedMenuIcon(exePath, m_items[i].iconIndex);
-                    if (hBmp) {
-                        mii.fMask |= MIIM_BITMAP;
-                        mii.hbmpItem = hBmp;
-                    }
+                HBITMAP hBmp = GetCachedMenuIcon(items[i].iconIndex);
+                if (hBmp) {
+                    mii.fMask |= MIIM_BITMAP;
+                    mii.hbmpItem = hBmp;
                 }
-                InsertMenuItemW(hSubMenu, (UINT)(i), TRUE, &mii);
+                actionIndex++;
             }
+            InsertMenuItemW(hSubMenu, (UINT)i, TRUE, &mii);
         }
 
-        // Parent cascaded menu item
+        m_actionCount = actionIndex;
+        if (idCmdFirst + m_actionCount > idCmdLast + 1) {
+            DestroyMenu(hSubMenu);
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+        }
+
+        // Parent cascaded menu item (pure submenu, no command ID)
         MENUITEMINFOW parentMii = { sizeof(parentMii) };
-        parentMii.fMask = MIIM_STRING | MIIM_SUBMENU | MIIM_ID;
-        parentMii.wID = idCmdFirst + totalCommands;
+        parentMii.fMask = MIIM_STRING | MIIM_SUBMENU;
         parentMii.hSubMenu = hSubMenu;
         parentMii.dwTypeData = const_cast<LPWSTR>(L"bpdf");
 
+        HBITMAP hLogoBmp = GetCachedMenuIcon(0);
         if (hLogoBmp) {
             parentMii.fMask |= MIIM_BITMAP;
             parentMii.hbmpItem = hLogoBmp;
@@ -386,27 +341,16 @@ public:
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, (ULONG)(totalCommands + 1));
+        return MAKE_HRESULT(SEVERITY_SUCCESS, 0, (ULONG)m_actionCount);
     }
 
     STDMETHODIMP InvokeCommand(LPCMINVOKECOMMANDINFO pici) override
     {
-        if (!pici) return E_POINTER;
-        if (!IS_INTRESOURCE(pici->lpVerb)) return E_FAIL;
+        if (!pici || !IS_INTRESOURCE(pici->lpVerb)) return E_FAIL;
 
         UINT verbOffset = LOWORD(pici->lpVerb);
-        UINT parentVerb = (m_itemCount > 0) ? (UINT)(m_itemCount) : 0;
-        HWND hwndOwner = pici->hwnd;
-
-        // Clicked individual action
-        if (m_itemCount > 0 && verbOffset < m_itemCount) {
-            size_t idx = verbOffset;
-            if (m_items[idx].iconIndex != -1) {
-                LaunchGui(m_files, (int)idx, hwndOwner);
-                return S_OK;
-            }
-        } else if (verbOffset == parentVerb) {
-            LaunchGui(m_files, -1, hwndOwner);
+        if (verbOffset < m_actionCount) {
+            LaunchGui(m_files, (int)verbOffset, pici->hwnd);
             return S_OK;
         }
 
@@ -488,11 +432,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hInst;
         DisableThreadLibraryCalls(hInst);
-        InitializeCriticalSection(&g_csShell);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (!lpReserved) {
             ClearIconCache();
-            DeleteCriticalSection(&g_csShell);
         }
     }
     return TRUE;
@@ -568,4 +510,3 @@ STDAPI DllUnregisterServer(void)
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return S_OK;
 }
-
