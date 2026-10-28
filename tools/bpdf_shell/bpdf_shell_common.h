@@ -48,6 +48,7 @@ enum GuiMode {
 };
 
 #define MAX_SHELL_ACTIONS 32
+#define MAX_INI_ITEMS     64
 
 struct MenuItemDef {
     wchar_t title[128];
@@ -80,16 +81,20 @@ struct StrW {
         if (data) data[0] = L'\0';
     }
 
-    void reserve(size_t n) {
+    bool reserve(size_t n) {
         if (n + 1 > cap) {
-            cap = (n + 1 < 32) ? 32 : (n + 1) * 2;
-            data = (wchar_t*)realloc(data, cap * sizeof(wchar_t));
+            size_t newCap = (n + 1 < 32) ? 32 : (n + 1) * 2;
+            wchar_t* newData = (wchar_t*)realloc(data, newCap * sizeof(wchar_t));
+            if (!newData) return false;
+            data = newData;
+            cap = newCap;
         }
+        return true;
     }
 
     void assign(const wchar_t* s, size_t n) {
-        reserve(n);
-        wmemcpy(data, s, n);
+        if (!reserve(n)) return;
+        if (s && n > 0) wmemcpy(data, s, n);
         data[n] = L'\0';
         len = n;
     }
@@ -101,7 +106,7 @@ struct StrW {
 
     void append(const wchar_t* s, size_t n) {
         if (!s || n == 0) return;
-        reserve(len + n);
+        if (!reserve(len + n)) return;
         wmemcpy(data + len, s, n);
         len += n;
         data[len] = L'\0';
@@ -112,7 +117,7 @@ struct StrW {
     }
 
     void append(wchar_t c) {
-        reserve(len + 1);
+        if (!reserve(len + 1)) return;
         data[len++] = c;
         data[len] = L'\0';
     }
@@ -150,11 +155,19 @@ struct WStringList {
 
     void add(const wchar_t* str) {
         if (!str) return;
+        wchar_t* copy = _wcsdup(str);
+        if (!copy) return;
         if (count + 1 > cap) {
-            cap = (cap == 0) ? 8 : cap * 2;
-            items = (wchar_t**)realloc(items, cap * sizeof(wchar_t*));
+            size_t newCap = (cap == 0) ? 8 : cap * 2;
+            wchar_t** newItems = (wchar_t**)realloc(items, newCap * sizeof(wchar_t*));
+            if (!newItems) {
+                free(copy);
+                return;
+            }
+            items = newItems;
+            cap = newCap;
         }
-        items[count++] = _wcsdup(str);
+        items[count++] = copy;
     }
 
     size_t size() const { return count; }
@@ -189,13 +202,11 @@ static inline FileKind ClassifyPath(const wchar_t* path)
         const wchar_t* ext = dot + 1;
         if (StrCmpIW(ext, L"pdf") == 0) return KIND_PDF;
         if (MatchExt(ext, L".jpg.jpeg.png.webp.bmp.gif.tif.tiff.avif.heic.heif.cr2.nef.arw.dng.raf.")) return KIND_IMAGE;
-        if (MatchExt(ext, L".docx.xlsx.pptx.rtf.odt.ods.odp.doc.xls.ppt.")) return KIND_OTHER_SUPPORTED;
-        if (MatchExt(ext, L".html.htm.xhtml.svg.")) return KIND_OTHER_SUPPORTED;
-        if (MatchExt(ext, L".epub.fb2.htmlz.djvu.xps.oxps.cbz.")) return KIND_OTHER_SUPPORTED;
-        if (MatchExt(ext, L".txt.md.")) return KIND_OTHER_SUPPORTED;
+        if (MatchExt(ext, L".docx.xlsx.pptx.rtf.odt.ods.odp.doc.xls.ppt.html.htm.xhtml.svg.epub.fb2.htmlz.djvu.xps.oxps.cbz.txt.md.")) return KIND_OTHER_SUPPORTED;
+        return KIND_UNSUPPORTED;
     }
 
-    // Only if extension is absent or unknown, check if path is a directory (e.g. C:\Folder or Report.2024)
+    // Only if extension is absent, check if path is a directory (e.g. C:\Folder)
     DWORD attrs = GetFileAttributesW(path);
     if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         return KIND_DIRECTORY;
@@ -382,7 +393,7 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
     // Check UTF-16 LE BOM (FF FE)
     if (bytesRead >= 2 && (unsigned char)buf[0] == 0xFF && (unsigned char)buf[1] == 0xFE) {
         size_t charCount = (bytesRead - 2) / sizeof(wchar_t);
-        outText.reserve(charCount);
+        if (!outText.reserve(charCount)) { free(buf); return false; }
         wmemcpy(outText.data, (const wchar_t*)(buf + 2), charCount);
         outText.data[charCount] = L'\0';
         outText.len = charCount;
@@ -398,11 +409,10 @@ static inline bool ReadTextFile(const wchar_t* path, StrW& outText)
     int wLen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf + offset, (int)bytesRead - offset, NULL, 0);
     if (wLen <= 0) {
         wLen = MultiByteToWideChar(CP_ACP, 0, buf + offset, (int)bytesRead - offset, NULL, 0);
-        if (wLen <= 0) { free(buf); return false; }
-        outText.reserve(wLen);
+        if (wLen <= 0 || !outText.reserve(wLen)) { free(buf); return false; }
         MultiByteToWideChar(CP_ACP, 0, buf + offset, (int)bytesRead - offset, outText.data, wLen);
     } else {
-        outText.reserve(wLen);
+        if (!outText.reserve(wLen)) { free(buf); return false; }
         MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, buf + offset, (int)bytesRead - offset, outText.data, wLen);
     }
     outText.data[wLen] = L'\0';
@@ -450,7 +460,10 @@ static inline void ParseItemFields(const wchar_t* line, MenuItemDef& item)
 
             if (StrCmpIW(key, L"title") == 0) lstrcpynW(item.title, val, ARRAYSIZE(item.title));
             else if (StrCmpIW(key, L"cmd") == 0) lstrcpynW(item.cmd, val, ARRAYSIZE(item.cmd));
-            else if (StrCmpIW(key, L"icon") == 0) item.iconIndex = StrToIntW(val);
+            else if (StrCmpIW(key, L"icon") == 0) {
+                int idx = StrToIntW(val);
+                item.iconIndex = (idx < 0) ? 0 : idx;
+            }
             else if (StrCmpIW(key, L"gui") == 0) {
                 if (StrCmpIW(val, L"info") == 0) item.guiMode = GUI_INFO;
                 else if (StrCmpIW(val, L"keep") == 0) item.guiMode = GUI_KEEP;
@@ -549,15 +562,26 @@ static inline void SanitizePathForQuotes(StrW& str)
     }
 }
 
-// Аргумент в кавычках: хвостовые '\' перед закрывающей кавычкой удваиваются (канон Windows CommandLineToArgvW)
+// Аргумент в кавычках: внутренние '"' экранируются, хвостовые '\' перед закрывающей кавычкой удваиваются
 static inline void AppendQuotedArg(StrW& out, const wchar_t* s)
 {
     if (!s) return;
-    size_t n = wcslen(s), tail = 0;
-    while (tail < n && s[n - 1 - tail] == L'\\') tail++;
     out.append(L'"');
-    out.append(s, n);
-    for (size_t i = 0; i < tail; i++) out.append(L'\\');
+    size_t bsCount = 0;
+    for (const wchar_t* p = s; *p; ++p) {
+        if (*p == L'\\') {
+            bsCount++;
+            out.append(L'\\');
+        } else if (*p == L'"') {
+            for (size_t i = 0; i < bsCount; i++) out.append(L'\\');
+            bsCount = 0;
+            out.append(L"\\\"");
+        } else {
+            bsCount = 0;
+            out.append(*p);
+        }
+    }
+    for (size_t i = 0; i < bsCount; i++) out.append(L'\\');
     out.append(L'"');
 }
 
@@ -696,10 +720,10 @@ static inline void ExpandCommand(const wchar_t* pattern, const wchar_t* fullPath
 
 static inline bool CreateManifestFile(const WStringList& files, wchar_t* outPath, size_t maxLen)
 {
-    wchar_t tempDir[MAX_PATH] = {0};
+    wchar_t tempDir[MAX_PATH * 2] = {0};
     GetTempPathW(ARRAYSIZE(tempDir), tempDir);
 
-    wchar_t tempFile[MAX_PATH] = {0};
+    wchar_t tempFile[MAX_PATH * 2] = {0};
     if (!GetTempFileNameW(tempDir, L"bpdf", 0, tempFile)) return false;
 
     HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -739,8 +763,7 @@ static inline bool CreateManifestFile(const WStringList& files, wchar_t* outPath
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// Text Normalization (LF -> CRLF for multiline controls)
+// -----------------------------------------------------------------------------// Text Normalization (LF -> CRLF for multiline controls)
 // -----------------------------------------------------------------------------
 
 static inline wchar_t* NormalizeLineEndings(const wchar_t* src, int len, int& outLen)

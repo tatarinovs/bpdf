@@ -15,20 +15,50 @@ static const wchar_t* CLSID_STRING = L"{B9DF0001-B000-4000-8000-000000000001}";
 static HINSTANCE g_hInst = NULL;
 static LONG g_refCount = 0;
 
+// 0 = not searched, 1 = searching, 2 = ready
 static wchar_t g_cachedExePath[MAX_PATH * 2] = {0};
-static volatile LONG g_cachedExeSearched = 0;
+static volatile LONG g_cachedExeState = 0;
+
+static wchar_t g_cachedGuiPath[MAX_PATH * 2] = {0};
+static volatile LONG g_cachedGuiState = 0;
 
 static bool GetCachedBpdfExe(wchar_t* outPath, size_t maxLen)
 {
-    if (InterlockedCompareExchange(&g_cachedExeSearched, 0, 0) == 0) {
+    LONG state = InterlockedCompareExchange(&g_cachedExeState, 1, 0);
+    if (state == 0) {
         wchar_t exe[MAX_PATH * 2] = {0};
         if (FindBpdfExe(exe, ARRAYSIZE(exe), g_hInst)) {
             lstrcpynW(g_cachedExePath, exe, ARRAYSIZE(g_cachedExePath));
         }
-        InterlockedExchange(&g_cachedExeSearched, 1);
+        InterlockedExchange(&g_cachedExeState, 2);
+    } else if (state == 1) {
+        while (InterlockedCompareExchange(&g_cachedExeState, 1, 1) == 1) {
+            SwitchToThread();
+        }
     }
     if (g_cachedExePath[0]) {
         lstrcpynW(outPath, g_cachedExePath, (int)maxLen);
+        return true;
+    }
+    return false;
+}
+
+static bool GetCachedBpdfGui(wchar_t* outPath, size_t maxLen)
+{
+    LONG state = InterlockedCompareExchange(&g_cachedGuiState, 1, 0);
+    if (state == 0) {
+        wchar_t gui[MAX_PATH * 2] = {0};
+        if (FindBpdfGui(gui, ARRAYSIZE(gui), g_hInst)) {
+            lstrcpynW(g_cachedGuiPath, gui, ARRAYSIZE(g_cachedGuiPath));
+        }
+        InterlockedExchange(&g_cachedGuiState, 2);
+    } else if (state == 1) {
+        while (InterlockedCompareExchange(&g_cachedGuiState, 1, 1) == 1) {
+            SwitchToThread();
+        }
+    }
+    if (g_cachedGuiPath[0]) {
+        lstrcpynW(outPath, g_cachedGuiPath, (int)maxLen);
         return true;
     }
     return false;
@@ -49,7 +79,7 @@ static size_t LoadMenuConfig(const wchar_t* targetSection, MenuItemDef* outItems
 // Icon Caching & Bitmap Conversion (Lock-free thread-safe)
 // -----------------------------------------------------------------------------
 
-static HBITMAP g_iconCache[32] = {0};
+static HBITMAP g_iconCache[MAX_SHELL_ACTIONS] = {0};
 
 static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
 {
@@ -103,7 +133,7 @@ static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
 
 static HBITMAP GetCachedMenuIcon(int iconIndex)
 {
-    if (iconIndex < 0 || iconIndex >= 32) return NULL;
+    if (iconIndex < 0 || iconIndex >= MAX_SHELL_ACTIONS) return NULL;
     if (g_iconCache[iconIndex]) return g_iconCache[iconIndex];
 
     wchar_t exePath[MAX_PATH * 2] = {0};
@@ -128,7 +158,7 @@ static HBITMAP GetCachedMenuIcon(int iconIndex)
 
 static void ClearIconCache()
 {
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < MAX_SHELL_ACTIONS; i++) {
         HBITMAP h = (HBITMAP)InterlockedExchangePointer((PVOID*)&g_iconCache[i], NULL);
         if (h) DeleteObject(h);
     }
@@ -143,7 +173,7 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
     if (files.empty()) return;
 
     wchar_t guiExe[MAX_PATH * 2] = {0};
-    if (!FindBpdfGui(guiExe, ARRAYSIZE(guiExe), g_hInst)) {
+    if (!GetCachedBpdfGui(guiExe, ARRAYSIZE(guiExe))) {
         MessageBoxW(
             hwndOwner,
             L"Исполняемый файл bpdf-gui.exe не найден.\n"
@@ -154,25 +184,41 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
         return;
     }
 
-    wchar_t manifestPath[MAX_PATH * 2] = {0};
-    if (!CreateManifestFile(files, manifestPath, ARRAYSIZE(manifestPath))) {
-        MessageBoxW(hwndOwner, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
-        return;
-    }
-
     StrW guiCmd;
     guiCmd.append(L"\"");
     guiCmd.append(guiExe);
     guiCmd.append(L"\" ");
 
-    StrW atManifest;
-    atManifest.append(L"@");
-    atManifest.append(manifestPath);
-    AppendQuotedArg(guiCmd, atManifest.c_str());
+    size_t totalLen = 0;
+    for (size_t i = 0; i < files.size(); i++) {
+        totalLen += wcslen(files[i]) + 3; // quotes + space
+    }
+
+    wchar_t tempManifestToDelete[MAX_PATH * 2] = {0};
+
+    // If few files and command line length fits well (< 3000 chars), pass files directly (no disk I/O)
+    if (files.size() <= 16 && totalLen < 3000) {
+        for (size_t i = 0; i < files.size(); i++) {
+            AppendQuotedArg(guiCmd, files[i]);
+            guiCmd.append(L" ");
+        }
+    } else {
+        wchar_t manifestPath[MAX_PATH * 2] = {0};
+        if (!CreateManifestFile(files, manifestPath, ARRAYSIZE(manifestPath))) {
+            MessageBoxW(hwndOwner, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
+            return;
+        }
+        StrW atManifest;
+        atManifest.append(L"@");
+        atManifest.append(manifestPath);
+        AppendQuotedArg(guiCmd, atManifest.c_str());
+        guiCmd.append(L" --delete-manifest ");
+        lstrcpynW(tempManifestToDelete, manifestPath, ARRAYSIZE(tempManifestToDelete));
+    }
 
     if (itemIndex >= 0) {
         wchar_t numBuf[32];
-        wnsprintfW(numBuf, ARRAYSIZE(numBuf), L" --item %d", itemIndex);
+        wnsprintfW(numBuf, ARRAYSIZE(numBuf), L"--item %d", itemIndex);
         guiCmd.append(numBuf);
     }
 
@@ -183,7 +229,7 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     } else {
-        DeleteFileW(manifestPath);
+        if (tempManifestToDelete[0]) DeleteFileW(tempManifestToDelete);
         MessageBoxW(hwndOwner, L"Не удалось запустить bpdf-gui.exe", L"bpdf", MB_ICONERROR);
     }
 }
@@ -286,7 +332,7 @@ public:
         wchar_t targetSection[64] = {0};
         GetSectionForFiles(m_files, targetSection, ARRAYSIZE(targetSection));
 
-        MenuItemDef items[32];
+        MenuItemDef items[MAX_INI_ITEMS];
         size_t totalItems = LoadMenuConfig(targetSection, items, ARRAYSIZE(items));
         if (totalItems == 0) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
@@ -298,12 +344,14 @@ public:
         }
 
         UINT actionIndex = 0;
+        UINT menuPos = 0;
         for (size_t i = 0; i < totalItems; i++) {
             MENUITEMINFOW mii = { sizeof(mii) };
             if (items[i].iconIndex == -1 || items[i].title[0] == L'\0') {
                 mii.fMask = MIIM_FTYPE;
                 mii.fType = MFT_SEPARATOR;
-            } else {
+                InsertMenuItemW(hSubMenu, menuPos++, TRUE, &mii);
+            } else if (actionIndex < MAX_SHELL_ACTIONS) {
                 mii.fMask = MIIM_STRING | MIIM_ID;
                 mii.wID = idCmdFirst + actionIndex;
                 mii.dwTypeData = items[i].title;
@@ -314,12 +362,12 @@ public:
                     mii.hbmpItem = hBmp;
                 }
                 actionIndex++;
+                InsertMenuItemW(hSubMenu, menuPos++, TRUE, &mii);
             }
-            InsertMenuItemW(hSubMenu, (UINT)i, TRUE, &mii);
         }
 
         m_actionCount = actionIndex;
-        if (idCmdFirst + m_actionCount > idCmdLast + 1) {
+        if (m_actionCount == 0 || idCmdFirst + m_actionCount > idCmdLast + 1) {
             DestroyMenu(hSubMenu);
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
@@ -505,7 +553,6 @@ STDAPI DllUnregisterServer(void)
     wchar_t clsidKey[128];
     wnsprintfW(clsidKey, ARRAYSIZE(clsidKey), L"Software\\Classes\\CLSID\\%s", CLSID_STRING);
     RegDeleteTreeW(HKEY_CURRENT_USER, clsidKey);
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\bpdf");
 
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
     return S_OK;
