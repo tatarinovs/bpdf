@@ -17,8 +17,9 @@
   shell\register.bat     добавить подменю «bpdf» (права администратора не нужны)
   shell\unregister.bat   убрать его
   В Windows 11 подменю находится в «Показать дополнительные параметры»
-  (Shift+F10). Пункты меню задаются в shell\bpdf_shell.ini, английский
-  вариант — bpdf_shell_en.ini (скопируйте поверх bpdf_shell.ini).
+  (Shift+F10). Пункты меню задаются в shell\bpdf_shell_ru.ini, английские —
+  в bpdf_shell.ini. Язык меню и окон следует языку Windows;
+  задать явно: переменная BPDF_LANG=ru или en.
 
 Total Commander
   Запустите генератор из папки bar, он создаст панель рядом с собой:

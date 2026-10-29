@@ -72,7 +72,7 @@ if exist "%DIST_DIR%" (
     )
     copy /y "%OUT_DLL%" "%DIST_SHELL%\bpdf_shell.dll" >nul
     copy /y "%~dp0bpdf_shell.ini" "%DIST_SHELL%\bpdf_shell.ini" >nul
-    copy /y "%~dp0bpdf_shell_en.ini" "%DIST_SHELL%\bpdf_shell_en.ini" >nul
+    copy /y "%~dp0bpdf_shell_ru.ini" "%DIST_SHELL%\bpdf_shell_ru.ini" >nul
     del /f /q "%DIST_SHELL%\bpdf-gui.exe" 2>nul
     echo Updated %DIST_SHELL%\bpdf_shell.dll and the ini files
   )

@@ -89,7 +89,7 @@ if exist "%CD%\tools\bpdf_shell\bpdf_shell.dll" (
     copy /y "%CD%\tools\bpdf_shell\bpdf_shell.dll" "%CD%\dist\shell\bpdf_shell.dll" >nul || goto :error
   )
   copy /y "%CD%\tools\bpdf_shell\bpdf_shell.ini" "%CD%\dist\shell\bpdf_shell.ini" >nul || goto :error
-  copy /y "%CD%\tools\bpdf_shell\bpdf_shell_en.ini" "%CD%\dist\shell\bpdf_shell_en.ini" >nul || goto :error
+  copy /y "%CD%\tools\bpdf_shell\bpdf_shell_ru.ini" "%CD%\dist\shell\bpdf_shell_ru.ini" >nul || goto :error
   if exist "%CD%\tools\bpdf_shell\bpdf-gui.exe" (
     copy /y "%CD%\tools\bpdf_shell\bpdf-gui.exe" "%CD%\dist\bpdf-gui.exe" >nul || goto :error
   )
@@ -114,7 +114,7 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
   "@('bpdf.exe', 'bpdf-gui.exe', 'config.example.toml') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
   "@('README.md', 'README.en.md', 'QUICKSTART.txt', 'QUICKSTART.en.txt', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d ('docs\' + $_)) (Join-Path $stage 'docs') };" ^
   "@('make_bar.bat', 'make_bar_en.bat', 'make_bar_gui.bat', 'make_bar_gui_en.bat') | ForEach-Object { Copy-Item (Join-Path $d ('bar\' + $_)) (Join-Path $stage 'bar') };" ^
-  "@('bpdf_shell.dll', 'bpdf_shell.ini', 'bpdf_shell_en.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
+  "@('bpdf_shell.dll', 'bpdf_shell.ini', 'bpdf_shell_ru.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
   "Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem;" ^
   "if (Test-Path '%ZIP_FILE%') { Remove-Item -Force '%ZIP_FILE%' };" ^
   "$zip = [IO.Compression.ZipFile]::Open('%ZIP_FILE%', 'Create');" ^

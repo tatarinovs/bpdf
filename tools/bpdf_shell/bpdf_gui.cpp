@@ -570,7 +570,7 @@ static LRESULT CALLBACK InputBoxWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
             w - m - btnW * 2 - MulDiv(8, dpi, 96), btnY, btnW, btnH, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
 
-        HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
+        HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", Tr(L"Отмена", L"Cancel"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             w - m - btnW, btnY, btnW, btnH, hwnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
 
@@ -942,8 +942,8 @@ static void LoadPaletteForFiles(GuiContext* ctx)
 
     wchar_t subInfo[512] = {};
     if (ctx->files.empty()) {
-        SetWindowTextW(ctx->hTargetTitle, L"Файлы не выбраны");
-        lstrcpynW(subInfo, L"Перетащите файлы сюда (Drag & Drop) или нажмите «Выбрать файлы...»", ARRAYSIZE(subInfo));
+        SetWindowTextW(ctx->hTargetTitle, Tr(L"Файлы не выбраны", L"No files selected"));
+        lstrcpynW(subInfo, Tr(L"Перетащите файлы сюда (Drag & Drop) или нажмите «Выбрать файлы...»", L"Drop files here or click \"Choose files...\""), ARRAYSIZE(subInfo));
     } else if (ctx->files.size() == 1) {
         const wchar_t* path = ctx->files[0];
         SetWindowTextW(ctx->hTargetTitle, PathFindFileNameW(path));
@@ -952,26 +952,26 @@ static void LoadPaletteForFiles(GuiContext* ctx)
         if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
             lstrcpynW(subInfo, path, ARRAYSIZE(subInfo));
         } else if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", path);
+            wnsprintfW(subInfo, ARRAYSIZE(subInfo), Tr(L"Папка: %s", L"Folder: %s"), path);
         } else {
             ULONGLONG size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             const ULONGLONG mb = 1024 * 1024;
             if (size >= mb) {
-                wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u.%u МБ  |  %s",
+                wnsprintfW(subInfo, ARRAYSIZE(subInfo), Tr(L"Размер: %u.%u МБ  |  %s", L"Size: %u.%u MB  |  %s"),
                     (DWORD)(size / mb), (DWORD)((size % mb) * 10 / mb), path);
             } else {
-                wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u КБ  |  %s", (DWORD)(size / 1024), path);
+                wnsprintfW(subInfo, ARRAYSIZE(subInfo), Tr(L"Размер: %u КБ  |  %s", L"Size: %u KB  |  %s"), (DWORD)(size / 1024), path);
             }
         }
     } else {
         wchar_t summary[64];
-        wnsprintfW(summary, ARRAYSIZE(summary), L"Выбрано файлов: %d", (int)ctx->files.size());
+        wnsprintfW(summary, ARRAYSIZE(summary), Tr(L"Выбрано файлов: %d", L"Files selected: %d"), (int)ctx->files.size());
         SetWindowTextW(ctx->hTargetTitle, summary);
 
         StrW dir;
         dir.assign(ctx->files[0]);
         PathRemoveFileSpecW(dir.data);
-        wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", dir.c_str());
+        wnsprintfW(subInfo, ARRAYSIZE(subInfo), Tr(L"Папка: %s", L"Folder: %s"), dir.c_str());
     }
 
     if (!ctx->files.empty()) {
@@ -981,9 +981,9 @@ static void LoadPaletteForFiles(GuiContext* ctx)
         MenuItemDef items[MAX_INI_ITEMS];
         size_t count = LoadMenuItems(section, items, ARRAYSIZE(items));
         if (count == 0) {
-            wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Нет действий: bpdf_shell.ini не найден или в нём нет раздела [%s]", section);
+            wnsprintfW(subInfo, ARRAYSIZE(subInfo), Tr(L"Нет действий: bpdf_shell_ru.ini (bpdf_shell.ini) не найден или в нём нет раздела [%s]", L"No actions: bpdf_shell.ini is missing or has no [%s] section"), section);
         } else if (!ctx->targetExe[0]) {
-            lstrcpynW(subInfo, L"Предупреждение: bpdf.exe не найден рядом или в PATH", ARRAYSIZE(subInfo));
+            lstrcpynW(subInfo, Tr(L"Предупреждение: bpdf.exe не найден рядом или в PATH", L"Warning: bpdf.exe was not found beside the program or in PATH"), ARRAYSIZE(subInfo));
         }
 
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(ctx->hwnd, GWLP_HINSTANCE);
@@ -1078,8 +1078,8 @@ static void ReturnToPalette(GuiContext* ctx)
     ctx->filesEmbeddedInCmd = false;
 
     SetWindowIconIndex(ctx, 0);
-    SetWindowTextW(ctx->hBtnClose, L"Закрыть");
-    SetWindowTextW(ctx->hwnd, L"bpdf — Панель действий");
+    SetWindowTextW(ctx->hBtnClose, Tr(L"Закрыть", L"Close"));
+    SetWindowTextW(ctx->hwnd, Tr(L"bpdf — Панель действий", L"bpdf — Actions"));
     LoadPaletteForFiles(ctx);
 }
 
@@ -1094,8 +1094,10 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const
     if (!ctx->targetExe[0] && !FindBpdfExe(ctx->targetExe, ARRAYSIZE(ctx->targetExe))) {
         MessageBoxW(
             ctx->hwnd,
-            L"Исполняемый файл bpdf.exe не найден.\n"
-            L"Поместите bpdf.exe рядом с программой или добавьте путь к нему в переменную PATH.",
+            Tr(L"Исполняемый файл bpdf.exe не найден.\n"
+               L"Поместите bpdf.exe рядом с программой или добавьте путь к нему в переменную PATH.",
+               L"bpdf.exe was not found.\n"
+               L"Put bpdf.exe beside this program or add its folder to PATH."),
             L"bpdf",
             MB_ICONERROR
         );
@@ -1136,7 +1138,7 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const
             atManifest.append(ctx->tempManifest);
             AppendQuotedArg(cmdLine, atManifest.c_str());
         } else {
-            MessageBoxW(ctx->hwnd, L"Не удалось создать список файлов", L"bpdf", MB_ICONERROR);
+            MessageBoxW(ctx->hwnd, Tr(L"Не удалось создать список файлов", L"Could not create the file list"), L"bpdf", MB_ICONERROR);
             secrets.wipe();
             AbortAction(ctx);
             return;
@@ -1147,7 +1149,7 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const
     bool envOk = secrets.empty() || BuildEnvironment(secrets, environment);
     secrets.wipe();
     if (!envOk) {
-        MessageBoxW(ctx->hwnd, L"Недостаточно памяти для запуска bpdf.exe", L"bpdf", MB_ICONERROR);
+        MessageBoxW(ctx->hwnd, Tr(L"Недостаточно памяти для запуска bpdf.exe", L"Not enough memory to start bpdf.exe"), L"bpdf", MB_ICONERROR);
         AbortAction(ctx);
         return;
     }
@@ -1159,12 +1161,12 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const
     SetWindowIconIndex(ctx, item.iconIndex);
     SetWindowTextW(ctx->hTitleStatic, item.title);
     wchar_t text[256];
-    wnsprintfW(text, ARRAYSIZE(text), L"Выполняется: %s...", item.title);
+    wnsprintfW(text, ARRAYSIZE(text), Tr(L"Выполняется: %s...", L"Running: %s..."), item.title);
     SetWindowTextW(ctx->hStatusStatic, text);
     wnsprintfW(text, ARRAYSIZE(text), L"bpdf — %s", item.title);
     SetWindowTextW(ctx->hwnd, text);
     SetWindowTextW(ctx->hEdit, L"");
-    SetWindowTextW(ctx->hBtnClose, L"Отмена");
+    SetWindowTextW(ctx->hBtnClose, Tr(L"Отмена", L"Cancel"));
     SendMessageW(ctx->hProgress, PBM_SETMARQUEE, TRUE, 30);
 
     RECT client;
@@ -1179,7 +1181,7 @@ static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const
     environment.wipe();
     cmdLine.wipe();
     if (!spawned) {
-        AppendLog(ctx, L"Не удалось запустить bpdf.exe\r\n");
+        AppendLog(ctx, Tr(L"Не удалось запустить bpdf.exe\r\n", L"Could not start bpdf.exe\r\n"));
         PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, (LPARAM)ctx->runId);
     }
 }
@@ -1192,7 +1194,15 @@ static void BrowseForFiles(GuiContext* ctx)
 
     OPENFILENAMEW ofn = { sizeof(ofn) };
     ofn.hwndOwner = ctx->hwnd;
-    ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
+    const wchar_t* supported = L"*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html";
+    const wchar_t* images = L"*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic";
+    wchar_t filter[1024];
+    int filterLen = wnsprintfW(filter, ARRAYSIZE(filter), Tr(
+        L"Все поддерживаемые файлы|%s|PDF документы (*.pdf)|*.pdf|Изображения|%s|Все файлы (*.*)|*.*|",
+        L"All supported files|%s|PDF documents (*.pdf)|*.pdf|Images|%s|All files (*.*)|*.*|"), supported, images);
+    // The filter is a list of NUL-separated strings ending with two NULs
+    for (int i = 0; i < filterLen; i++) if (filter[i] == L'|') filter[i] = L'\0';
+    ofn.lpstrFilter = filter;
     ofn.lpstrFile = buf;
     ofn.nMaxFile = bufLen;
     ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -1247,10 +1257,10 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         ctx->hProgress = CreateChild(ctx, PROGRESS_CLASSW, NULL, PBS_MARQUEE, 0);
         ctx->hEdit = CreateChild(ctx, L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, WS_EX_CLIENTEDGE);
         SendMessageW(ctx->hEdit, EM_SETLIMITTEXT, 0, 0);
-        ctx->hBtnClose = CreateChild(ctx, L"BUTTON", L"Закрыть", button, ID_BTN_CLOSE);
-        ctx->hBtnFolder = CreateChild(ctx, L"BUTTON", L"Открыть папку", button, ID_BTN_FOLDER);
-        ctx->hBtnBrowse = CreateChild(ctx, L"BUTTON", L"Выбрать файлы...", button, ID_BTN_BROWSE);
-        ctx->hBtnBack = CreateChild(ctx, L"BUTTON", L"← К действиям", button, ID_BTN_BACK);
+        ctx->hBtnClose = CreateChild(ctx, L"BUTTON", Tr(L"Закрыть", L"Close"), button, ID_BTN_CLOSE);
+        ctx->hBtnFolder = CreateChild(ctx, L"BUTTON", Tr(L"Открыть папку", L"Open folder"), button, ID_BTN_FOLDER);
+        ctx->hBtnBrowse = CreateChild(ctx, L"BUTTON", Tr(L"Выбрать файлы...", L"Choose files..."), button, ID_BTN_BROWSE);
+        ctx->hBtnBack = CreateChild(ctx, L"BUTTON", Tr(L"← К действиям", L"← Back to actions"), button, ID_BTN_BACK);
         ApplyDpiFonts(ctx);
 
         SetWindowIconIndex(ctx, ctx->hasCustomAction ? ctx->customAction.iconIndex : 0);
@@ -1340,12 +1350,12 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         ctx->state = STATE_FINISHED;
         SendMessageW(ctx->hProgress, PBM_SETMARQUEE, FALSE, 0);
-        SetWindowTextW(ctx->hBtnBack, ctx->isPaletteSession ? L"← К действиям" : L"Панель действий...");
-        SetWindowTextW(ctx->hBtnClose, L"Закрыть");
+        SetWindowTextW(ctx->hBtnBack, ctx->isPaletteSession ? Tr(L"← К действиям", L"← Back to actions") : Tr(L"Панель действий...", L"Actions..."));
+        SetWindowTextW(ctx->hBtnClose, Tr(L"Закрыть", L"Close"));
         SetWindowTextW(ctx->hStatusStatic,
-            wParam != 0 ? L"Завершено с ошибками (проверьте журнал вывода)" :
-            warnings ? L"Готово, но есть предупреждения (см. журнал вывода)" :
-            L"Готово! Операция успешно завершена.");
+            wParam != 0 ? Tr(L"Завершено с ошибками (проверьте журнал вывода)", L"Finished with errors (see the log)") :
+            warnings ? Tr(L"Готово, но есть предупреждения (см. журнал вывода)", L"Done, with warnings (see the log)") :
+            Tr(L"Готово! Операция успешно завершена.", L"Done! The operation completed successfully."));
         LayoutControls(ctx);
         ShowMainWindow(ctx);
         // Enter takes the default way on: back to the palette or close
@@ -1427,25 +1437,46 @@ static void ShowHelp()
 {
     MessageBoxW(
         NULL,
-        L"bpdf-gui — Графический интерфейс действий и прогресса для bpdf\n\n"
-        L"Использование:\n"
-        L"  bpdf-gui.exe [опции GUI] -- <команда bpdf> [файлы / @список] [параметры]\n"
-        L"  bpdf-gui.exe [файлы / @список] --cmd \"команда [параметры]\"\n"
-        L"  bpdf-gui.exe --item <номер> [файлы / @список]\n"
-        L"  bpdf-gui.exe [файлы / @список]  (открывает палитру действий)\n\n"
-        L"Опции GUI: --title <текст>, --icon <номер>, --gui auto|info|keep\n\n"
-        L"Примеры:\n"
-        L"  bpdf-gui.exe --icon 7 -- rotate doc.pdf -a \"{ask:Угол:90}\" -i\n"
-        L"  bpdf-gui.exe --icon 1 -- merge @filelist.txt --optimize -s A4\n"
-        L"  bpdf-gui.exe doc.pdf -- watermark \"{file}\" \"{ask:Текст:КОПИЯ}\" --angle 45 -i\n\n"
-        L"Параметры диалогов в командах:\n"
-        L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
-        L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками; после --password\n"
-        L"                           команд protect и unlock передаётся bpdf через\n"
-        L"                           окружение, а не командную строку\n\n"
-        L"Кнопки Total Commander:\n"
-        L"  Команда:    bpdf-gui.exe --icon 7\n"
-        L"  Параметры:  -- rotate @\"%UL\" -a \"{ask:Угол поворота (90, 180, 270, portrait):90}\" -i",
+        Tr(
+            L"bpdf-gui — Графический интерфейс действий и прогресса для bpdf\n\n"
+            L"Использование:\n"
+            L"  bpdf-gui.exe [опции GUI] -- <команда bpdf> [файлы / @список] [параметры]\n"
+            L"  bpdf-gui.exe [файлы / @список] --cmd \"команда [параметры]\"\n"
+            L"  bpdf-gui.exe --item <номер> [файлы / @список]\n"
+            L"  bpdf-gui.exe [файлы / @список]  (открывает палитру действий)\n\n"
+            L"Опции GUI: --title <текст>, --icon <номер>, --gui auto|info|keep\n\n"
+            L"Примеры:\n"
+            L"  bpdf-gui.exe --icon 7 -- rotate doc.pdf -a \"{ask:Угол:90}\" -i\n"
+            L"  bpdf-gui.exe --icon 1 -- merge @filelist.txt --optimize -s A4\n"
+            L"  bpdf-gui.exe doc.pdf -- watermark \"{file}\" \"{ask:Текст:КОПИЯ}\" --angle 45 -i\n\n"
+            L"Параметры диалогов в командах:\n"
+            L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
+            L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками; после --password\n"
+            L"                           команд protect и unlock передаётся bpdf через\n"
+            L"                           окружение, а не командную строку\n\n"
+            L"Кнопки Total Commander:\n"
+            L"  Команда:    bpdf-gui.exe --icon 7\n"
+            L"  Параметры:  -- rotate @\"%UL\" -a \"{ask:Угол поворота (90, 180, 270, portrait):90}\" -i",
+            L"bpdf-gui — actions and progress window for bpdf\n\n"
+            L"Usage:\n"
+            L"  bpdf-gui.exe [GUI options] -- <bpdf command> [files / @list] [options]\n"
+            L"  bpdf-gui.exe [files / @list] --cmd \"command [options]\"\n"
+            L"  bpdf-gui.exe --item <number> [files / @list]\n"
+            L"  bpdf-gui.exe [files / @list]  (opens the action palette)\n\n"
+            L"GUI options: --title <text>, --icon <number>, --gui auto|info|keep\n\n"
+            L"Examples:\n"
+            L"  bpdf-gui.exe --icon 7 -- rotate doc.pdf -a \"{ask:Angle:90}\" -i\n"
+            L"  bpdf-gui.exe --icon 1 -- merge @filelist.txt --optimize -s A4\n"
+            L"  bpdf-gui.exe doc.pdf -- watermark \"{file}\" \"{ask:Text:COPY}\" --angle 45 -i\n\n"
+            L"Dialog parameters in commands:\n"
+            L"  {ask:Prompt:Default} — input dialog for a value\n"
+            L"  {ask_pass:Prompt}    — masked password input; after --password of\n"
+            L"                         protect and unlock it reaches bpdf through\n"
+            L"                         the environment, not the command line\n\n"
+            L"Total Commander buttons:\n"
+            L"  Command:     bpdf-gui.exe --icon 7\n"
+            L"  Parameters:  -- rotate @\"%UL\" -a \"{ask:Rotation angle (90, 180, 270, portrait):90}\" -i"
+        ),
         L"bpdf-gui",
         MB_OK | MB_ICONINFORMATION
     );
@@ -1530,7 +1561,7 @@ static bool ParseArguments(GuiContext* ctx)
             command[n] = c[n];
         }
         if (!title.empty()) lstrcpynW(action.title, title.c_str(), ARRAYSIZE(action.title));
-        else wnsprintfW(action.title, ARRAYSIZE(action.title), L"bpdf: %s", command[0] ? command : L"команда");
+        else wnsprintfW(action.title, ARRAYSIZE(action.title), L"bpdf: %s", command[0] ? command : Tr(L"команда", L"command"));
 
         if (hasGuiMode) action.guiMode = guiMode;
         else action.guiMode = StrCmpIW(command, L"info") == 0 ? GUI_INFO : GUI_AUTO;
@@ -1561,7 +1592,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     HWND hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         BPDF_GUI_CLASS,
-        L"bpdf — Панель действий",
+        Tr(L"bpdf — Панель действий", L"bpdf — Actions"),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         NULL, NULL, hInst, &ctx

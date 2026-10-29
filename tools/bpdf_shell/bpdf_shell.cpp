@@ -136,8 +136,10 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
     if (!ResolvePath(g_guiPath, FindBpdfGui, guiExe, ARRAYSIZE(guiExe))) {
         MessageBoxW(
             hwndOwner,
-            L"Исполняемый файл bpdf-gui.exe не найден.\n"
-            L"Убедитесь, что bpdf-gui.exe находится рядом с bpdf_shell.dll или bpdf.exe.",
+            Tr(L"Исполняемый файл bpdf-gui.exe не найден.\n"
+               L"Убедитесь, что bpdf-gui.exe находится рядом с bpdf_shell.dll или bpdf.exe.",
+               L"bpdf-gui.exe was not found.\n"
+               L"Put bpdf-gui.exe beside bpdf_shell.dll or bpdf.exe."),
             L"bpdf",
             MB_ICONERROR
         );
@@ -163,7 +165,7 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
     } else {
         wchar_t manifestPath[MAX_PATH * 2] = {0};
         if (!CreateManifestFile(files, manifestPath, ARRAYSIZE(manifestPath))) {
-            MessageBoxW(hwndOwner, L"Не удалось создать файл списка аргументов", L"bpdf", MB_ICONERROR);
+            MessageBoxW(hwndOwner, Tr(L"Не удалось создать файл списка аргументов", L"Could not create the argument list file"), L"bpdf", MB_ICONERROR);
             return;
         }
         StrW atManifest;
@@ -188,7 +190,7 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
         CloseHandle(pi.hThread);
     } else {
         if (tempManifestToDelete[0]) DeleteFileW(tempManifestToDelete);
-        MessageBoxW(hwndOwner, L"Не удалось запустить bpdf-gui.exe", L"bpdf", MB_ICONERROR);
+        MessageBoxW(hwndOwner, Tr(L"Не удалось запустить bpdf-gui.exe", L"Could not start bpdf-gui.exe"), L"bpdf", MB_ICONERROR);
     }
 }
 

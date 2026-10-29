@@ -139,13 +139,14 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 or MSVC:
 
 - `bpdf_shell.dll`: the Explorer context menu handler. It picks the
-  `bpdf_shell.ini` section for the selection, builds the submenu and starts
+  `bpdf_shell.ini` (`bpdf_shell_ru.ini` for Russian) section for the selection, builds the submenu and starts
   `bpdf-gui.exe --item N` with the files (an `@list` for several).
 - `bpdf-gui.exe`: expands placeholders and `{ask:...}` dialogs, passes
   passwords through `BPDF_*_PASSWORD` variables, runs `bpdf.exe --no-pause`
   and shows its progress; without a command it is the action palette.
 - `bpdf_shell_common.h`: shared lookup of `bpdf.exe`, `bpdf-gui.exe` and the
-  ini, and the UTF-8 ini parser.
+  ini, the UTF-8 ini parser and `Tr(ru, en)`: the interface language comes
+  from `BPDF_LANG`, otherwise from the Windows display language.
 
 The CLI stays the only place that touches documents; the shell parts only
 build command lines.

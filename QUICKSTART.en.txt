@@ -14,11 +14,12 @@ INSTALLATION
 3. Check: bpdf doctor
 
 Explorer menu
-  shell\bpdf_shell_en.ini   copy it over shell\bpdf_shell.ini for English items
   shell\register.bat        add the "bpdf" submenu (no administrator rights needed)
   shell\unregister.bat      remove it
   On Windows 11 the submenu is under "Show more options" (Shift+F10).
-  Menu items are defined in shell\bpdf_shell.ini.
+  Menu items are defined in shell\bpdf_shell.ini (Russian: bpdf_shell_ru.ini).
+  The menu and window language follows Windows; set BPDF_LANG=en or ru
+  to choose it explicitly.
 
 Total Commander
   Run a generator from the bar folder; it creates the button bar beside itself:
@@ -28,7 +29,6 @@ Total Commander
 
 Action palette
   Run bpdf-gui.exe, drop files onto its window and pick an action.
-  (bpdf-gui messages are in Russian only for now.)
 
 
 COMMANDS

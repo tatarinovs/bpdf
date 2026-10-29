@@ -281,8 +281,29 @@ static inline bool FindBpdfGui(wchar_t* outPath, size_t maxLen, HMODULE hMod = N
     return SearchInPathEnv(L"bpdf-gui.exe", outPath, maxLen);
 }
 
+// Russian when BPDF_LANG starts with "ru" or, without BPDF_LANG, when the
+// Windows display language is Russian; English otherwise
+static inline bool UiRussian()
+{
+    static int cached = -1;
+    if (cached < 0) {
+        wchar_t lang[16] = {0};
+        DWORD n = GetEnvironmentVariableW(L"BPDF_LANG", lang, ARRAYSIZE(lang));
+        if (n > 0 && n < ARRAYSIZE(lang)) cached = StrCmpNIW(lang, L"ru", 2) == 0;
+        else cached = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
+    }
+    return cached != 0;
+}
+
+static inline const wchar_t* Tr(const wchar_t* ru, const wchar_t* en)
+{
+    return UiRussian() ? ru : en;
+}
+
+// The Russian interface takes bpdf_shell_ru.ini when there is one
 static inline bool FindBpdfIni(wchar_t* outPath, size_t maxLen, HMODULE hMod = NULL)
 {
+    if (UiRussian() && FindNearModule(L"bpdf_shell_ru.ini", outPath, maxLen, hMod)) return true;
     return FindNearModule(L"bpdf_shell.ini", outPath, maxLen, hMod);
 }
 
