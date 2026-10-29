@@ -15,7 +15,8 @@ chcp 1251 >nul
 set "EXE_DIR=%~dp0"
 set "EXE_DIR=%EXE_DIR:~0,-1%"
 set "OUT=%~dp0bpdf_gui.bar"
-set "Q="
+rem Путь в cmd= всегда в кавычках: в нём могут быть пробелы ("Program Files").
+set Q="
 
 if /i "%~1"=="/default" (
   set "BASE=%%COMMANDER_PATH%%\tools\bpdf"
@@ -65,8 +66,6 @@ if defined OK (
     echo Total Commander не найден, пути будут абсолютными.
   )
 )
-rem Если в переменной с cmd= есть пробел в кавычках, то TC выполнит всё без перекосов.
-if not "%EXE_DIR: =%"=="%EXE_DIR%" set Q="
 
 :write
 setlocal EnableDelayedExpansion
@@ -137,9 +136,8 @@ echo param12=-- optimize %%P%%N
 echo iconic12=0
 echo menu12=Оптимизировать PDF ^(сжатие^)
 echo button13=!EXE!,11
-echo cmd13=!RUN! --icon 11 --gui none
-echo param13=-- stamp %%P%%N "stamp.png" --pick --position br --blend multiply --scale 1 -i
-echo path13="!BASE!\"
+echo cmd13=!RUN! --icon 11
+echo param13=-- stamp %%P%%N "{exe_dir}\stamp.png" --pick --position br --blend multiply --scale 1 -i
 echo iconic13=0
 echo menu13=Наложить штамп на PDF ^(stamp.png рядом с bpdf.exe^)
 echo button14=!EXE!,15

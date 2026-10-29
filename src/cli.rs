@@ -383,10 +383,10 @@ pub struct ProtectArgs {
     /// Source PDF file.
     pub input: PathBuf,
     /// Password needed to open the PDF (omit to let anyone open it).
-    #[arg(long)]
+    #[arg(long, env = "BPDF_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
     /// Password that lifts the restrictions (default: the open password, or a random one with restrictions).
-    #[arg(long)]
+    #[arg(long, env = "BPDF_OWNER_PASSWORD", hide_env_values = true)]
     pub owner_password: Option<String>,
     /// Forbid printing.
     #[arg(long)]
@@ -406,7 +406,7 @@ pub struct UnlockArgs {
     /// Source PDF file.
     pub input: PathBuf,
     /// Open or owner password (omit for PDFs that open without one but carry restrictions).
-    #[arg(long)]
+    #[arg(long, env = "BPDF_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
     #[command(flatten)]
     pub output: OutputArgs,

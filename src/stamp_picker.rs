@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::pdf::transform::{self, PageGeometry, StampOptions, StampPlacement, StampSize};
-use crate::{html, output, winpdf};
+use crate::{html, output, process, winpdf};
 
 const PAGE: &str = include_str!("stamp_picker.html");
 const PREVIEW_LONG_EDGE: u32 = 1600;
@@ -271,22 +271,27 @@ fn serve(
 
 fn open_browser(url: &str, configured: Option<&Path>) {
     let launched = html::find_browser(configured).and_then(|browser| {
-        std::process::Command::new(browser)
+        let mut command = std::process::Command::new(browser);
+        command
             .arg(format!("--app={url}"))
-            .arg("--window-size=1280,1000")
-            .spawn()
-            .map(drop)
-            .map_err(Into::into)
+            .arg("--window-size=1280,1000");
+        process::spawn_detached(command).map_err(Into::into)
     });
     if launched.is_ok() {
         return;
     }
     #[cfg(windows)]
-    let fallback = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
+    let fallback = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/c", "start", "", url]);
+        process::spawn_detached(command)
+    };
     #[cfg(not(windows))]
-    let fallback = std::process::Command::new("xdg-open").arg(url).spawn();
+    let fallback = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        process::spawn_detached(command)
+    };
     if fallback.is_err() {
         output::warn(format!("open {url} in a browser to place the stamp"));
     }

@@ -4,10 +4,18 @@
 
 static const wchar_t* BPDF_GUI_CLASS = L"BpdfGuiWindow";
 
-#define WM_BPDF_APPEND   (WM_APP + 1)
-#define WM_BPDF_FINISHED (WM_APP + 2)
+// Worker messages carry the run id: output of a cancelled run is dropped
+#define WM_BPDF_APPEND            (WM_APP + 1) // wParam: run id, lParam: malloc'ed text
+#define WM_BPDF_FINISHED          (WM_APP + 2) // wParam: exit code, lParam: run id
+#define WM_BPDF_START_AUTO_ACTION (WM_APP + 3)
 
-#define ID_TIMER_AUTOCLOSE 101
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+// A single action shows its window only if it runs longer than this
+#define ID_TIMER_SHOW 101
+#define SHOW_DELAY_MS 500
 
 #define ID_BTN_CLOSE   201
 #define ID_BTN_FOLDER  202
@@ -26,245 +34,327 @@ enum GuiState {
 // -----------------------------------------------------------------------------
 
 struct GuiContext {
-    HWND hwnd;
-    GuiState state;
-    bool isPaletteSession;
-    bool filesEmbeddedInCmd;
+    HWND hwnd = NULL;
+    GuiState state = STATE_PALETTE;
+    bool isPaletteSession = false;   // false: started for one action (menu item, TC button)
+    bool filesEmbeddedInCmd = false; // the files are already in the command after "--"
 
     // Palette controls
-    HWND hTargetTitle;
-    HWND hTargetSub;
-    HWND hPaletteGroup;
-    HWND hActionBtns[MAX_SHELL_ACTIONS];
-    HIMAGELIST hActionIml[MAX_SHELL_ACTIONS];
-    MenuItemDef actionDefs[MAX_SHELL_ACTIONS];
-    size_t actionCount;
+    HWND hTargetTitle = NULL;
+    HWND hTargetSub = NULL;
+    HWND hBtnBrowse = NULL;
+    HWND hActionBtns[MAX_SHELL_ACTIONS] = {};
+    HIMAGELIST hActionIml[MAX_SHELL_ACTIONS] = {};
+    MenuItemDef actionDefs[MAX_SHELL_ACTIONS] = {};
+    size_t actionCount = 0;
 
-    // Progress / Execution controls
-    HWND hTitleStatic;
-    HWND hStatusStatic;
-    HWND hProgress;
-    HWND hEdit;
-    HWND hBtnClose;
-    HWND hBtnFolder;
-    HWND hBtnBrowse;
-    HWND hBtnBack;
+    // Progress controls
+    HWND hTitleStatic = NULL;
+    HWND hStatusStatic = NULL;
+    HWND hProgress = NULL;
+    HWND hEdit = NULL;
+    HWND hBtnFolder = NULL;
+    HWND hBtnBack = NULL;
+    HWND hBtnClose = NULL;
 
-    HFONT hFontTitle;
-    HFONT hFontSub;
-    HFONT hFontButton;
-    HFONT hFontUi;
-    HFONT hFontEdit;
-    HBRUSH hBrushEdit;
-    HICON hIcon;
+    HFONT hFontTitle = NULL;
+    HFONT hFontSub = NULL;
+    HFONT hFontUi = NULL;
+    HFONT hFontEdit = NULL;
+    HBRUSH hBrushEdit = NULL;
+    HICON hIcon = NULL;
+    int dpi = 96;
 
     WStringList files;
-    wchar_t targetExe[MAX_PATH * 2];
-    wchar_t currentTitle[128];
-    wchar_t* cmdLine;
-    wchar_t workDir[32768];
-    wchar_t tempManifest[MAX_PATH * 2];
+    wchar_t targetExe[MAX_PATH * 2] = {};
+    StrW workDir;
+    wchar_t tempManifest[MAX_PATH * 2] = {};
 
-    int iconIndex;
-    GuiMode guiMode;
-    int autoCloseSeconds;
-    int dpi;
+    GuiMode guiMode = GUI_AUTO;
 
-    HANDLE hProcess;
-    HANDLE hWorkerThread;
-    HANDLE hJob;
-    volatile LONG isFinished;
-    volatile LONG isCancelled;
-    int autoActionIndex;
-    bool hasCustomAction;
-    MenuItemDef customAction;
+    HANDLE hProcess = NULL;
+    HANDLE hJob = NULL;
+    HANDLE hWorkerThread = NULL;
+    LONG runId = 0;
 
-    GuiContext()
-        : hwnd(NULL), state(STATE_PALETTE), isPaletteSession(false), filesEmbeddedInCmd(false),
-          hTargetTitle(NULL), hTargetSub(NULL), hPaletteGroup(NULL), actionCount(0),
-          hTitleStatic(NULL), hStatusStatic(NULL), hProgress(NULL),
-          hEdit(NULL), hBtnClose(NULL), hBtnFolder(NULL), hBtnBrowse(NULL), hBtnBack(NULL),
-          hFontTitle(NULL), hFontSub(NULL), hFontButton(NULL), hFontUi(NULL), hFontEdit(NULL),
-          hBrushEdit(NULL), hIcon(NULL),
-          cmdLine(NULL), iconIndex(0), guiMode(GUI_AUTO), autoCloseSeconds(0), dpi(96),
-          hProcess(NULL), hWorkerThread(NULL), hJob(NULL), isFinished(0), isCancelled(0),
-          autoActionIndex(-1), hasCustomAction(false)
-    {
-        for (int i = 0; i < MAX_SHELL_ACTIONS; i++) {
-            hActionBtns[i] = NULL;
-            hActionIml[i] = NULL;
-        }
-        targetExe[0] = L'\0';
-        currentTitle[0] = L'\0';
-        workDir[0] = L'\0';
-        tempManifest[0] = L'\0';
-        memset(&customAction, 0, sizeof(customAction));
-    }
+    int autoActionIndex = -1;
+    bool hasCustomAction = false;
+    MenuItemDef customAction = {};
+    StrW customCmd;
 
+    int scale(int val) const { return MulDiv(val, dpi, 96); }
+
+    // Kills the running bpdf.exe with its helpers; output still in flight is dropped
     void stopWorker()
     {
-        InterlockedExchange(&isCancelled, 1);
+        runId++;
         if (hJob) {
             TerminateJobObject(hJob, 1);
-        } else if (hProcess) {
+            CloseHandle(hJob);
+            hJob = NULL;
+        }
+        if (hProcess) {
             TerminateProcess(hProcess, 1);
+            CloseHandle(hProcess);
+            hProcess = NULL;
         }
         if (hWorkerThread) {
             WaitForSingleObject(hWorkerThread, 5000);
             CloseHandle(hWorkerThread);
             hWorkerThread = NULL;
         }
-        if (hJob) {
-            CloseHandle(hJob);
-            hJob = NULL;
+    }
+
+    void deleteTempManifest()
+    {
+        if (tempManifest[0]) {
+            DeleteFileW(tempManifest);
+            tempManifest[0] = L'\0';
         }
-        if (hProcess) {
-            CloseHandle(hProcess);
-            hProcess = NULL;
+    }
+
+    void clearPaletteButtons()
+    {
+        for (size_t i = 0; i < MAX_SHELL_ACTIONS; i++) {
+            if (hActionBtns[i]) {
+                DestroyWindow(hActionBtns[i]);
+                hActionBtns[i] = NULL;
+            }
+            if (hActionIml[i]) {
+                ImageList_Destroy(hActionIml[i]);
+                hActionIml[i] = NULL;
+            }
         }
+        actionCount = 0;
     }
 
     ~GuiContext()
     {
         stopWorker();
-        if (cmdLine) free(cmdLine);
-        if (tempManifest[0]) DeleteFileW(tempManifest);
+        deleteTempManifest();
+        clearPaletteButtons();
         if (hIcon) DestroyIcon(hIcon);
-
-        for (size_t i = 0; i < MAX_SHELL_ACTIONS; i++) {
-            if (hActionIml[i]) ImageList_Destroy(hActionIml[i]);
-        }
-
         if (hFontTitle) DeleteObject(hFontTitle);
         if (hFontSub) DeleteObject(hFontSub);
-        if (hFontButton) DeleteObject(hFontButton);
         if (hFontUi) DeleteObject(hFontUi);
         if (hFontEdit) DeleteObject(hFontEdit);
         if (hBrushEdit) DeleteObject(hBrushEdit);
-    }
-
-    int scale(int val) const {
-        return MulDiv(val, dpi, 96);
     }
 };
 
 static void FlushPendingAppendMessages(HWND hwnd)
 {
-    if (!hwnd) return;
     MSG msg;
     while (PeekMessageW(&msg, hwnd, WM_BPDF_APPEND, WM_BPDF_APPEND, PM_REMOVE)) {
-        if (msg.lParam) {
-            free((void*)msg.lParam);
-        }
+        free((void*)msg.lParam);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Layout & UI Transitions
+// DPI, Fonts & Icons
 // -----------------------------------------------------------------------------
 
-static void LayoutControls(HWND hwnd, GuiContext* ctx)
+static int WindowDpi(HWND hwnd)
 {
-    if (!ctx) return;
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    GetDpiForWindowFn getDpi = (GetDpiForWindowFn)(void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    if (getDpi) {
+        UINT dpi = getDpi(hwnd);
+        if (dpi) return (int)dpi;
+    }
+    int dpi = 96;
+    HDC hdc = GetDC(NULL);
+    if (hdc) {
+        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
+        ReleaseDC(NULL, hdc);
+    }
+    return dpi > 0 ? dpi : 96;
+}
+
+static HFONT CreateUiFont(const GuiContext* ctx, int size, int weight, const wchar_t* face)
+{
+    return CreateFontW(-ctx->scale(size), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+}
+
+// (Re)creates the fonts for ctx->dpi and assigns them to the controls
+static void ApplyDpiFonts(GuiContext* ctx)
+{
+    HFONT old[] = { ctx->hFontTitle, ctx->hFontSub, ctx->hFontUi, ctx->hFontEdit };
+    ctx->hFontTitle = CreateUiFont(ctx, 18, FW_SEMIBOLD, L"Segoe UI");
+    ctx->hFontSub = CreateUiFont(ctx, 12, FW_NORMAL, L"Segoe UI");
+    ctx->hFontUi = CreateUiFont(ctx, 13, FW_NORMAL, L"Segoe UI");
+    ctx->hFontEdit = CreateUiFont(ctx, 12, FW_NORMAL, L"Consolas");
+
+    struct { HWND hwnd; HFONT font; } controls[] = {
+        { ctx->hTargetTitle, ctx->hFontTitle }, { ctx->hTitleStatic, ctx->hFontTitle },
+        { ctx->hTargetSub, ctx->hFontSub }, { ctx->hStatusStatic, ctx->hFontUi },
+        { ctx->hEdit, ctx->hFontEdit }, { ctx->hBtnClose, ctx->hFontUi },
+        { ctx->hBtnFolder, ctx->hFontUi }, { ctx->hBtnBrowse, ctx->hFontUi },
+        { ctx->hBtnBack, ctx->hFontUi },
+    };
+    for (size_t i = 0; i < ARRAYSIZE(controls); i++) {
+        if (controls[i].hwnd) SendMessageW(controls[i].hwnd, WM_SETFONT, (WPARAM)controls[i].font, TRUE);
+    }
+    for (size_t i = 0; i < ARRAYSIZE(old); i++) {
+        if (old[i]) DeleteObject(old[i]);
+    }
+}
+
+static void SetWindowIconIndex(GuiContext* ctx, int index)
+{
+    HICON icon = NULL;
+    if (!ctx->targetExe[0] || index < 0 || ExtractIconExW(ctx->targetExe, index, &icon, NULL, 1) == 0 || !icon) {
+        return;
+    }
+    SendMessageW(ctx->hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
+    SendMessageW(ctx->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+    if (ctx->hIcon) DestroyIcon(ctx->hIcon);
+    ctx->hIcon = icon;
+}
+
+// -----------------------------------------------------------------------------
+// Layout
+// -----------------------------------------------------------------------------
+
+static int PaletteRows(const GuiContext* ctx)
+{
+    int rows = (ctx->actionCount > 5) ? (int)((ctx->actionCount + 1) / 2) : (int)ctx->actionCount;
+    return rows < 1 ? 1 : rows;
+}
+
+// Top of the Browse/Close row under the action buttons
+static int PaletteFooterTop(const GuiContext* ctx)
+{
+    int rows = PaletteRows(ctx);
+    return ctx->scale(72) + rows * ctx->scale(36) + (rows - 1) * ctx->scale(8) + ctx->scale(18);
+}
+
+static HDWP Place(HDWP hdwp, HWND hwnd, int x, int y, int w, int h, bool visible)
+{
+    if (!hdwp || !hwnd) return hdwp;
+    return DeferWindowPos(hdwp, hwnd, NULL, x, y, w, h,
+        SWP_NOZORDER | SWP_NOACTIVATE | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+}
+
+// Positions every control and shows only those of the current state
+static void LayoutControls(GuiContext* ctx)
+{
     RECT rc;
-    GetClientRect(hwnd, &rc);
+    GetClientRect(ctx->hwnd, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
 
     int m = ctx->scale(16);
     int btnW = ctx->scale(110);
     int btnH = ctx->scale(28);
+    bool palette = ctx->state == STATE_PALETTE;
+    bool finished = ctx->state == STATE_FINISHED;
 
-    HDWP hdwp = BeginDeferWindowPos(32);
+    HDWP hdwp = BeginDeferWindowPos(16 + MAX_SHELL_ACTIONS);
 
-    if (ctx->state == STATE_PALETTE) {
-        int titleH = ctx->scale(24);
-        int subH = ctx->scale(18);
-        if (ctx->hTargetTitle) {
-            hdwp = DeferWindowPos(hdwp, ctx->hTargetTitle, NULL, m, m, w - m * 2, titleH, SWP_NOZORDER);
-        }
-        if (ctx->hTargetSub) {
-            hdwp = DeferWindowPos(hdwp, ctx->hTargetSub, NULL, m, m + titleH + ctx->scale(2), w - m * 2, subH, SWP_NOZORDER);
-        }
+    // Palette
+    hdwp = Place(hdwp, ctx->hTargetTitle, m, m, w - m * 2, ctx->scale(24), palette);
+    hdwp = Place(hdwp, ctx->hTargetSub, m, m + ctx->scale(26), w - m * 2, ctx->scale(18), palette);
 
-        int startY = m + titleH + subH + ctx->scale(14);
-        int actionBtnH = ctx->scale(36);
-        int gap = ctx->scale(8);
-
-        int cols = (ctx->actionCount > 5) ? 2 : 1;
-        int colW = (cols == 2) ? (w - m * 2 - gap) / 2 : (w - m * 2);
-
-        for (size_t i = 0; i < ctx->actionCount; i++) {
-            if (ctx->hActionBtns[i]) {
-                int col = (int)(i % cols);
-                int row = (int)(i / cols);
-                int x = m + col * (colW + gap);
-                int y = startY + row * (actionBtnH + gap);
-                hdwp = DeferWindowPos(hdwp, ctx->hActionBtns[i], NULL, x, y, colW, actionBtnH, SWP_NOZORDER | SWP_SHOWWINDOW);
-            }
-        }
-
-        int rows = (ctx->actionCount > 5) ? (int)((ctx->actionCount + 1) / 2) : (int)ctx->actionCount;
-        if (rows < 1) rows = 1;
-        int lastBtnBottom = startY + rows * actionBtnH + (rows - 1) * gap;
-        int bottomGap = ctx->scale(18);
-        int bottomY = lastBtnBottom + bottomGap;
-
-        if (ctx->hBtnBrowse) {
-            hdwp = DeferWindowPos(hdwp, ctx->hBtnBrowse, NULL, m, bottomY, ctx->scale(140), btnH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-        if (ctx->hBtnClose) {
-            hdwp = DeferWindowPos(hdwp, ctx->hBtnClose, NULL, w - m - btnW, bottomY, btnW, btnH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-    } else {
-        // STATE_RUNNING / STATE_FINISHED (Progress Mode)
-        int titleH = ctx->scale(22);
-        int statusH = ctx->scale(18);
-        int progressH = ctx->scale(14);
-
-        if (ctx->hTitleStatic) {
-            hdwp = DeferWindowPos(hdwp, ctx->hTitleStatic, NULL, m, ctx->scale(12), w - m * 2, titleH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-        if (ctx->hStatusStatic) {
-            hdwp = DeferWindowPos(hdwp, ctx->hStatusStatic, NULL, m, ctx->scale(36), w - m * 2, statusH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-
-        int editY = ctx->scale(58);
-        if (ctx->hProgress && ctx->guiMode != GUI_INFO) {
-            hdwp = DeferWindowPos(hdwp, ctx->hProgress, NULL, m, ctx->scale(58), w - m * 2, progressH, SWP_NOZORDER | SWP_SHOWWINDOW);
-            editY = ctx->scale(80);
-        }
-
-        int btnY = h - m - btnH;
-        int editH = btnY - editY - ctx->scale(10);
-        if (editH < ctx->scale(40)) editH = ctx->scale(40);
-
-        if (ctx->hEdit) {
-            hdwp = DeferWindowPos(hdwp, ctx->hEdit, NULL, m, editY, w - m * 2, editH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
-
-        int curX = m;
-        if (ctx->hBtnBack) {
-            int backBtnW = ctx->scale(150);
-            hdwp = DeferWindowPos(hdwp, ctx->hBtnBack, NULL, curX, btnY, backBtnW, btnH, SWP_NOZORDER | (ctx->isFinished ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-            curX += backBtnW + ctx->scale(8);
-        }
-        if (ctx->hBtnFolder) {
-            int folderBtnW = ctx->scale(130);
-            hdwp = DeferWindowPos(hdwp, ctx->hBtnFolder, NULL, curX, btnY, folderBtnW, btnH, SWP_NOZORDER | (ctx->isFinished ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-        }
-        if (ctx->hBtnClose) {
-            hdwp = DeferWindowPos(hdwp, ctx->hBtnClose, NULL, w - m - btnW, btnY, btnW, btnH, SWP_NOZORDER | SWP_SHOWWINDOW);
-        }
+    int cols = (ctx->actionCount > 5) ? 2 : 1;
+    int gap = ctx->scale(8);
+    int colW = (w - m * 2 - gap * (cols - 1)) / cols;
+    int actionH = ctx->scale(36);
+    for (size_t i = 0; i < ctx->actionCount; i++) {
+        int x = m + (int)(i % cols) * (colW + gap);
+        int y = ctx->scale(72) + (int)(i / cols) * (actionH + gap);
+        hdwp = Place(hdwp, ctx->hActionBtns[i], x, y, colW, actionH, palette);
     }
+    hdwp = Place(hdwp, ctx->hBtnBrowse, m, PaletteFooterTop(ctx), ctx->scale(140), btnH, palette);
 
-    EndDeferWindowPos(hdwp);
+    // Progress
+    bool hasProgress = ctx->guiMode != GUI_INFO;
+    int editY = ctx->scale(hasProgress ? 80 : 58);
+    int bottomY = h - m - btnH;
+    int editH = bottomY - editY - ctx->scale(10);
+    if (editH < ctx->scale(40)) editH = ctx->scale(40);
+
+    hdwp = Place(hdwp, ctx->hTitleStatic, m, ctx->scale(12), w - m * 2, ctx->scale(22), !palette);
+    hdwp = Place(hdwp, ctx->hStatusStatic, m, ctx->scale(36), w - m * 2, ctx->scale(18), !palette);
+    hdwp = Place(hdwp, ctx->hProgress, m, ctx->scale(58), w - m * 2, ctx->scale(14), hasProgress && ctx->state == STATE_RUNNING);
+    hdwp = Place(hdwp, ctx->hEdit, m, editY, w - m * 2, editH, !palette);
+    hdwp = Place(hdwp, ctx->hBtnBack, m, bottomY, ctx->scale(150), btnH, finished);
+    hdwp = Place(hdwp, ctx->hBtnFolder, m + ctx->scale(158), bottomY, ctx->scale(130), btnH, finished);
+
+    int closeY = palette ? PaletteFooterTop(ctx) : bottomY;
+    hdwp = Place(hdwp, ctx->hBtnClose, w - m - btnW, closeY, btnW, btnH, true);
+
+    if (hdwp) EndDeferWindowPos(hdwp);
+}
+
+// Client width 0 keeps the current one
+static void SetClientSize(GuiContext* ctx, int clientW, int clientH)
+{
+    RECT client;
+    GetClientRect(ctx->hwnd, &client);
+    RECT adj = { 0, 0, clientW ? clientW : client.right, clientH };
+    AdjustWindowRectEx(&adj, (DWORD)GetWindowLongPtrW(ctx->hwnd, GWL_STYLE), FALSE,
+        (DWORD)GetWindowLongPtrW(ctx->hwnd, GWL_EXSTYLE));
+    SetWindowPos(ctx->hwnd, NULL, 0, 0, adj.right - adj.left, adj.bottom - adj.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Client width that fits the widest action title in its column, not wider
+// than the monitor; never narrower than the current window
+static int PaletteClientWidth(GuiContext* ctx)
+{
+    int iconSize = ctx->scale(16);
+    int textW = 0;
+    HDC hdc = GetDC(ctx->hwnd);
+    HGDIOBJ oldFont = SelectObject(hdc, ctx->hFontUi);
+    for (size_t i = 0; i < ctx->actionCount; i++) {
+        SIZE size;
+        const wchar_t* title = ctx->actionDefs[i].title;
+        if (GetTextExtentPoint32W(hdc, title, lstrlenW(title), &size) && size.cx > textW) textW = size.cx;
+    }
+    SelectObject(hdc, oldFont);
+    ReleaseDC(ctx->hwnd, hdc);
+
+    // Icon margins as set in LoadPaletteForFiles, the text, a right padding
+    int buttonW = ctx->scale(8) + iconSize + ctx->scale(8) + textW + ctx->scale(16);
+    int cols = (ctx->actionCount > 5) ? 2 : 1;
+    int width = ctx->scale(16) * 2 + cols * buttonW + (cols - 1) * ctx->scale(8);
+
+    RECT client;
+    GetClientRect(ctx->hwnd, &client);
+    if (width < client.right) width = client.right;
+
+    MONITORINFO mi = { sizeof(mi) };
+    if (GetMonitorInfoW(MonitorFromWindow(ctx->hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        int maxW = (mi.rcWork.right - mi.rcWork.left) * 9 / 10;
+        if (width > maxW) width = maxW;
+    }
+    return width;
+}
+
+static void CenterOnMonitor(HWND hwnd)
+{
+    RECT rc;
+    GetWindowRect(hwnd, &rc);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - (rc.right - rc.left)) / 2;
+    int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - (rc.bottom - rc.top)) / 2;
+    SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 // -----------------------------------------------------------------------------
 // Background Worker Thread (Pipe Streaming)
 // -----------------------------------------------------------------------------
 
+struct WorkerArgs {
+    HWND hwnd;
+    HANDLE pipe;
+    HANDLE process;
+    LONG runId;
+};
+
+// Length of the prefix that does not end inside a UTF-8 sequence
 static int Utf8CompletePrefix(const unsigned char* p, int n)
 {
     int i = n - 1, back = 0;
@@ -272,427 +362,161 @@ static int Utf8CompletePrefix(const unsigned char* p, int n)
     if (i < 0) return n;
     unsigned char c = p[i];
     int need = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
-    return (n - i >= need) ? n : i;   // иначе переносим хвост с lead-байта
+    return (n - i >= need) ? n : i;
 }
 
+// Decodes a chunk (UTF-8, or the OEM code page of console tools) with LF -> CRLF
+// for the edit control and posts it to the window
+static void PostOutput(const WorkerArgs& a, const char* bytes, int len)
+{
+    if (len <= 0) return;
+    UINT codePage = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(codePage, flags, bytes, len, NULL, 0);
+    if (n <= 0) {
+        codePage = GetOEMCP();
+        flags = 0;
+        n = MultiByteToWideChar(codePage, flags, bytes, len, NULL, 0);
+        if (n <= 0) return;
+    }
+
+    // Decoded into the upper half, expanded downwards: writing position 2i+1
+    // never reaches the unread character n+i+1
+    wchar_t* text = (wchar_t*)malloc((2 * n + 1) * sizeof(wchar_t));
+    if (!text) return;
+    const wchar_t* src = text + n;
+    MultiByteToWideChar(codePage, flags, bytes, len, text + n, n);
+    int j = 0;
+    for (int i = 0; i < n; i++) {
+        wchar_t c = src[i];
+        if (c == L'\n' && (i == 0 || src[i - 1] != L'\r')) text[j++] = L'\r';
+        text[j++] = c;
+    }
+    text[j] = L'\0';
+    if (!PostMessageW(a.hwnd, WM_BPDF_APPEND, (WPARAM)a.runId, (LPARAM)text)) free(text);
+}
+
+// The run ends when bpdf.exe exits, not when the pipe closes: a program it
+// starts (a browser window) may hold a copy of the pipe for much longer
 static DWORD WINAPI WorkerThreadProc(LPVOID param)
 {
-    GuiContext* ctx = (GuiContext*)param;
-    if (!ctx || !ctx->cmdLine) return 1;
+    WorkerArgs a = *(WorkerArgs*)param;
+    free(param);
 
-    HANDLE hReadPipe = NULL;
-    HANDLE hWritePipe = NULL;
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    char buf[4096 + 4];
+    int carry = 0;
+    for (;;) {
+        bool exited = WaitForSingleObject(a.process, 0) == WAIT_OBJECT_0;
+        DWORD avail = 0;
+        if (!PeekNamedPipe(a.pipe, NULL, 0, NULL, &avail, NULL)) break;
+        if (avail == 0) {
+            if (exited) break;
+            WaitForSingleObject(a.process, 50);
+            continue;
+        }
 
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, 0);
-        return 1;
+        DWORD read = 0;
+        if (!ReadFile(a.pipe, buf + carry, avail < 4096 ? avail : 4096, &read, NULL) || read == 0) break;
+        int len = carry + (int)read;
+        // An unfinished UTF-8 sequence or a CR without its LF waits for the next chunk
+        int done = Utf8CompletePrefix((const unsigned char*)buf, len);
+        if (done > 0 && buf[done - 1] == '\r') done--;
+        PostOutput(a, buf, done);
+        carry = len - done;
+        memmove(buf, buf + done, carry);
     }
-    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+    PostOutput(a, buf, carry);
+    CloseHandle(a.pipe);
 
-    // Create a NUL stdin handle so bpdf.exe does not inherit console/blocking stdin
-    HANDLE hNullInput = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    DWORD exitCode = 1;
+    WaitForSingleObject(a.process, INFINITE);
+    GetExitCodeProcess(a.process, &exitCode);
+    CloseHandle(a.process);
+    PostMessageW(a.hwnd, WM_BPDF_FINISHED, exitCode, (LPARAM)a.runId);
+    return 0;
+}
+
+// Starts bpdf.exe with its output piped to a worker thread
+static bool SpawnProcess(GuiContext* ctx, wchar_t* cmdLine, wchar_t* environment)
+{
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE readPipe = NULL;
+    HANDLE writePipe = NULL;
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) return false;
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
 
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    si.hStdInput = (hNullInput != INVALID_HANDLE_VALUE) ? hNullInput : NULL;
+    si.hStdInput = (nul != INVALID_HANDLE_VALUE) ? nul : NULL;
+    si.hStdOutput = writePipe;
+    si.hStdError = writePipe;
 
-    PROCESS_INFORMATION pi = { 0 };
-
-    SetEnvironmentVariableW(L"BPDF_NO_PAUSE", L"1");
-
-    BOOL spawned = CreateProcessW(
-        NULL,
-        ctx->cmdLine,
-        NULL,
-        NULL,
-        TRUE,
-        CREATE_NO_WINDOW | CREATE_SUSPENDED,
-        NULL,
-        ctx->workDir[0] ? ctx->workDir : NULL,
-        &si,
-        &pi
-    );
-
-    CloseHandle(hWritePipe);
-    if (hNullInput != INVALID_HANDLE_VALUE) CloseHandle(hNullInput);
-
-    if (!spawned) {
-        CloseHandle(hReadPipe);
-        PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, 0);
-        return 1;
+    PROCESS_INFORMATION pi = {};
+    BOOL created = CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, environment,
+        ctx->workDir.empty() ? NULL : ctx->workDir.c_str(), &si, &pi);
+    CloseHandle(writePipe);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    if (!created) {
+        CloseHandle(readPipe);
+        return false;
     }
 
+    // Cancelling takes bpdf's helpers (FFmpeg, PowerShell, Office) down with it;
+    // a browser window it opens for the user leaves the job (BREAKAWAY_OK)
+    ctx->hJob = CreateJobObjectW(NULL, NULL);
     if (ctx->hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        SetInformationJobObject(ctx->hJob, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
         AssignProcessToJobObject(ctx->hJob, pi.hProcess);
     }
-    // Ownership of pi.hProcess belongs to GuiContext (closed on main thread after worker exits)
-    ctx->hProcess = pi.hProcess;
-
-    if (InterlockedCompareExchange(&ctx->isCancelled, 0, 0) == 1) {
-        if (ctx->hJob) TerminateJobObject(ctx->hJob, 1);
-        else TerminateProcess(pi.hProcess, 1);
-        CloseHandle(pi.hThread);
-        CloseHandle(hReadPipe);
-        PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, 0);
-        return 1;
-    }
-
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
+    ctx->hProcess = pi.hProcess;
 
-    char rawBuf[2048];
-    char carryBuf[8];
-    int carryLen = 0;
-    DWORD bytesRead = 0;
-
-    while (ReadFile(hReadPipe, rawBuf, sizeof(rawBuf) - 8, &bytesRead, NULL) && bytesRead > 0) {
-        if (InterlockedCompareExchange(&ctx->isCancelled, 0, 0) == 1) break;
-
-        char procBuf[sizeof(rawBuf) + 8];
-        int procLen = 0;
-        if (carryLen > 0) {
-            memcpy(procBuf, carryBuf, carryLen);
-            procLen = carryLen;
-            carryLen = 0;
-        }
-        memcpy(procBuf + procLen, rawBuf, bytesRead);
-        procLen += (int)bytesRead;
-
-        int validLen = Utf8CompletePrefix((const unsigned char*)procBuf, procLen);
-
-        // If the last byte of the chunk is '\r', hold it back so that '\r\n'
-        // is never split across two chunks (which would produce '\r\r\n' in NormalizeLineEndings).
-        if (validLen > 0 && procBuf[validLen - 1] == '\r') {
-            validLen--;
-        }
-
-        if (validLen < procLen) {
-            carryLen = procLen - validLen;
-            if (carryLen > (int)sizeof(carryBuf)) carryLen = (int)sizeof(carryBuf);
-            memcpy(carryBuf, procBuf + validLen, carryLen);
-        }
-
-        if (validLen > 0) {
-            int wChars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, procBuf, validLen, NULL, 0);
-            UINT codePage = CP_UTF8;
-            DWORD convFlags = MB_ERR_INVALID_CHARS;
-            int decodeLen = validLen;
-
-            if (wChars <= 0) {
-                // Not valid UTF-8. The output is likely OEM (CP866 on Russian Windows) or ANSI (CP1251).
-                // Reclaim any carried bytes since single-byte encodings have no multi-byte split sequences.
-                decodeLen = procLen;
-                carryLen = 0;
-                convFlags = 0;
-
-                codePage = GetOEMCP();
-                wChars = MultiByteToWideChar(codePage, 0, procBuf, decodeLen, NULL, 0);
-                if (wChars <= 0) {
-                    codePage = CP_ACP;
-                    wChars = MultiByteToWideChar(codePage, 0, procBuf, decodeLen, NULL, 0);
-                }
-                if (wChars <= 0) {
-                    codePage = CP_UTF8;
-                    wChars = MultiByteToWideChar(CP_UTF8, 0, procBuf, decodeLen, NULL, 0);
-                }
-            }
-
-            if (wChars > 0) {
-                wchar_t* wBuf = (wchar_t*)malloc((wChars + 1) * sizeof(wchar_t));
-                if (wBuf) {
-                    MultiByteToWideChar(codePage, convFlags, procBuf, decodeLen, wBuf, wChars);
-                    wBuf[wChars] = L'\0';
-
-                    int normLen = 0;
-                    wchar_t* normBuf = NormalizeLineEndings(wBuf, wChars, normLen);
-                    free(wBuf);
-                    if (normBuf) {
-                        if (!PostMessageW(ctx->hwnd, WM_BPDF_APPEND, 0, (LPARAM)normBuf)) {
-                            free(normBuf);
-                        }
-                    }
-                }
-            }
-        }
+    WorkerArgs* args = (WorkerArgs*)malloc(sizeof(WorkerArgs));
+    if (args && DuplicateHandle(GetCurrentProcess(), pi.hProcess, GetCurrentProcess(), &args->process,
+                                0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        args->hwnd = ctx->hwnd;
+        args->pipe = readPipe;
+        args->runId = ctx->runId;
+        ctx->hWorkerThread = CreateThread(NULL, 0, WorkerThreadProc, args, 0, NULL);
+        if (ctx->hWorkerThread) return true;
+        CloseHandle(args->process);
     }
-
-    if (carryLen > 0 && InterlockedCompareExchange(&ctx->isCancelled, 0, 0) == 0) {
-        int wChars = MultiByteToWideChar(CP_UTF8, 0, carryBuf, carryLen, NULL, 0);
-        UINT cp = CP_UTF8;
-        if (wChars <= 0) {
-            cp = GetOEMCP();
-            wChars = MultiByteToWideChar(cp, 0, carryBuf, carryLen, NULL, 0);
-        }
-        if (wChars > 0) {
-            wchar_t* wBuf = (wchar_t*)malloc((wChars + 1) * sizeof(wchar_t));
-            if (wBuf) {
-                MultiByteToWideChar(cp, 0, carryBuf, carryLen, wBuf, wChars);
-                wBuf[wChars] = L'\0';
-                int normLen = 0;
-                wchar_t* normBuf = NormalizeLineEndings(wBuf, wChars, normLen);
-                free(wBuf);
-                if (normBuf) {
-                    if (!PostMessageW(ctx->hwnd, WM_BPDF_APPEND, 0, (LPARAM)normBuf)) {
-                        free(normBuf);
-                    }
-                }
-            }
-        }
-    }
-
-    CloseHandle(hReadPipe);
-
-    DWORD exitCode = 0;
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
-    PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, exitCode, 0);
-    return exitCode;
-}
-
-// -----------------------------------------------------------------------------
-// Load Actions for Selected Files & Adjust Window Size
-// -----------------------------------------------------------------------------
-
-static void LoadPaletteForFiles(GuiContext* ctx)
-{
-    // Clean up old action buttons
-    for (size_t i = 0; i < MAX_SHELL_ACTIONS; i++) {
-        if (ctx->hActionBtns[i]) {
-            DestroyWindow(ctx->hActionBtns[i]);
-            ctx->hActionBtns[i] = NULL;
-        }
-        if (ctx->hActionIml[i]) {
-            ImageList_Destroy(ctx->hActionIml[i]);
-            ctx->hActionIml[i] = NULL;
-        }
-    }
-    ctx->actionCount = 0;
-
-    if (ctx->files.empty()) {
-        SetWindowTextW(ctx->hTargetTitle, L"Файлы не выбраны");
-        SetWindowTextW(ctx->hTargetSub, L"Перетащите файлы сюда (Drag & Drop) или нажмите «Выбрать файлы...»");
-        if (ctx->hBtnBrowse) ShowWindow(ctx->hBtnBrowse, SW_SHOW);
-        LayoutControls(ctx->hwnd, ctx);
-        return;
-    }
-
-    // Set summary in header
-    if (ctx->files.size() == 1) {
-        wchar_t name[MAX_PATH * 2];
-        lstrcpynW(name, PathFindFileNameW(ctx->files[0]), ARRAYSIZE(name));
-        SetWindowTextW(ctx->hTargetTitle, name);
-
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        wchar_t subInfo[512] = {0};
-        if (GetFileAttributesExW(ctx->files[0], GetFileExInfoStandard, &fad)) {
-            if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", ctx->files[0]);
-            } else {
-                ULARGE_INTEGER uli;
-                uli.LowPart = fad.nFileSizeLow;
-                uli.HighPart = fad.nFileSizeHigh;
-                DWORD sizeMbInt = (DWORD)(uli.QuadPart / (1024 * 1024));
-                DWORD sizeMbDec = (DWORD)(((uli.QuadPart % (1024 * 1024)) * 10) / (1024 * 1024));
-                if (sizeMbInt > 0) {
-                    wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u.%u МБ  |  %s", sizeMbInt, sizeMbDec, ctx->files[0]);
-                } else {
-                    DWORD sizeKb = (DWORD)(uli.QuadPart / 1024);
-                    wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u КБ  |  %s", sizeKb, ctx->files[0]);
-                }
-            }
-        } else {
-            lstrcpynW(subInfo, ctx->files[0], ARRAYSIZE(subInfo));
-        }
-        SetWindowTextW(ctx->hTargetSub, subInfo);
-    } else {
-        wchar_t summary[256];
-        wnsprintfW(summary, ARRAYSIZE(summary), L"Выбрано файлов: %d", (int)ctx->files.size());
-        SetWindowTextW(ctx->hTargetTitle, summary);
-
-        StrW fullPath, dir, name, ext;
-        SplitPathParts(ctx->files[0], fullPath, dir, name, ext);
-        wchar_t subInfo[512];
-        wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", dir.c_str());
-        SetWindowTextW(ctx->hTargetSub, subInfo);
-    }
-
-    // Determine INI section
-    wchar_t section[64];
-    GetSectionForFiles(ctx->files, section, ARRAYSIZE(section));
-
-    // Read INI
-    wchar_t iniPath[MAX_PATH * 2] = {0};
-    StrW iniContent;
-    if (FindBpdfIni(iniPath, ARRAYSIZE(iniPath))) {
-        ReadTextFile(iniPath, iniContent);
-    }
-
-    MenuItemDef items[MAX_INI_ITEMS];
-    size_t count = ParseIniSection(iniContent.c_str(), section, items, ARRAYSIZE(items));
-
-    if (count == 0 && iniContent.length() == 0) {
-        SetWindowTextW(ctx->hTargetSub, L"Файл конфигурации bpdf_shell.ini не найден");
-    } else if (!ctx->targetExe[0]) {
-        SetWindowTextW(ctx->hTargetSub, L"Предупреждение: bpdf.exe не найден рядом или в PATH");
-    }
-
-    int iconSize = ctx->scale(16);
-
-    // Create buttons for non-separator items
-    size_t btnIndex = 0;
-    for (size_t i = 0; i < count && btnIndex < MAX_SHELL_ACTIONS; i++) {
-        if (items[i].iconIndex == -1 || items[i].title[0] == L'\0') {
-            continue;
-        }
-
-        ctx->actionDefs[btnIndex] = items[i];
-
-        HWND hBtn = CreateWindowExW(
-            0,
-            L"BUTTON",
-            items[i].title,
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-            0, 0, 100, 30,
-            ctx->hwnd,
-            (HMENU)(INT_PTR)(ID_ACTION_BASE + btnIndex),
-            (HINSTANCE)GetWindowLongPtrW(ctx->hwnd, GWLP_HINSTANCE),
-            NULL
-        );
-
-        if (hBtn) {
-            SendMessageW(hBtn, WM_SETFONT, (WPARAM)ctx->hFontButton, TRUE);
-
-            // Set button icon if available from targetExe (with DPI scaling)
-            if (ctx->targetExe[0] && items[i].iconIndex >= 0) {
-                HICON hIconExtracted = NULL;
-                UINT extracted = PrivateExtractIconsW(
-                    ctx->targetExe,
-                    items[i].iconIndex,
-                    iconSize,
-                    iconSize,
-                    &hIconExtracted,
-                    NULL,
-                    1,
-                    LR_DEFAULTCOLOR
-                );
-                if (extracted == 0 || extracted == 0xFFFFFFFF || !hIconExtracted) {
-                    ExtractIconExW(ctx->targetExe, items[i].iconIndex, NULL, &hIconExtracted, 1);
-                }
-                if (hIconExtracted) {
-                    HIMAGELIST himl = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 1);
-                    if (himl) {
-                        ImageList_AddIcon(himl, hIconExtracted);
-                        BUTTON_IMAGELIST bil = {0};
-                        bil.himl = himl;
-                        bil.margin.left = ctx->scale(8);
-                        bil.uAlign = BUTTON_IMAGELIST_ALIGN_LEFT;
-                        SendMessageW(hBtn, BCM_SETIMAGELIST, 0, (LPARAM)&bil);
-                        ctx->hActionIml[btnIndex] = himl;
-                    }
-                    DestroyIcon(hIconExtracted);
-                }
-            }
-
-            ctx->hActionBtns[btnIndex] = hBtn;
-            btnIndex++;
-        }
-    }
-    ctx->actionCount = btnIndex;
-
-    // Auto-adjust window height accurately based on buttons grid
-    int rows = (ctx->actionCount > 5) ? (int)((ctx->actionCount + 1) / 2) : (int)ctx->actionCount;
-    if (rows < 1) rows = 1;
-
-    int m = ctx->scale(16);
-    int titleH = ctx->scale(24);
-    int subH = ctx->scale(18);
-    int startY = m + titleH + subH + ctx->scale(14);
-    int actionBtnH = ctx->scale(36);
-    int gap = ctx->scale(8);
-
-    int lastBtnBottom = startY + rows * actionBtnH + (rows - 1) * gap;
-    int bottomGap = ctx->scale(18);
-    int btnH = ctx->scale(28);
-    int neededClientH = lastBtnBottom + bottomGap + btnH + m;
-
-    RECT curRc;
-    GetWindowRect(ctx->hwnd, &curRc);
-    int curW = curRc.right - curRc.left;
-
-    RECT adjRc = { 0, 0, curW, neededClientH };
-    DWORD style = (DWORD)GetWindowLongPtrW(ctx->hwnd, GWL_STYLE);
-    DWORD exStyle = (DWORD)GetWindowLongPtrW(ctx->hwnd, GWL_EXSTYLE);
-    AdjustWindowRectEx(&adjRc, style, FALSE, exStyle);
-
-    int totalWindowH = adjRc.bottom - adjRc.top;
-    SetWindowPos(ctx->hwnd, NULL, 0, 0, curW, totalWindowH, SWP_NOMOVE | SWP_NOZORDER);
-
-    LayoutControls(ctx->hwnd, ctx);
-}
-
-// -----------------------------------------------------------------------------
-// Return to Action Palette
-// -----------------------------------------------------------------------------
-
-static void ReturnToPalette(GuiContext* ctx)
-{
-    if (!ctx) return;
-    KillTimer(ctx->hwnd, ID_TIMER_AUTOCLOSE);
-
+    free(args);
+    CloseHandle(readPipe);
     ctx->stopWorker();
-    FlushPendingAppendMessages(ctx->hwnd);
+    return false;
+}
 
-    if (ctx->tempManifest[0]) {
-        DeleteFileW(ctx->tempManifest);
-        ctx->tempManifest[0] = L'\0';
-    }
+// "NAME=value\0" entries of vars, then the rest of our environment
+static bool BuildEnvironment(const StrW& vars, StrW& out)
+{
+    wchar_t* parent = GetEnvironmentStringsW();
+    const wchar_t* e = parent;
+    while (e && *e) e += wcslen(e) + 1;
+    size_t parentLen = e ? (size_t)(e - parent) : 0;
 
-    ctx->state = STATE_PALETTE;
-    ctx->isPaletteSession = true;
-    ctx->filesEmbeddedInCmd = false;
-    ctx->isFinished = 0;
-    ctx->isCancelled = 0;
-
-    // Reset window icon back to logo
-    if (ctx->targetExe[0]) {
-        HICON hLogo = NULL;
-        if (ExtractIconExW(ctx->targetExe, 0, &hLogo, NULL, 1) > 0 && hLogo) {
-            if (ctx->hIcon) DestroyIcon(ctx->hIcon);
-            ctx->hIcon = hLogo;
-            SendMessageW(ctx->hwnd, WM_SETICON, ICON_BIG, (LPARAM)ctx->hIcon);
-            SendMessageW(ctx->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)ctx->hIcon);
+    // One allocation: a reallocation would leave copies of the passwords behind
+    bool ok = out.reserve(vars.len + parentLen + 1);
+    if (ok) {
+        out.append(vars.data, vars.len);
+        for (e = parent; e && *e; e += wcslen(e) + 1) {
+            bool overridden = false;
+            for (const wchar_t* v = vars.data; v < vars.data + vars.len && !overridden; v += wcslen(v) + 1) {
+                size_t nameLen = wcscspn(v, L"=");
+                overridden = _wcsnicmp(e, v, nameLen) == 0 && e[nameLen] == L'=';
+            }
+            if (!overridden) out.append(e, wcslen(e) + 1);
         }
+        out.append(L'\0');
     }
-
-    // Hide execution controls
-    if (ctx->hTitleStatic) ShowWindow(ctx->hTitleStatic, SW_HIDE);
-    if (ctx->hStatusStatic) ShowWindow(ctx->hStatusStatic, SW_HIDE);
-    if (ctx->hProgress) ShowWindow(ctx->hProgress, SW_HIDE);
-    if (ctx->hEdit) ShowWindow(ctx->hEdit, SW_HIDE);
-    if (ctx->hBtnFolder) ShowWindow(ctx->hBtnFolder, SW_HIDE);
-    if (ctx->hBtnBack) ShowWindow(ctx->hBtnBack, SW_HIDE);
-
-    // Clear edit log
-    if (ctx->hEdit) SetWindowTextW(ctx->hEdit, L"");
-
-    // Show palette controls
-    if (ctx->hTargetTitle) ShowWindow(ctx->hTargetTitle, SW_SHOW);
-    if (ctx->hTargetSub) ShowWindow(ctx->hTargetSub, SW_SHOW);
-    if (ctx->hBtnBrowse) ShowWindow(ctx->hBtnBrowse, SW_SHOW);
-    if (ctx->hBtnClose) {
-        ShowWindow(ctx->hBtnClose, SW_SHOW);
-        SetWindowTextW(ctx->hBtnClose, L"Закрыть");
-    }
-
-    SetWindowTextW(ctx->hwnd, L"bpdf — Панель действий");
-
-    // Reload palette (re-reads file sizes and recreates buttons)
-    LoadPaletteForFiles(ctx);
+    if (parent) FreeEnvironmentStringsW(parent);
+    return ok;
 }
 
 // -----------------------------------------------------------------------------
@@ -702,7 +526,6 @@ static void ReturnToPalette(GuiContext* ctx)
 #define ID_IB_EDIT 1001
 
 struct InputBoxParams {
-    const wchar_t* title;
     const wchar_t* prompt;
     const wchar_t* defVal;
     wchar_t outVal[512];
@@ -733,70 +556,63 @@ static LRESULT CALLBACK InputBoxWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         HWND hPrompt = CreateWindowExW(0, L"STATIC", p->prompt,
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             m, m, w - m * 2, promptH, hwnd, NULL, cs->hInstance, NULL);
-        if (p->hFont) SendMessageW(hPrompt, WM_SETFONT, (WPARAM)p->hFont, TRUE);
 
         DWORD editStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL;
         if (p->isPassword) editStyle |= ES_PASSWORD;
 
-        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", p->defVal ? p->defVal : L"",
+        HWND hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", p->defVal,
             editStyle,
             m, m + promptH + MulDiv(4, dpi, 96), w - m * 2, editH, hwnd, (HMENU)(INT_PTR)ID_IB_EDIT, cs->hInstance, NULL);
-        if (p->hFont) SendMessageW(hEdit, WM_SETFONT, (WPARAM)p->hFont, TRUE);
-        SendMessageW(hEdit, EM_SETSEL, 0, -1);
-        SetFocus(hEdit);
 
         int btnY = m + promptH + editH + MulDiv(14, dpi, 96);
 
         HWND hBtnOk = CreateWindowExW(0, L"BUTTON", L"OK",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
             w - m - btnW * 2 - MulDiv(8, dpi, 96), btnY, btnW, btnH, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
-        if (p->hFont) SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)p->hFont, TRUE);
 
         HWND hBtnCancel = CreateWindowExW(0, L"BUTTON", L"Отмена",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
             w - m - btnW, btnY, btnW, btnH, hwnd, (HMENU)IDCANCEL, cs->hInstance, NULL);
-        if (p->hFont) SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)p->hFont, TRUE);
 
+        HWND controls[] = { hPrompt, hEdit, hBtnOk, hBtnCancel };
+        for (size_t i = 0; i < ARRAYSIZE(controls); i++) {
+            if (p->hFont) SendMessageW(controls[i], WM_SETFONT, (WPARAM)p->hFont, TRUE);
+        }
+        SendMessageW(hEdit, EM_SETSEL, 0, -1);
+        SetFocus(hEdit);
         return 0;
     }
 
     case WM_COMMAND: {
         int id = LOWORD(wParam);
-        if (id == IDOK) {
-            if (p) {
-                HWND hEdit = GetDlgItem(hwnd, ID_IB_EDIT);
-                GetWindowTextW(hEdit, p->outVal, ARRAYSIZE(p->outVal));
+        if (id == IDOK || id == IDCANCEL) {
+            if (p && id == IDOK) {
+                GetDlgItemTextW(hwnd, ID_IB_EDIT, p->outVal, ARRAYSIZE(p->outVal));
                 p->okPressed = true;
             }
-            DestroyWindow(hwnd);
-            return 0;
-        } else if (id == IDCANCEL) {
-            if (p) p->okPressed = false;
             DestroyWindow(hwnd);
             return 0;
         }
         break;
     }
 
-    case WM_CLOSE: {
-        if (p) p->okPressed = false;
+    case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
-    }
     }
 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// Modal input dialog; works with a hidden owner (action started before the window is shown)
 static bool ShowInputBox(HWND hwndOwner, const wchar_t* title, const wchar_t* prompt, const wchar_t* defVal, wchar_t* outVal, size_t maxLen, bool isPassword, HFONT hFont, int dpi)
 {
     static bool s_classRegistered = false;
-    HINSTANCE hInst = (HINSTANCE)GetModuleHandleW(NULL);
+    HINSTANCE hInst = GetModuleHandleW(NULL);
     const wchar_t* IB_CLASS = L"BpdfInputBox";
 
     if (!s_classRegistered) {
         WNDCLASSEXW wc = { sizeof(wc) };
-        wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = InputBoxWndProc;
         wc.hInstance = hInst;
         wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
@@ -806,60 +622,53 @@ static bool ShowInputBox(HWND hwndOwner, const wchar_t* title, const wchar_t* pr
         s_classRegistered = true;
     }
 
-    InputBoxParams params;
-    params.title = title ? title : L"bpdf";
-    params.prompt = prompt ? prompt : L"";
-    params.defVal = defVal ? defVal : L"";
-    params.outVal[0] = L'\0';
+    InputBoxParams params = {};
+    params.prompt = prompt;
+    params.defVal = defVal;
     params.isPassword = isPassword;
     params.hFont = hFont;
     params.dpi = (dpi > 0) ? dpi : 96;
-    params.okPressed = false;
 
-    int clientW = MulDiv(400, params.dpi, 96);
-    int clientH = MulDiv(135, params.dpi, 96);
-
-    RECT rc = { 0, 0, clientW, clientH };
+    RECT rc = { 0, 0, MulDiv(400, params.dpi, 96), MulDiv(135, params.dpi, 96) };
     DWORD dwStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    DWORD dwExStyle = WS_EX_DLGMODALFRAME;
+    bool ownerVisible = hwndOwner && IsWindowVisible(hwndOwner);
+    DWORD dwExStyle = WS_EX_DLGMODALFRAME | (ownerVisible ? 0 : WS_EX_APPWINDOW);
     AdjustWindowRectEx(&rc, dwStyle, FALSE, dwExStyle);
-
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
 
-    int posX = (GetSystemMetrics(SM_CXSCREEN) - winW) / 2;
-    int posY = (GetSystemMetrics(SM_CYSCREEN) - winH) / 2;
-
-    if (hwndOwner && IsWindowVisible(hwndOwner)) {
-        RECT parentRc;
-        GetWindowRect(hwndOwner, &parentRc);
-        posX = parentRc.left + ((parentRc.right - parentRc.left) - winW) / 2;
-        posY = parentRc.top + ((parentRc.bottom - parentRc.top) - winH) / 2;
+    RECT area;
+    if (ownerVisible) {
+        GetWindowRect(hwndOwner, &area);
+    } else {
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfoW(MonitorFromWindow(hwndOwner, MONITOR_DEFAULTTOPRIMARY), &mi);
+        area = mi.rcWork;
     }
 
     HWND hDlg = CreateWindowExW(
-        dwExStyle,
-        IB_CLASS,
-        params.title,
-        dwStyle,
-        posX, posY, winW, winH,
-        hwndOwner,
-        NULL,
-        hInst,
-        &params
-    );
-
+        dwExStyle, IB_CLASS, title ? title : L"bpdf", dwStyle,
+        area.left + ((area.right - area.left) - winW) / 2,
+        area.top + ((area.bottom - area.top) - winH) / 2,
+        winW, winH, hwndOwner, NULL, hInst, &params);
     if (!hDlg) return false;
 
-    if (hwndOwner) EnableWindow(hwndOwner, FALSE);
-
+    if (ownerVisible) EnableWindow(hwndOwner, FALSE);
     ShowWindow(hDlg, SW_SHOW);
-    UpdateWindow(hDlg);
+    SetForegroundWindow(hDlg);
 
     MSG msg;
-    while (IsWindow(hDlg) && GetMessageW(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+    while (IsWindow(hDlg)) {
+        BOOL got = GetMessageW(&msg, NULL, 0, 0);
+        if (got == 0) {
+            // WM_QUIT belongs to the main loop
+            PostQuitMessage((int)msg.wParam);
+            DestroyWindow(hDlg);
             params.okPressed = false;
+            break;
+        }
+        if (got == -1) break;
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
             DestroyWindow(hDlg);
             break;
         }
@@ -869,329 +678,540 @@ static bool ShowInputBox(HWND hwndOwner, const wchar_t* title, const wchar_t* pr
         }
     }
 
-    if (hwndOwner) {
+    if (ownerVisible) {
         EnableWindow(hwndOwner, TRUE);
         SetForegroundWindow(hwndOwner);
     }
 
-    if (params.okPressed) {
-        lstrcpynW(outVal, params.outVal, (int)maxLen);
-        return true;
-    }
-    return false;
+    if (params.okPressed) lstrcpynW(outVal, params.outVal, (int)maxLen);
+    SecureZeroMemory(params.outVal, sizeof(params.outVal));
+    return params.okPressed;
 }
 
-static bool ResolveCommandPrompts(HWND hwndOwner, const wchar_t* actionTitle, const wchar_t* inCmd, StrW& outCmd, HFONT hFont, int dpi)
+// -----------------------------------------------------------------------------
+// Command Template Expansion
+// -----------------------------------------------------------------------------
+
+struct Placeholders {
+    StrW file, dir, name, ext, exeDir;
+};
+
+static const wchar_t* const kPlaceholders[] = {
+    L"{file}", L"{dir}", L"{name}", L"{ext}", L"{exe_dir}", L"{tool_dir}"
+};
+
+// Index in kPlaceholders of the placeholder at p, -1 if there is none
+static int MatchPlaceholder(const wchar_t* p, size_t* tagLen)
 {
-    outCmd.clear();
-    if (!inCmd || !inCmd[0]) return true;
-
-    const wchar_t* p = inCmd;
-    while (*p) {
-        const wchar_t* askTag = wcsstr(p, L"{ask:");
-        const wchar_t* askPassTag = wcsstr(p, L"{ask_pass:");
-
-        const wchar_t* startTag = NULL;
-        bool isPass = false;
-        size_t tagPrefixLen = 0;
-
-        if (askTag && askPassTag) {
-            if (askTag < askPassTag) {
-                startTag = askTag;
-                tagPrefixLen = 5;
-            } else {
-                startTag = askPassTag;
-                isPass = true;
-                tagPrefixLen = 10;
-            }
-        } else if (askTag) {
-            startTag = askTag;
-            tagPrefixLen = 5;
-        } else if (askPassTag) {
-            startTag = askPassTag;
-            isPass = true;
-            tagPrefixLen = 10;
+    for (int i = 0; i < (int)ARRAYSIZE(kPlaceholders); i++) {
+        size_t n = wcslen(kPlaceholders[i]);
+        if (wcsncmp(p, kPlaceholders[i], n) == 0) {
+            *tagLen = n;
+            return i;
         }
+    }
+    return -1;
+}
 
-        if (!startTag) {
-            outCmd.append(p);
-            break;
+static const wchar_t* PlaceholderValue(const Placeholders& ph, int index)
+{
+    const StrW* values[] = { &ph.file, &ph.dir, &ph.name, &ph.ext, &ph.exeDir, &ph.exeDir };
+    return values[index]->c_str();
+}
+
+static void AssignFullPath(StrW& out, const wchar_t* path)
+{
+    DWORD n = GetFullPathNameW(path, 0, NULL, NULL);
+    if (n == 0 || !out.reserve(n) || GetFullPathNameW(path, n, out.data, NULL) >= n) {
+        out.assign(path);
+        return;
+    }
+    out.len = wcslen(out.data);
+}
+
+// {file} {dir} {name} {ext} of the first selected file; with no files {dir} is
+// the current directory. A selected folder is its own {dir}
+static void FillPlaceholders(const GuiContext* ctx, Placeholders& ph)
+{
+    ph.exeDir.assign(ctx->targetExe);
+    PathRemoveFileSpecW(ph.exeDir.data);
+    ph.exeDir.len = wcslen(ph.exeDir.data);
+
+    if (ctx->files.empty()) {
+        DWORD n = GetCurrentDirectoryW(0, NULL);
+        if (n && ph.dir.reserve(n) && GetCurrentDirectoryW(n, ph.dir.data) < n) {
+            ph.dir.len = wcslen(ph.dir.data);
         }
-
-        outCmd.append(p, startTag - p);
-
-        // Find matching closing '}' taking nested braces (e.g. {n}, {total}) into account
-        const wchar_t* endTag = NULL;
-        int braceDepth = 0;
-        for (const wchar_t* cur = startTag; *cur; ++cur) {
-            if (*cur == L'{') {
-                braceDepth++;
-            } else if (*cur == L'}') {
-                braceDepth--;
-                if (braceDepth == 0) {
-                    endTag = cur;
-                    break;
-                }
-            }
-        }
-
-        if (!endTag) {
-            outCmd.append(startTag);
-            break;
-        }
-
-        const wchar_t* content = startTag + tagPrefixLen;
-        size_t contentLen = endTag - content;
-
-        wchar_t promptBuf[256] = {0};
-        wchar_t defValBuf[256] = {0};
-
-        // Find ':' separating prompt and default value at top brace level
-        const wchar_t* sep = NULL;
-        int innerDepth = 0;
-        for (const wchar_t* cur = content; cur < endTag; ++cur) {
-            if (*cur == L'{') innerDepth++;
-            else if (*cur == L'}' && innerDepth > 0) innerDepth--;
-            else if (*cur == L':' && innerDepth == 0) {
-                sep = cur;
-                break;
-            }
-        }
-
-        if (sep && sep < endTag) {
-            size_t pLen = sep - content;
-            if (pLen >= ARRAYSIZE(promptBuf)) pLen = ARRAYSIZE(promptBuf) - 1;
-            wmemcpy(promptBuf, content, pLen);
-            promptBuf[pLen] = L'\0';
-
-            size_t dLen = endTag - (sep + 1);
-            if (dLen >= ARRAYSIZE(defValBuf)) dLen = ARRAYSIZE(defValBuf) - 1;
-            wmemcpy(defValBuf, sep + 1, dLen);
-            defValBuf[dLen] = L'\0';
-        } else {
-            size_t pLen = contentLen;
-            if (pLen >= ARRAYSIZE(promptBuf)) pLen = ARRAYSIZE(promptBuf) - 1;
-            wmemcpy(promptBuf, content, pLen);
-            promptBuf[pLen] = L'\0';
-        }
-
-        wchar_t userVal[512] = {0};
-        if (!ShowInputBox(hwndOwner, actionTitle, promptBuf, defValBuf, userVal, ARRAYSIZE(userVal), isPass, hFont, dpi)) {
-            return false;
-        }
-
-        const wchar_t* trimmedVal = Trim(userVal);
-        bool alreadyQuoted = (outCmd.len > 0 && outCmd.data[outCmd.len - 1] == L'"');
-        bool needsQuotes = (wcschr(trimmedVal, L' ') != NULL || wcschr(trimmedVal, L'"') != NULL);
-
-        if (alreadyQuoted) {
-            // Escape any internal quotes or trailing backslashes inside existing quotes
-            for (const wchar_t* c = trimmedVal; *c; ++c) {
-                if (*c == L'"') outCmd.append(L"\\\"");
-                else outCmd.append(*c);
-            }
-            if (*(endTag + 1) == L'"' && outCmd.len > 0 && outCmd.data[outCmd.len - 1] == L'\\') {
-                outCmd.append(L'\\');
-            }
-        } else if (needsQuotes) {
-            AppendQuotedArg(outCmd, trimmedVal);
-        } else {
-            outCmd.append(trimmedVal);
-        }
-        p = endTag + 1;
+        return;
     }
 
+    AssignFullPath(ph.file, ctx->files[0]);
+    StrW& full = ph.file;
+    while (full.len > 3 && (full.data[full.len - 1] == L'\\' || full.data[full.len - 1] == L'/')) {
+        full.truncate(full.len - 1);
+    }
+
+    if (full.len == 3 && full.data[1] == L':') { // drive root "D:\"
+        ph.dir.assign(full.data);
+        ph.name.assign(full.data, 1);
+        return;
+    }
+
+    const wchar_t* fileName = PathFindFileNameW(full.data);
+    DWORD attrs = GetFileAttributesW(full.data);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        ph.dir.assign(full.data);
+        ph.name.assign(fileName);
+        return;
+    }
+
+    size_t dirLen = fileName - full.data;
+    if (dirLen > 3) dirLen--; // without the slash, except in "D:\"
+    ph.dir.assign(full.data, dirLen);
+
+    const wchar_t* dot = PathFindExtensionW(fileName);
+    if (dot[0] && dot != fileName) {
+        ph.name.assign(fileName, dot - fileName);
+        ph.ext.assign(dot + 1);
+    } else {
+        ph.name.assign(fileName);
+    }
+}
+
+// A value inserted into the command: escaped inside "...", quoted when needed outside
+static void AppendValue(StrW& out, const wchar_t* value, bool inQuotes, wchar_t next)
+{
+    if (inQuotes) AppendEscaped(out, value, next == L'"');
+    else AppendArg(out, value);
+}
+
+// The '}' closing the '{' at p, NULL if unbalanced
+static const wchar_t* FindClosingBrace(const wchar_t* p)
+{
+    int depth = 0;
+    for (; *p; ++p) {
+        if (*p == L'{') depth++;
+        else if (*p == L'}' && --depth == 0) return p;
+    }
+    return NULL;
+}
+
+// Dialog for "Prompt:Default" between content and end; placeholders in the
+// default are expanded, braces in the prompt such as {n} are kept
+static bool AskValue(GuiContext* ctx, const wchar_t* title, const wchar_t* content, const wchar_t* end,
+                     bool isPass, const Placeholders& ph, wchar_t* value, size_t valueLen)
+{
+    const wchar_t* sep = NULL;
+    int depth = 0;
+    for (const wchar_t* c = content; c < end && !sep; ++c) {
+        if (*c == L'{') depth++;
+        else if (*c == L'}') depth--;
+        else if (*c == L':' && depth == 0) sep = c;
+    }
+
+    wchar_t prompt[256];
+    size_t promptLen = (sep ? sep : end) - content;
+    lstrcpynW(prompt, content, (int)(promptLen + 1 < ARRAYSIZE(prompt) ? promptLen + 1 : ARRAYSIZE(prompt)));
+
+    StrW defVal;
+    for (const wchar_t* c = sep ? sep + 1 : end; c < end;) {
+        size_t tagLen = 0;
+        int index = (*c == L'{') ? MatchPlaceholder(c, &tagLen) : -1;
+        if (index >= 0 && c + tagLen <= end) {
+            defVal.append(PlaceholderValue(ph, index));
+            c += tagLen;
+        } else {
+            defVal.append(*c++);
+        }
+    }
+    return ShowInputBox(ctx->hwnd, title, prompt, defVal.c_str(), value, valueLen, isPass, ctx->hFontUi, ctx->dpi);
+}
+
+// For `--password {ask_pass:...}` or `--password "{ask_pass:...}"`: removes the
+// option from out and returns the environment variable bpdf reads it from
+static const wchar_t* TakePasswordOption(StrW& out, bool inQuotes, wchar_t next)
+{
+    static const wchar_t* const kOptions[][2] = {
+        { L"--password", L"BPDF_PASSWORD" },
+        { L"--owner-password", L"BPDF_OWNER_PASSWORD" },
+    };
+
+    size_t end = out.len;
+    if (inQuotes) {
+        // Only a quote opened right before the prompt and closed right after it
+        if (end == 0 || out.data[end - 1] != L'"' || next != L'"') return NULL;
+        end--;
+    }
+    size_t optEnd = end;
+    while (optEnd > 0 && (out.data[optEnd - 1] == L' ' || out.data[optEnd - 1] == L'\t')) optEnd--;
+    if (optEnd == end) return NULL;
+    size_t start = optEnd;
+    while (start > 0 && out.data[start - 1] != L' ' && out.data[start - 1] != L'\t') start--;
+
+    for (size_t i = 0; i < ARRAYSIZE(kOptions); i++) {
+        size_t n = wcslen(kOptions[i][0]);
+        if (optEnd - start == n && wcsncmp(out.data + start, kOptions[i][0], n) == 0) {
+            out.truncate(start);
+            return kOptions[i][1];
+        }
+    }
+    return NULL;
+}
+
+// Expands the placeholders and the {ask:Prompt:Default} / {ask_pass:Prompt}
+// dialogs of a cmd template in one pass, tracking quotes by the
+// CommandLineToArgvW rules so every value is escaped for its position.
+// A password for --password/--owner-password goes to secrets ("NAME=value\0")
+// instead of the command line, which other programs and logs can read.
+// False when a dialog was cancelled.
+static bool ExpandTemplate(GuiContext* ctx, const wchar_t* title, const wchar_t* tpl, const Placeholders& ph,
+                           StrW& out, StrW& secrets, bool& hasFile)
+{
+    bool inQuotes = false;
+    size_t backslashes = 0;
+    const wchar_t* p = tpl;
+    while (*p) {
+        size_t tagLen = 0;
+        int index = (*p == L'{') ? MatchPlaceholder(p, &tagLen) : -1;
+        if (index >= 0) {
+            const wchar_t* value = PlaceholderValue(ph, index);
+            hasFile |= (index == 0);
+            p += tagLen;
+            AppendValue(out, value, inQuotes, *p);
+            // "{dir}\name" for a file in the root "D:\"
+            size_t valueLen = wcslen(value);
+            if (*p == L'\\' && valueLen && value[valueLen - 1] == L'\\') p++;
+            backslashes = 0;
+            continue;
+        }
+
+        bool isPass = wcsncmp(p, L"{ask_pass:", 10) == 0;
+        const wchar_t* end = (isPass || wcsncmp(p, L"{ask:", 5) == 0) ? FindClosingBrace(p) : NULL;
+        if (end) {
+            wchar_t value[512] = {};
+            if (!AskValue(ctx, title, p + (isPass ? 10 : 5), end, isPass, ph, value, ARRAYSIZE(value))) {
+                return false;
+            }
+            p = end + 1;
+            const wchar_t* text = isPass ? value : Trim(value);
+            const wchar_t* envName = isPass ? TakePasswordOption(out, inQuotes, *p) : NULL;
+            if (envName) {
+                secrets.append(envName);
+                secrets.append(L'=');
+                secrets.append(text);
+                secrets.append(L'\0');
+                if (inQuotes) {
+                    p++; // the closing quote went with the option
+                    inQuotes = false;
+                }
+            } else {
+                AppendValue(out, text, inQuotes, *p);
+            }
+            SecureZeroMemory(value, sizeof(value));
+            backslashes = 0;
+            continue;
+        }
+
+        if (*p == L'"' && backslashes % 2 == 0) inQuotes = !inQuotes;
+        backslashes = (*p == L'\\') ? backslashes + 1 : 0;
+        out.append(*p++);
+    }
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// Transition: Start an Action from Palette or Job
+// Load Actions for Selected Files & Adjust Window Size
 // -----------------------------------------------------------------------------
 
-static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item)
+static void LoadPaletteForFiles(GuiContext* ctx)
 {
-    if (!ctx->targetExe[0]) {
-        if (!FindBpdfExe(ctx->targetExe, ARRAYSIZE(ctx->targetExe))) {
-            MessageBoxW(
-                ctx->hwnd,
-                L"Исполняемый файл bpdf.exe не найден.\n"
-                L"Поместите bpdf.exe рядом с программой или добавьте путь к нему в переменную PATH.",
-                L"bpdf",
-                MB_ICONERROR
-            );
+    ctx->clearPaletteButtons();
+
+    wchar_t subInfo[512] = {};
+    if (ctx->files.empty()) {
+        SetWindowTextW(ctx->hTargetTitle, L"Файлы не выбраны");
+        lstrcpynW(subInfo, L"Перетащите файлы сюда (Drag & Drop) или нажмите «Выбрать файлы...»", ARRAYSIZE(subInfo));
+    } else if (ctx->files.size() == 1) {
+        const wchar_t* path = ctx->files[0];
+        SetWindowTextW(ctx->hTargetTitle, PathFindFileNameW(path));
+
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+            lstrcpynW(subInfo, path, ARRAYSIZE(subInfo));
+        } else if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", path);
+        } else {
+            ULONGLONG size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            const ULONGLONG mb = 1024 * 1024;
+            if (size >= mb) {
+                wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u.%u МБ  |  %s",
+                    (DWORD)(size / mb), (DWORD)((size % mb) * 10 / mb), path);
+            } else {
+                wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Размер: %u КБ  |  %s", (DWORD)(size / 1024), path);
+            }
+        }
+    } else {
+        wchar_t summary[64];
+        wnsprintfW(summary, ARRAYSIZE(summary), L"Выбрано файлов: %d", (int)ctx->files.size());
+        SetWindowTextW(ctx->hTargetTitle, summary);
+
+        StrW dir;
+        dir.assign(ctx->files[0]);
+        PathRemoveFileSpecW(dir.data);
+        wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Папка: %s", dir.c_str());
+    }
+
+    if (!ctx->files.empty()) {
+        wchar_t section[64];
+        GetSectionForFiles(ctx->files, section, ARRAYSIZE(section));
+
+        MenuItemDef items[MAX_INI_ITEMS];
+        size_t count = LoadMenuItems(section, items, ARRAYSIZE(items));
+        if (count == 0) {
+            wnsprintfW(subInfo, ARRAYSIZE(subInfo), L"Нет действий: bpdf_shell.ini не найден или в нём нет раздела [%s]", section);
+        } else if (!ctx->targetExe[0]) {
+            lstrcpynW(subInfo, L"Предупреждение: bpdf.exe не найден рядом или в PATH", ARRAYSIZE(subInfo));
+        }
+
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(ctx->hwnd, GWLP_HINSTANCE);
+        int iconSize = ctx->scale(16);
+        for (size_t i = 0; i < count && ctx->actionCount < MAX_SHELL_ACTIONS; i++) {
+            if (items[i].iconIndex == -1) continue;
+
+            // Text left-aligned right after the icon, like in a menu: a long
+            // title never runs over the icon
+            size_t index = ctx->actionCount;
+            HWND hBtn = CreateWindowExW(0, L"BUTTON", items[i].title,
+                WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON | BS_LEFT,
+                0, 0, 0, 0, ctx->hwnd, (HMENU)(INT_PTR)(ID_ACTION_BASE + index), hInst, NULL);
+            if (!hBtn) continue;
+            SendMessageW(hBtn, WM_SETFONT, (WPARAM)ctx->hFontUi, FALSE);
+
+            HICON hIcon = NULL;
+            if (ctx->targetExe[0]) {
+                UINT got = PrivateExtractIconsW(ctx->targetExe, items[i].iconIndex, iconSize, iconSize, &hIcon, NULL, 1, 0);
+                if (got == 0 || got == 0xFFFFFFFF) hIcon = NULL;
+            }
+            if (hIcon) {
+                HIMAGELIST himl = ImageList_Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 1, 1);
+                if (himl) {
+                    ImageList_AddIcon(himl, hIcon);
+                    BUTTON_IMAGELIST bil = {};
+                    bil.himl = himl;
+                    bil.margin.left = ctx->scale(8);
+                    bil.margin.right = ctx->scale(8);
+                    bil.uAlign = BUTTON_IMAGELIST_ALIGN_LEFT;
+                    SendMessageW(hBtn, BCM_SETIMAGELIST, 0, (LPARAM)&bil);
+                    ctx->hActionIml[index] = himl;
+                }
+                DestroyIcon(hIcon);
+            }
+
+            ctx->actionDefs[index] = items[i];
+            ctx->hActionBtns[index] = hBtn;
+            ctx->actionCount++;
+        }
+    }
+    SetWindowTextW(ctx->hTargetSub, subInfo);
+
+    SetClientSize(ctx, PaletteClientWidth(ctx),PaletteFooterTop(ctx) + ctx->scale(28) + ctx->scale(16));
+    LayoutControls(ctx);
+}
+
+// -----------------------------------------------------------------------------
+// State Transitions
+// -----------------------------------------------------------------------------
+
+static void AppendLog(GuiContext* ctx, const wchar_t* text)
+{
+    int len = GetWindowTextLengthW(ctx->hEdit);
+    SendMessageW(ctx->hEdit, EM_SETSEL, len, len);
+    SendMessageW(ctx->hEdit, EM_REPLACESEL, FALSE, (LPARAM)text);
+    SendMessageW(ctx->hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+static void ShowMainWindow(GuiContext* ctx)
+{
+    KillTimer(ctx->hwnd, ID_TIMER_SHOW);
+    if (IsWindowVisible(ctx->hwnd)) return;
+    ShowWindow(ctx->hwnd, SW_SHOW);
+    SetForegroundWindow(ctx->hwnd);
+}
+
+// bpdf prints warnings as "Warning: ..." lines (stderr goes to the same log)
+static bool LogHasWarnings(GuiContext* ctx)
+{
+    int len = GetWindowTextLengthW(ctx->hEdit);
+    if (len <= 0) return false;
+    wchar_t* text = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+    if (!text) return false;
+    GetWindowTextW(ctx->hEdit, text, len + 1);
+    const wchar_t* prefix = L"Warning: ";
+    bool found = wcsncmp(text, prefix, wcslen(prefix)) == 0;
+    for (const wchar_t* nl = wcschr(text, L'\n'); nl && !found; nl = wcschr(nl + 1, L'\n')) {
+        found = wcsncmp(nl + 1, prefix, wcslen(prefix)) == 0;
+    }
+    free(text);
+    return found;
+}
+
+static void ReturnToPalette(GuiContext* ctx)
+{
+    ctx->stopWorker();
+    ctx->deleteTempManifest();
+
+    ctx->state = STATE_PALETTE;
+    ctx->isPaletteSession = true;
+    ctx->filesEmbeddedInCmd = false;
+
+    SetWindowIconIndex(ctx, 0);
+    SetWindowTextW(ctx->hBtnClose, L"Закрыть");
+    SetWindowTextW(ctx->hwnd, L"bpdf — Панель действий");
+    LoadPaletteForFiles(ctx);
+}
+
+// Ends a single-action session (its window may not even be shown yet)
+static void AbortAction(GuiContext* ctx)
+{
+    if (!ctx->isPaletteSession) PostMessageW(ctx->hwnd, WM_CLOSE, 0, 0);
+}
+
+static void StartActionExecution(GuiContext* ctx, const MenuItemDef& item, const wchar_t* cmdTemplate)
+{
+    if (!ctx->targetExe[0] && !FindBpdfExe(ctx->targetExe, ARRAYSIZE(ctx->targetExe))) {
+        MessageBoxW(
+            ctx->hwnd,
+            L"Исполняемый файл bpdf.exe не найден.\n"
+            L"Поместите bpdf.exe рядом с программой или добавьте путь к нему в переменную PATH.",
+            L"bpdf",
+            MB_ICONERROR
+        );
+        AbortAction(ctx);
+        return;
+    }
+
+    ctx->stopWorker();
+    ctx->deleteTempManifest();
+
+    Placeholders ph;
+    FillPlaceholders(ctx, ph);
+
+    StrW cmd;
+    StrW secrets;
+    secrets.reserve(1024); // no reallocation leaves copies of passwords behind
+    bool hasFile = false;
+    if (!ExpandTemplate(ctx, item.title, cmdTemplate, ph, cmd, secrets, hasFile)) {
+        secrets.wipe();
+        AbortAction(ctx);
+        return;
+    }
+
+    StrW cmdLine;
+    AppendQuotedArg(cmdLine, ctx->targetExe);
+    cmdLine.append(L" --no-pause ");
+    cmdLine.append(cmd.c_str());
+    cmd.wipe();
+
+    // Files go last unless the command already has them ({file} or after "--")
+    if (!hasFile && !ctx->filesEmbeddedInCmd && !ctx->files.empty()) {
+        cmdLine.append(L' ');
+        if (ctx->files.size() == 1) {
+            AppendQuotedArg(cmdLine, ctx->files[0]);
+        } else if (CreateManifestFile(ctx->files, ctx->tempManifest, ARRAYSIZE(ctx->tempManifest))) {
+            StrW atManifest;
+            atManifest.append(L'@');
+            atManifest.append(ctx->tempManifest);
+            AppendQuotedArg(cmdLine, atManifest.c_str());
+        } else {
+            MessageBoxW(ctx->hwnd, L"Не удалось создать список файлов", L"bpdf", MB_ICONERROR);
+            secrets.wipe();
+            AbortAction(ctx);
             return;
         }
     }
 
-    // Ensure previous worker/process handles are cleaned up
-    ctx->stopWorker();
-    FlushPendingAppendMessages(ctx->hwnd);
-    InterlockedExchange(&ctx->isCancelled, 0);
-    InterlockedExchange(&ctx->isFinished, 0);
-
-    // Resolve any interactive {ask:...} or {ask_pass:...} prompts
-    StrW cmdWithPrompts;
-    if (!ResolveCommandPrompts(ctx->hwnd, item.title, item.cmd, cmdWithPrompts, ctx->hFontUi, ctx->dpi)) {
-        if (ctx->autoActionIndex >= 0 || ctx->hasCustomAction) {
-            PostMessageW(ctx->hwnd, WM_CLOSE, 0, 0);
-        }
+    StrW environment;
+    bool envOk = secrets.empty() || BuildEnvironment(secrets, environment);
+    secrets.wipe();
+    if (!envOk) {
+        MessageBoxW(ctx->hwnd, L"Недостаточно памяти для запуска bpdf.exe", L"bpdf", MB_ICONERROR);
+        AbortAction(ctx);
         return;
     }
 
-    // Clean up previous temporary manifest if one was created
-    if (ctx->tempManifest[0]) {
-        DeleteFileW(ctx->tempManifest);
-        ctx->tempManifest[0] = L'\0';
-    }
-
-    StrW fullPath, dir, name, ext;
-    if (!ctx->files.empty()) {
-        SplitPathParts(ctx->files[0], fullPath, dir, name, ext);
-    } else {
-        wchar_t curDir[MAX_PATH * 2] = {0};
-        GetCurrentDirectoryW(ARRAYSIZE(curDir), curDir);
-        dir.assign(curDir);
-    }
-
-    wchar_t exeDir[MAX_PATH * 2] = {0};
-    lstrcpynW(exeDir, ctx->targetExe, ARRAYSIZE(exeDir));
-    PathRemoveFileSpecW(exeDir);
-    SanitizePathForQuotes(exeDir);
-
-    StrW expanded;
-    bool hasFilePlaceholder = false;
-    ExpandCommand(cmdWithPrompts.c_str(), fullPath.c_str(), dir.c_str(), name.c_str(), ext.c_str(), expanded, hasFilePlaceholder, exeDir);
-
-    wchar_t manifestPath[MAX_PATH * 2] = {0};
-    StrW fullCmdLine;
-    fullCmdLine.append(L"\"");
-    fullCmdLine.append(ctx->targetExe);
-    fullCmdLine.append(L"\" --no-pause ");
-    fullCmdLine.append(expanded.c_str());
-
-    // Файлы передаются в конец только если они были переданы внешне (Explorer/палитра),
-    // не встроены напрямую в команду после "--" и в шаблоне команды не было {file}.
-    if (!hasFilePlaceholder && !ctx->filesEmbeddedInCmd && !ctx->files.empty()) {
-        fullCmdLine.append(L" ");
-        if (ctx->files.size() > 1) {
-            if (!CreateManifestFile(ctx->files, manifestPath, ARRAYSIZE(manifestPath))) {
-                MessageBoxW(ctx->hwnd, L"Не удалось создать список файлов", L"bpdf", MB_ICONERROR);
-                return;
-            }
-            StrW atManifest;
-            atManifest.append(L"@");
-            atManifest.append(manifestPath);
-            AppendQuotedArg(fullCmdLine, atManifest.c_str());
-        } else {
-            AppendQuotedArg(fullCmdLine, ctx->files[0]);
-        }
-    }
-
-    if (ctx->cmdLine) free(ctx->cmdLine);
-    ctx->cmdLine = _wcsdup(fullCmdLine.c_str());
-    lstrcpynW(ctx->workDir, dir.c_str(), ARRAYSIZE(ctx->workDir));
-    lstrcpynW(ctx->tempManifest, manifestPath, ARRAYSIZE(ctx->tempManifest));
-    lstrcpynW(ctx->currentTitle, item.title, ARRAYSIZE(ctx->currentTitle));
-    ctx->iconIndex = item.iconIndex;
+    ctx->workDir.assign(ph.dir.c_str());
     ctx->guiMode = item.guiMode;
-
-    // Dynamically update window icon for current action
-    if (ctx->targetExe[0] && item.iconIndex >= 0) {
-        HICON hActionIcon = NULL;
-        if (ExtractIconExW(ctx->targetExe, item.iconIndex, &hActionIcon, NULL, 1) > 0 && hActionIcon) {
-            if (ctx->hIcon) DestroyIcon(ctx->hIcon);
-            ctx->hIcon = hActionIcon;
-            SendMessageW(ctx->hwnd, WM_SETICON, ICON_BIG, (LPARAM)ctx->hIcon);
-            SendMessageW(ctx->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)ctx->hIcon);
-        }
-    }
-
-    if (item.guiMode == GUI_NONE) {
-        STARTUPINFOW si = { sizeof(si) };
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi = { 0 };
-        SetEnvironmentVariableW(L"BPDF_NO_PAUSE", L"1");
-        if (CreateProcessW(NULL, ctx->cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, ctx->workDir[0] ? ctx->workDir : NULL, &si, &pi)) {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        } else {
-            MessageBoxW(ctx->hwnd, L"Не удалось запустить процесс bpdf.exe", L"bpdf", MB_ICONERROR);
-        }
-        if (ctx->tempManifest[0]) {
-            DeleteFileW(ctx->tempManifest);
-            ctx->tempManifest[0] = L'\0';
-        }
-        return;
-    }
-
-    // Hide Palette controls
-    if (ctx->hTargetTitle) ShowWindow(ctx->hTargetTitle, SW_HIDE);
-    if (ctx->hTargetSub) ShowWindow(ctx->hTargetSub, SW_HIDE);
-    if (ctx->hBtnBrowse) ShowWindow(ctx->hBtnBrowse, SW_HIDE);
-    if (ctx->hBtnBack) ShowWindow(ctx->hBtnBack, SW_HIDE);
-    if (ctx->hBtnFolder) ShowWindow(ctx->hBtnFolder, SW_HIDE);
-    for (size_t i = 0; i < ctx->actionCount; i++) {
-        if (ctx->hActionBtns[i]) ShowWindow(ctx->hActionBtns[i], SW_HIDE);
-    }
-
-    // Switch state
     ctx->state = STATE_RUNNING;
 
+    SetWindowIconIndex(ctx, item.iconIndex);
     SetWindowTextW(ctx->hTitleStatic, item.title);
-
-    wchar_t statusText[256];
-    wnsprintfW(statusText, ARRAYSIZE(statusText), L"Выполняется: %s...", item.title);
-    SetWindowTextW(ctx->hStatusStatic, statusText);
-
-    wchar_t winTitle[256];
-    wnsprintfW(winTitle, ARRAYSIZE(winTitle), L"bpdf — %s", item.title);
-    SetWindowTextW(ctx->hwnd, winTitle);
-
-    if (ctx->guiMode != GUI_INFO && ctx->hProgress) {
-        ShowWindow(ctx->hProgress, SW_SHOW);
-        SendMessageW(ctx->hProgress, PBM_SETMARQUEE, TRUE, 30);
-    }
-
-    ShowWindow(ctx->hTitleStatic, SW_SHOW);
-    ShowWindow(ctx->hStatusStatic, SW_SHOW);
-    ShowWindow(ctx->hEdit, SW_SHOW);
-    ShowWindow(ctx->hBtnClose, SW_SHOW);
+    wchar_t text[256];
+    wnsprintfW(text, ARRAYSIZE(text), L"Выполняется: %s...", item.title);
+    SetWindowTextW(ctx->hStatusStatic, text);
+    wnsprintfW(text, ARRAYSIZE(text), L"bpdf — %s", item.title);
+    SetWindowTextW(ctx->hwnd, text);
+    SetWindowTextW(ctx->hEdit, L"");
     SetWindowTextW(ctx->hBtnClose, L"Отмена");
+    SendMessageW(ctx->hProgress, PBM_SETMARQUEE, TRUE, 30);
 
-    RECT curRc;
-    GetWindowRect(ctx->hwnd, &curRc);
-    int curW = curRc.right - curRc.left;
-    int minProgressH = ctx->scale(440);
-    if (curRc.bottom - curRc.top < minProgressH) {
-        SetWindowPos(ctx->hwnd, NULL, 0, 0, curW, minProgressH, SWP_NOMOVE | SWP_NOZORDER);
+    RECT client;
+    GetClientRect(ctx->hwnd, &client);
+    if (client.bottom < ctx->scale(400)) SetClientSize(ctx, 0, ctx->scale(400));
+    LayoutControls(ctx);
+
+    // A quick action finishes before the window would appear: nothing flashes
+    if (!IsWindowVisible(ctx->hwnd)) SetTimer(ctx->hwnd, ID_TIMER_SHOW, SHOW_DELAY_MS, NULL);
+
+    bool spawned = SpawnProcess(ctx, cmdLine.data, environment.empty() ? NULL : environment.data);
+    environment.wipe();
+    cmdLine.wipe();
+    if (!spawned) {
+        AppendLog(ctx, L"Не удалось запустить bpdf.exe\r\n");
+        PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, (LPARAM)ctx->runId);
     }
+}
 
-    LayoutControls(ctx->hwnd, ctx);
+static void BrowseForFiles(GuiContext* ctx)
+{
+    const DWORD bufLen = 32768;
+    wchar_t* buf = (wchar_t*)calloc(bufLen, sizeof(wchar_t));
+    if (!buf) return;
 
-    // Create Job Object on main thread before spawning worker thread
-    ctx->hJob = CreateJobObjectW(NULL, NULL);
-    if (ctx->hJob) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = { 0 };
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(ctx->hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
-    }
+    OPENFILENAMEW ofn = { sizeof(ofn) };
+    ofn.hwndOwner = ctx->hwnd;
+    ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.djvu;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = bufLen;
+    ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
-    ctx->hWorkerThread = CreateThread(NULL, 0, WorkerThreadProc, ctx, 0, NULL);
-    if (!ctx->hWorkerThread) {
-        if (ctx->hJob) {
-            CloseHandle(ctx->hJob);
-            ctx->hJob = NULL;
+    if (GetOpenFileNameW(&ofn)) {
+        ctx->files.clear();
+        ctx->filesEmbeddedInCmd = false;
+        // One file: its full path; several: the folder, then the names
+        const wchar_t* dir = buf;
+        const wchar_t* name = dir + wcslen(dir) + 1;
+        if (!*name) ctx->files.add(dir);
+        StrW full;
+        for (; *name; name += wcslen(name) + 1) {
+            full.assign(dir);
+            if (full.len && full.data[full.len - 1] != L'\\') full.append(L'\\');
+            full.append(name);
+            ctx->files.add(full.c_str());
         }
-        MessageBoxW(ctx->hwnd, L"Не удалось запустить процесс bpdf.exe", L"bpdf", MB_ICONERROR);
-        PostMessageW(ctx->hwnd, WM_BPDF_FINISHED, 1, 0);
+        LoadPaletteForFiles(ctx);
     }
+    free(buf);
 }
 
 // -----------------------------------------------------------------------------
 // Window Procedure
 // -----------------------------------------------------------------------------
+
+static HWND CreateChild(GuiContext* ctx, const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD exStyle = 0)
+{
+    return CreateWindowExW(exStyle, cls, text, WS_CHILD | style, 0, 0, 0, 0, ctx->hwnd,
+        (HMENU)(INT_PTR)id, (HINSTANCE)GetWindowLongPtrW(ctx->hwnd, GWLP_HINSTANCE), NULL);
+}
 
 static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -1199,96 +1219,50 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     switch (msg) {
     case WM_CREATE: {
-        CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
-        ctx = (GuiContext*)cs->lpCreateParams;
+        ctx = (GuiContext*)((CREATESTRUCTW*)lParam)->lpCreateParams;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)ctx);
         ctx->hwnd = hwnd;
-
-        if (ctx->hIcon) {
-            SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)ctx->hIcon);
-            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)ctx->hIcon);
-        }
-
-        HINSTANCE hInst = cs->hInstance;
-
-        ctx->hFontTitle = CreateFontW(-ctx->scale(18), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        ctx->hFontSub = CreateFontW(-ctx->scale(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        ctx->hFontButton = CreateFontW(-ctx->scale(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        ctx->hFontUi = CreateFontW(-ctx->scale(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        ctx->hFontEdit = CreateFontW(-ctx->scale(12), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+        ctx->dpi = WindowDpi(hwnd);
         ctx->hBrushEdit = CreateSolidBrush(RGB(24, 24, 24));
 
-        // Header controls (Palette mode)
-        ctx->hTargetTitle = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT | SS_ENDELLIPSIS,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
-        SendMessageW(ctx->hTargetTitle, WM_SETFONT, (WPARAM)ctx->hFontTitle, TRUE);
-
-        ctx->hTargetSub = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_LEFT | SS_ENDELLIPSIS,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
-        SendMessageW(ctx->hTargetSub, WM_SETFONT, (WPARAM)ctx->hFontSub, TRUE);
-
-        // Progress controls
-        ctx->hTitleStatic = CreateWindowExW(0, L"STATIC", L"bpdf", WS_CHILD | SS_LEFT | SS_ENDELLIPSIS,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
-        SendMessageW(ctx->hTitleStatic, WM_SETFONT, (WPARAM)ctx->hFontTitle, TRUE);
-
-        ctx->hStatusStatic = CreateWindowExW(0, L"STATIC", L"Подготовка...", WS_CHILD | SS_LEFT | SS_ENDELLIPSIS,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
-        SendMessageW(ctx->hStatusStatic, WM_SETFONT, (WPARAM)ctx->hFontUi, TRUE);
-
-        ctx->hProgress = CreateWindowExW(0, PROGRESS_CLASSW, NULL, WS_CHILD | PBS_MARQUEE,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
-
-        ctx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
-            0, 0, 10, 10, hwnd, NULL, hInst, NULL);
+        DWORD label = SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX;
+        DWORD button = WS_TABSTOP | BS_PUSHBUTTON;
+        ctx->hTargetTitle = CreateChild(ctx, L"STATIC", L"", label, 0);
+        ctx->hTargetSub = CreateChild(ctx, L"STATIC", L"", label, 0);
+        ctx->hTitleStatic = CreateChild(ctx, L"STATIC", L"bpdf", label, 0);
+        ctx->hStatusStatic = CreateChild(ctx, L"STATIC", L"", label, 0);
+        ctx->hProgress = CreateChild(ctx, PROGRESS_CLASSW, NULL, PBS_MARQUEE, 0);
+        ctx->hEdit = CreateChild(ctx, L"EDIT", L"", WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 0, WS_EX_CLIENTEDGE);
         SendMessageW(ctx->hEdit, EM_SETLIMITTEXT, 0, 0);
-        SendMessageW(ctx->hEdit, WM_SETFONT, (WPARAM)ctx->hFontEdit, TRUE);
+        ctx->hBtnClose = CreateChild(ctx, L"BUTTON", L"Закрыть", button, ID_BTN_CLOSE);
+        ctx->hBtnFolder = CreateChild(ctx, L"BUTTON", L"Открыть папку", button, ID_BTN_FOLDER);
+        ctx->hBtnBrowse = CreateChild(ctx, L"BUTTON", L"Выбрать файлы...", button, ID_BTN_BROWSE);
+        ctx->hBtnBack = CreateChild(ctx, L"BUTTON", L"← К действиям", button, ID_BTN_BACK);
+        ApplyDpiFonts(ctx);
 
-        ctx->hBtnClose = CreateWindowExW(0, L"BUTTON", L"Закрыть", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_BTN_CLOSE, hInst, NULL);
-        SendMessageW(ctx->hBtnClose, WM_SETFONT, (WPARAM)ctx->hFontUi, TRUE);
-
-        ctx->hBtnFolder = CreateWindowExW(0, L"BUTTON", L"Открыть папку", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_BTN_FOLDER, hInst, NULL);
-        SendMessageW(ctx->hBtnFolder, WM_SETFONT, (WPARAM)ctx->hFontUi, TRUE);
-
-        ctx->hBtnBrowse = CreateWindowExW(0, L"BUTTON", L"Выбрать файлы...", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_BTN_BROWSE, hInst, NULL);
-        SendMessageW(ctx->hBtnBrowse, WM_SETFONT, (WPARAM)ctx->hFontUi, TRUE);
-
-        ctx->hBtnBack = CreateWindowExW(0, L"BUTTON", L"← К действиям", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
-            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)ID_BTN_BACK, hInst, NULL);
-        SendMessageW(ctx->hBtnBack, WM_SETFONT, (WPARAM)ctx->hFontUi, TRUE);
-
+        SetWindowIconIndex(ctx, ctx->hasCustomAction ? ctx->customAction.iconIndex : 0);
         DragAcceptFiles(hwnd, TRUE);
 
-        ShowWindow(ctx->hTargetTitle, SW_SHOW);
-        ShowWindow(ctx->hTargetSub, SW_SHOW);
-        ShowWindow(ctx->hBtnClose, SW_SHOW);
+        SetWindowPos(hwnd, NULL, 0, 0, ctx->scale(580), ctx->scale(400), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         LoadPaletteForFiles(ctx);
 
-        if (ctx->hasCustomAction) {
-            StartActionExecution(ctx, ctx->customAction);
-            if (ctx->customAction.guiMode == GUI_NONE) {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                return 0;
-            }
-        } else if (ctx->autoActionIndex >= 0 && (size_t)ctx->autoActionIndex < ctx->actionCount) {
-            MenuItemDef item = ctx->actionDefs[ctx->autoActionIndex];
-            StartActionExecution(ctx, item);
-            if (item.guiMode == GUI_NONE) {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                return 0;
-            }
-        }
+        // An action given on the command line starts once the message loop runs,
+        // so its dialogs are not shown from inside CreateWindow
+        bool autoAction = ctx->hasCustomAction ||
+            (ctx->autoActionIndex >= 0 && (size_t)ctx->autoActionIndex < ctx->actionCount);
+        ctx->isPaletteSession = !autoAction;
+        if (autoAction) PostMessageW(hwnd, WM_BPDF_START_AUTO_ACTION, 0, 0);
+        return 0;
+    }
 
-        LayoutControls(hwnd, ctx);
+    case WM_DPICHANGED: {
+        if (!ctx) break;
+        ctx->dpi = HIWORD(wParam);
+        ApplyDpiFonts(ctx);
+        const RECT* r = (const RECT*)lParam;
+        SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (ctx->state == STATE_PALETTE) LoadPaletteForFiles(ctx); // icons of the new size
+        else LayoutControls(ctx);
         return 0;
     }
 
@@ -1298,16 +1272,11 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         if (fileCount > 0 && ctx && ctx->state == STATE_PALETTE) {
             ctx->files.clear();
             ctx->filesEmbeddedInCmd = false;
+            StrW path;
             for (UINT i = 0; i < fileCount; i++) {
                 UINT len = DragQueryFileW(hDrop, i, NULL, 0);
-                if (len > 0) {
-                    wchar_t* filePath = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
-                    if (filePath) {
-                        if (DragQueryFileW(hDrop, i, filePath, len + 1) > 0) {
-                            ctx->files.add(filePath);
-                        }
-                        free(filePath);
-                    }
+                if (len > 0 && path.reserve(len) && DragQueryFileW(hDrop, i, path.data, len + 1) > 0) {
+                    ctx->files.add(path.data);
                 }
             }
             LoadPaletteForFiles(ctx);
@@ -1316,13 +1285,12 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
 
-    case WM_SIZE: {
-        LayoutControls(hwnd, ctx);
+    case WM_SIZE:
+        if (ctx) LayoutControls(ctx);
         return 0;
-    }
 
     case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC:
         if (ctx && (HWND)lParam == ctx->hEdit) {
             HDC hdc = (HDC)wParam;
             SetTextColor(hdc, RGB(220, 220, 220));
@@ -1330,204 +1298,95 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             return (LRESULT)ctx->hBrushEdit;
         }
         break;
-    }
 
-    case WM_BPDF_APPEND: {
-        wchar_t* text = (wchar_t*)lParam;
-        if (text) {
-            if (ctx && ctx->hEdit && ctx->state != STATE_PALETTE) {
-                int len = GetWindowTextLengthW(ctx->hEdit);
-                SendMessageW(ctx->hEdit, EM_SETSEL, len, len);
-                SendMessageW(ctx->hEdit, EM_REPLACESEL, FALSE, (LPARAM)text);
-                SendMessageW(ctx->hEdit, EM_SCROLLCARET, 0, 0);
-            }
-            free(text);
+    case WM_BPDF_APPEND:
+        if (ctx && (LONG)wParam == ctx->runId) AppendLog(ctx, (const wchar_t*)lParam);
+        free((void*)lParam);
+        return 0;
+
+    case WM_BPDF_START_AUTO_ACTION:
+        if (!ctx) return 0;
+        if (ctx->hasCustomAction) {
+            StartActionExecution(ctx, ctx->customAction, ctx->customCmd.c_str());
+        } else {
+            const MenuItemDef& item = ctx->actionDefs[ctx->autoActionIndex];
+            StartActionExecution(ctx, item, item.cmd);
         }
         return 0;
-    }
 
     case WM_BPDF_FINISHED: {
-        if (!ctx) return 0;
-        InterlockedExchange(&ctx->isFinished, 1);
-        ctx->state = STATE_FINISHED;
+        if (!ctx || (LONG)lParam != ctx->runId) return 0;
+        bool warnings = wParam == 0 && LogHasWarnings(ctx);
 
-        DWORD exitCode = (DWORD)wParam;
-
-        if (ctx->hProgress) {
-            SendMessageW(ctx->hProgress, PBM_SETMARQUEE, FALSE, 0);
-            ShowWindow(ctx->hProgress, SW_HIDE);
-        }
-
-        if (ctx->hBtnFolder) {
-            ShowWindow(ctx->hBtnFolder, SW_SHOW);
-        }
-
-        if (ctx->hBtnBack) {
-            ShowWindow(ctx->hBtnBack, SW_SHOW);
-            SetWindowTextW(ctx->hBtnBack, ctx->isPaletteSession ? L"← К действиям" : L"Панель действий...");
-        }
-
-        if (ctx->hBtnClose) {
-            SetWindowTextW(ctx->hBtnClose, L"Закрыть");
-        }
-
-        if (exitCode == 0) {
-            SetWindowTextW(ctx->hStatusStatic, L"Готово! Операция успешно завершена.");
-            if (ctx->guiMode == GUI_AUTO) {
-                ctx->autoCloseSeconds = 5;
-                SetTimer(hwnd, ID_TIMER_AUTOCLOSE, 1000, NULL);
-                wchar_t timerMsg[64];
-                if (ctx->isPaletteSession) {
-                    wnsprintfW(timerMsg, ARRAYSIZE(timerMsg), L"← К действиям (%dс)", ctx->autoCloseSeconds);
-                    if (ctx->hBtnBack) SetWindowTextW(ctx->hBtnBack, timerMsg);
-                } else {
-                    wnsprintfW(timerMsg, ARRAYSIZE(timerMsg), L"Закрыть (%dс)", ctx->autoCloseSeconds);
-                    if (ctx->hBtnClose) SetWindowTextW(ctx->hBtnClose, timerMsg);
-                }
-            }
-        } else {
-            SetWindowTextW(ctx->hStatusStatic, L"Завершено с ошибками (проверьте журнал вывода)");
-        }
-
-        LayoutControls(hwnd, ctx);
-        return 0;
-    }
-
-    case WM_TIMER: {
-        if (wParam == ID_TIMER_AUTOCLOSE && ctx) {
-            ctx->autoCloseSeconds--;
-            if (ctx->autoCloseSeconds <= 0) {
-                KillTimer(hwnd, ID_TIMER_AUTOCLOSE);
-                if (ctx->isPaletteSession) {
-                    ReturnToPalette(ctx);
-                } else {
-                    DestroyWindow(hwnd);
-                }
-            } else {
-                wchar_t timerMsg[64];
-                if (ctx->isPaletteSession) {
-                    wnsprintfW(timerMsg, ARRAYSIZE(timerMsg), L"← К действиям (%dс)", ctx->autoCloseSeconds);
-                    if (ctx->hBtnBack) SetWindowTextW(ctx->hBtnBack, timerMsg);
-                } else {
-                    wnsprintfW(timerMsg, ARRAYSIZE(timerMsg), L"Закрыть (%dс)", ctx->autoCloseSeconds);
-                    if (ctx->hBtnClose) SetWindowTextW(ctx->hBtnClose, timerMsg);
-                }
-            }
-            return 0;
-        }
-        break;
-    }
-
-    case WM_COMMAND: {
-        int id = LOWORD(wParam);
-
-        // Click on Action Button in Palette mode
-        if (id >= ID_ACTION_BASE && id < ID_ACTION_BASE + MAX_SHELL_ACTIONS && ctx && ctx->state == STATE_PALETTE) {
-            size_t idx = id - ID_ACTION_BASE;
-            if (idx < ctx->actionCount) {
-                StartActionExecution(ctx, ctx->actionDefs[idx]);
-            }
-            return 0;
-        }
-
-        if (id == ID_BTN_BACK && ctx) {
-            ReturnToPalette(ctx);
-            return 0;
-        }
-
-        if (id == ID_BTN_BROWSE && ctx && ctx->state == STATE_PALETTE) {
-            wchar_t fileBuf[32768] = {0};
-            OPENFILENAMEW ofn = { sizeof(ofn) };
-            ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.djvu;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
-            ofn.lpstrFile = fileBuf;
-            ofn.nMaxFile = ARRAYSIZE(fileBuf);
-            ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-
-            if (GetOpenFileNameW(&ofn)) {
-                ctx->files.clear();
-                ctx->filesEmbeddedInCmd = false;
-                wchar_t* p = fileBuf;
-                wchar_t* dir = p;
-                p += wcslen(dir) + 1;
-                if (*p == L'\0') {
-                    ctx->files.add(dir);
-                } else {
-                    while (*p) {
-                        wchar_t full[MAX_PATH * 2];
-                        wnsprintfW(full, ARRAYSIZE(full), L"%s\\%s", dir, p);
-                        ctx->files.add(full);
-                        p += wcslen(p) + 1;
-                    }
-                }
-                LoadPaletteForFiles(ctx);
-            }
-            return 0;
-        }
-
-        if (id == ID_BTN_FOLDER && ctx) {
-            KillTimer(hwnd, ID_TIMER_AUTOCLOSE);
-            if (ctx->isPaletteSession && ctx->hBtnBack) {
-                SetWindowTextW(ctx->hBtnBack, L"← К действиям");
-            } else if (ctx->hBtnClose) {
-                SetWindowTextW(ctx->hBtnClose, L"Закрыть");
-            }
-
-            if (ctx->workDir[0]) {
-                ShellExecuteW(NULL, L"open", ctx->workDir, NULL, NULL, SW_SHOWNORMAL);
-            } else if (!ctx->files.empty()) {
-                StrW fullPath, dir, name, ext;
-                SplitPathParts(ctx->files[0], fullPath, dir, name, ext);
-                if (dir.length()) {
-                    ShellExecuteW(NULL, L"open", dir.c_str(), NULL, NULL, SW_SHOWNORMAL);
-                }
-            }
-            return 0;
-        }
-
-        if (HIWORD(wParam) == EN_SETFOCUS && ctx && (HWND)lParam == ctx->hEdit) {
-            KillTimer(hwnd, ID_TIMER_AUTOCLOSE);
-            if (ctx->isPaletteSession && ctx->hBtnBack) {
-                SetWindowTextW(ctx->hBtnBack, L"← К действиям");
-            } else if (ctx->hBtnClose) {
-                SetWindowTextW(ctx->hBtnClose, L"Закрыть");
-            }
-        }
-
-        if (id == ID_BTN_CLOSE || id == IDCANCEL) {
-            if (ctx && ctx->state == STATE_RUNNING && !ctx->isFinished) {
-                ctx->stopWorker();
-            }
+        // A single action that went cleanly has nothing to show: the result is
+        // in the file panel. Errors, warnings, info and keep stay on screen
+        if (wParam == 0 && !warnings && ctx->guiMode == GUI_AUTO && !ctx->isPaletteSession) {
             DestroyWindow(hwnd);
             return 0;
         }
 
-        if (id == IDOK) {
-            if (ctx && ctx->state == STATE_FINISHED) {
-                if (ctx->isPaletteSession) {
-                    ReturnToPalette(ctx);
-                } else {
-                    DestroyWindow(hwnd);
-                }
+        ctx->state = STATE_FINISHED;
+        SendMessageW(ctx->hProgress, PBM_SETMARQUEE, FALSE, 0);
+        SetWindowTextW(ctx->hBtnBack, ctx->isPaletteSession ? L"← К действиям" : L"Панель действий...");
+        SetWindowTextW(ctx->hBtnClose, L"Закрыть");
+        SetWindowTextW(ctx->hStatusStatic,
+            wParam != 0 ? L"Завершено с ошибками (проверьте журнал вывода)" :
+            warnings ? L"Готово, но есть предупреждения (см. журнал вывода)" :
+            L"Готово! Операция успешно завершена.");
+        LayoutControls(ctx);
+        ShowMainWindow(ctx);
+        // Enter takes the default way on: back to the palette or close
+        SetFocus(ctx->isPaletteSession ? ctx->hBtnBack : ctx->hBtnClose);
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wParam != ID_TIMER_SHOW || !ctx) break;
+        ShowMainWindow(ctx);
+        return 0;
+
+    case WM_COMMAND: {
+        if (!ctx) break;
+        int id = LOWORD(wParam);
+
+        if (id >= ID_ACTION_BASE && id < ID_ACTION_BASE + MAX_SHELL_ACTIONS) {
+            size_t index = id - ID_ACTION_BASE;
+            if (ctx->state == STATE_PALETTE && index < ctx->actionCount) {
+                const MenuItemDef& item = ctx->actionDefs[index];
+                StartActionExecution(ctx, item, item.cmd);
+            }
+            return 0;
+        }
+
+        switch (id) {
+        case ID_BTN_BACK:
+            ReturnToPalette(ctx);
+            return 0;
+        case ID_BTN_BROWSE:
+            if (ctx->state == STATE_PALETTE) BrowseForFiles(ctx);
+            return 0;
+        case ID_BTN_FOLDER:
+            if (!ctx->workDir.empty()) ShellExecuteW(NULL, L"open", ctx->workDir.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        case ID_BTN_CLOSE:
+        case IDCANCEL:
+            DestroyWindow(hwnd);
+            return 0;
+        case IDOK: // Enter
+            if (ctx->state == STATE_FINISHED) {
+                if (ctx->isPaletteSession) ReturnToPalette(ctx);
+                else DestroyWindow(hwnd);
             }
             return 0;
         }
         break;
     }
 
-    case WM_CLOSE: {
-        if (ctx && ctx->state == STATE_RUNNING && !ctx->isFinished) {
-            ctx->stopWorker();
-        }
-        DestroyWindow(hwnd);
-        return 0;
-    }
-
-    case WM_DESTROY: {
+    case WM_DESTROY:
+        if (ctx) ctx->stopWorker();
         FlushPendingAppendMessages(hwnd);
         PostQuitMessage(0);
         return 0;
-    }
     }
 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1540,16 +1399,129 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 static void LoadFilesFromListFile(const wchar_t* listPath, WStringList& outFiles)
 {
     StrW listText;
-    if (ReadTextFile(listPath, listText)) {
-        wchar_t* p = listText.data;
-        while (p && *p) {
-            wchar_t* nl = wcschr(p, L'\n');
-            if (nl) { *nl = L'\0'; nl++; }
-            wchar_t* t = Trim(p);
-            if (*t) outFiles.add(t);
-            p = nl;
+    if (!ReadTextFile(listPath, listText)) return;
+    wchar_t* p = listText.data;
+    while (p && *p) {
+        wchar_t* nl = wcschr(p, L'\n');
+        if (nl) *nl++ = L'\0';
+        wchar_t* t = Trim(p);
+        if (*t) outFiles.add(t);
+        p = nl;
+    }
+}
+
+static void ShowHelp()
+{
+    MessageBoxW(
+        NULL,
+        L"bpdf-gui — Графический интерфейс действий и прогресса для bpdf\n\n"
+        L"Использование:\n"
+        L"  bpdf-gui.exe [опции GUI] -- <команда bpdf> [файлы / @список] [параметры]\n"
+        L"  bpdf-gui.exe [файлы / @список] --cmd \"команда [параметры]\"\n"
+        L"  bpdf-gui.exe --item <номер> [файлы / @список]\n"
+        L"  bpdf-gui.exe [файлы / @список]  (открывает палитру действий)\n\n"
+        L"Опции GUI: --title <текст>, --icon <номер>, --gui auto|info|keep\n\n"
+        L"Примеры:\n"
+        L"  bpdf-gui.exe --icon 7 -- rotate doc.pdf -a \"{ask:Угол:90}\" -i\n"
+        L"  bpdf-gui.exe --icon 1 -- merge @filelist.txt --optimize -s A4\n"
+        L"  bpdf-gui.exe doc.pdf -- watermark \"{file}\" \"{ask:Текст:КОПИЯ}\" --angle 45 -i\n\n"
+        L"Параметры диалогов в командах:\n"
+        L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
+        L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками; после --password\n"
+        L"                           передаётся bpdf через окружение, а не командную строку\n\n"
+        L"Кнопки Total Commander:\n"
+        L"  Команда:    bpdf-gui.exe --icon 7\n"
+        L"  Параметры:  -- rotate @\"%UL\" -a \"{ask:Угол поворота (90, 180, 270, portrait):90}\" -i",
+        L"bpdf-gui",
+        MB_OK | MB_ICONINFORMATION
+    );
+}
+
+// False for --help. After "--" the rest is the bpdf command; the paths and
+// @lists right after its name are the selection the palette returns to
+static bool ParseArguments(GuiContext* ctx)
+{
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return true;
+
+    StrW title;
+    int icon = 0;
+    bool hasGuiMode = false;
+    GuiMode guiMode = GUI_AUTO;
+    const wchar_t* listFile = NULL;
+    bool deleteList = false;
+    bool help = false;
+
+    for (int i = 1; i < argc && !help; i++) {
+        const wchar_t* arg = argv[i];
+        bool hasValue = i + 1 < argc;
+        if (StrCmpW(arg, L"--") == 0) {
+            bool takeFiles = ctx->files.empty();
+            ctx->customCmd.clear();
+            for (int j = i + 1; j < argc; j++) {
+                const wchar_t* a = argv[j];
+                if (j > i + 1) ctx->customCmd.append(L' ');
+                AppendArg(ctx->customCmd, a);
+                if (j == i + 1 || !takeFiles) continue;
+                if (a[0] == L'@' && a[1]) LoadFilesFromListFile(a + 1, ctx->files);
+                else if (a[0] != L'-' && GetFileAttributesW(a) != INVALID_FILE_ATTRIBUTES) ctx->files.add(a);
+                else takeFiles = false;
+                if (takeFiles) ctx->filesEmbeddedInCmd = true;
+            }
+            break;
+        }
+        if (StrCmpIW(arg, L"--help") == 0 || StrCmpIW(arg, L"-h") == 0 || StrCmpW(arg, L"/?") == 0) {
+            help = true;
+        } else if (StrCmpIW(arg, L"--item") == 0 && hasValue) {
+            ctx->autoActionIndex = StrToIntW(argv[++i]);
+        } else if (StrCmpIW(arg, L"--cmd") == 0 && hasValue) {
+            ctx->customCmd.assign(argv[++i]);
+        } else if (StrCmpIW(arg, L"--title") == 0 && hasValue) {
+            title.assign(argv[++i]);
+        } else if (StrCmpIW(arg, L"--icon") == 0 && hasValue) {
+            icon = StrToIntW(argv[++i]);
+        } else if (StrCmpIW(arg, L"--gui") == 0 && hasValue) {
+            const wchar_t* mode = argv[++i];
+            hasGuiMode = true;
+            guiMode = StrCmpIW(mode, L"info") == 0 ? GUI_INFO : StrCmpIW(mode, L"keep") == 0 ? GUI_KEEP : GUI_AUTO;
+        } else if (StrCmpIW(arg, L"--delete-manifest") == 0) {
+            deleteList = true;
+        } else if (arg[0] == L'@' && arg[1]) {
+            LoadFilesFromListFile(arg + 1, ctx->files);
+            listFile = arg + 1;
+        } else {
+            ctx->files.add(arg);
         }
     }
+
+    // The list from the shell extension is ours to delete once read
+    if (deleteList && listFile) DeleteFileW(listFile);
+    LocalFree(argv);
+
+    if (help) {
+        ShowHelp();
+        return false;
+    }
+
+    if (!ctx->customCmd.empty()) {
+        MenuItemDef& action = ctx->customAction;
+        ctx->hasCustomAction = true;
+        action.iconIndex = icon >= 0 ? icon : 0;
+
+        wchar_t command[64] = {};
+        const wchar_t* c = ctx->customCmd.c_str();
+        while (*c == L' ' || *c == L'\t') c++;
+        for (size_t n = 0; c[n] && c[n] != L' ' && c[n] != L'\t' && n < ARRAYSIZE(command) - 1; n++) {
+            command[n] = c[n];
+        }
+        if (!title.empty()) lstrcpynW(action.title, title.c_str(), ARRAYSIZE(action.title));
+        else wnsprintfW(action.title, ARRAYSIZE(action.title), L"bpdf: %s", command[0] ? command : L"команда");
+
+        if (hasGuiMode) action.guiMode = guiMode;
+        else action.guiMode = StrCmpIW(command, L"info") == 0 ? GUI_INFO : GUI_AUTO;
+    }
+    return true;
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
@@ -1558,163 +1530,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     InitCommonControlsEx(&icc);
 
     GuiContext ctx;
-
-    if (!FindBpdfExe(ctx.targetExe, ARRAYSIZE(ctx.targetExe))) {
-        // bpdf.exe could not be found yet, can still open palette and browse
-    }
-
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-
-    int autoActionIndex = -1;
-    wchar_t tempManifestToDelete[MAX_PATH * 2] = {0};
-    StrW customCmd;
-    StrW customTitle;
-    int customIcon = -1;
-    GuiMode customGuiMode = GUI_AUTO;
-    bool hasCustomGuiMode = false;
-
-    if (argv && argc >= 2) {
-        // Quick help dialog
-        for (int i = 1; i < argc; i++) {
-            if (StrCmpIW(argv[i], L"--help") == 0 || StrCmpIW(argv[i], L"-h") == 0 || StrCmpW(argv[i], L"/?") == 0) {
-                MessageBoxW(
-                    NULL,
-                    L"bpdf-gui — Графический интерфейс действий и прогресса для bpdf\n\n"
-                    L"Использование:\n"
-                    L"  bpdf-gui.exe [опции GUI] -- <команда bpdf> [файлы / @список] [параметры]\n"
-                    L"  bpdf-gui.exe [файлы / @список] --cmd \"команда [параметры]\"\n"
-                    L"  bpdf-gui.exe --item <номер> [файлы / @список]\n"
-                    L"  bpdf-gui.exe [файлы / @список]  (открывает палитру действий)\n\n"
-                    L"Примеры:\n"
-                    L"  bpdf-gui.exe --icon 7 -- rotate doc.pdf -a \"{ask:Угол:90}\" -i\n"
-                    L"  bpdf-gui.exe --icon 1 -- merge @filelist.txt --optimize -s A4\n"
-                    L"  bpdf-gui.exe doc.pdf -- watermark \"{file}\" \"{ask:Текст:КОПИЯ}\" --angle 45 -i\n\n"
-                    L"Параметры диалогов в командах:\n"
-                    L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
-                    L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками\n\n"
-                    L"Кнопки Total Commander:\n"
-                    L"  Команда:    bpdf-gui.exe --icon 7\n"
-                    L"  Параметры:  -- rotate @\"%UL\" -a \"{ask:Угол поворота (90, 180, 270, portrait):90}\" -i",
-                    L"bpdf-gui",
-                    MB_OK | MB_ICONINFORMATION
-                );
-                LocalFree(argv);
-                return 0;
-            }
-        }
-
-        bool deleteManifest = false;
-        wchar_t lastManifestPath[MAX_PATH * 2] = {0};
-
-        for (int i = 1; i < argc; i++) {
-            if (StrCmpW(argv[i], L"--") == 0) {
-                bool hadFilesBeforeDash = !ctx.files.empty();
-                // Everything after "--" is treated as the bpdf command and options
-                for (int j = i + 1; j < argc; j++) {
-                    if (!customCmd.empty()) customCmd.append(L" ");
-                    const wchar_t* arg = argv[j];
-                    if ((wcschr(arg, L' ') != NULL || wcschr(arg, L'\t') != NULL) && arg[0] != L'"') {
-                        AppendQuotedArg(customCmd, arg);
-                    } else {
-                        customCmd.append(arg);
-                    }
-
-                    // If files were passed after "--" (e.g. from Total Commander buttonbar),
-                    // capture them into ctx.files for working directory and "Return to Palette"
-                    if (!hadFilesBeforeDash && j > i + 1) {
-                        if (arg[0] == L'@' && arg[1] != L'\0') {
-                            LoadFilesFromListFile(arg + 1, ctx.files);
-                            ctx.filesEmbeddedInCmd = true;
-                        } else if (arg[0] != L'-' && wcsstr(arg, L"{ask") == NULL && PathFileExistsW(arg)) {
-                            ctx.files.add(arg);
-                            ctx.filesEmbeddedInCmd = true;
-                        }
-                    }
-                }
-                break;
-            } else if (StrCmpIW(argv[i], L"--item") == 0 && i + 1 < argc) {
-                autoActionIndex = _wtoi(argv[++i]);
-            } else if (StrCmpIW(argv[i], L"--cmd") == 0 && i + 1 < argc) {
-                customCmd.assign(argv[++i]);
-            } else if (StrCmpIW(argv[i], L"--title") == 0 && i + 1 < argc) {
-                customTitle.assign(argv[++i]);
-            } else if (StrCmpIW(argv[i], L"--icon") == 0 && i + 1 < argc) {
-                customIcon = _wtoi(argv[++i]);
-            } else if (StrCmpIW(argv[i], L"--gui") == 0 && i + 1 < argc) {
-                hasCustomGuiMode = true;
-                const wchar_t* mode = argv[++i];
-                if (StrCmpIW(mode, L"info") == 0) customGuiMode = GUI_INFO;
-                else if (StrCmpIW(mode, L"keep") == 0) customGuiMode = GUI_KEEP;
-                else if (StrCmpIW(mode, L"none") == 0) customGuiMode = GUI_NONE;
-                else customGuiMode = GUI_AUTO;
-            } else if (StrCmpIW(argv[i], L"--delete-manifest") == 0) {
-                deleteManifest = true;
-            } else if (argv[i][0] == L'@') {
-                const wchar_t* listPath = argv[i] + 1;
-                LoadFilesFromListFile(listPath, ctx.files);
-                lstrcpynW(lastManifestPath, listPath, ARRAYSIZE(lastManifestPath));
-                wchar_t tempDir[MAX_PATH * 2] = {0};
-                GetTempPathW(ARRAYSIZE(tempDir), tempDir);
-                if (StrStrIW(listPath, tempDir) && StrStrIW(listPath, L"bpdf")) {
-                    lstrcpynW(tempManifestToDelete, listPath, ARRAYSIZE(tempManifestToDelete));
-                }
-            } else {
-                ctx.files.add(argv[i]);
-            }
-        }
-
-        if (deleteManifest && lastManifestPath[0]) {
-            lstrcpynW(tempManifestToDelete, lastManifestPath, ARRAYSIZE(tempManifestToDelete));
-        }
-    }
-    if (argv) LocalFree(argv);
-
-    if (tempManifestToDelete[0]) {
-        DeleteFileW(tempManifestToDelete);
-    }
-
-    bool hasCustomAction = !customCmd.empty();
-    if (hasCustomAction) {
-        ctx.hasCustomAction = true;
-        lstrcpynW(ctx.customAction.cmd, customCmd.c_str(), ARRAYSIZE(ctx.customAction.cmd));
-
-        if (!customTitle.empty()) {
-            lstrcpynW(ctx.customAction.title, customTitle.c_str(), ARRAYSIZE(ctx.customAction.title));
-        } else {
-            wchar_t firstWord[64] = {0};
-            const wchar_t* p = customCmd.c_str();
-            while (*p == L' ' || *p == L'\t') p++;
-            size_t fwLen = 0;
-            while (p[fwLen] && p[fwLen] != L' ' && p[fwLen] != L'\t' && fwLen < ARRAYSIZE(firstWord) - 1) {
-                firstWord[fwLen] = p[fwLen];
-                fwLen++;
-            }
-            firstWord[fwLen] = L'\0';
-            wnsprintfW(ctx.customAction.title, ARRAYSIZE(ctx.customAction.title), L"bpdf: %s", firstWord[0] ? firstWord : L"команда");
-        }
-
-        if (customIcon >= 0) {
-            ctx.customAction.iconIndex = customIcon;
-        } else {
-            ctx.customAction.iconIndex = 0;
-        }
-
-        if (hasCustomGuiMode) {
-            ctx.customAction.guiMode = customGuiMode;
-        } else if (_wcsnicmp(customCmd.c_str(), L"info", 4) == 0) {
-            ctx.customAction.guiMode = GUI_INFO;
-        } else {
-            ctx.customAction.guiMode = GUI_AUTO;
-        }
-    }
-
-    ctx.autoActionIndex = autoActionIndex;
-    ctx.state = STATE_PALETTE;
-    ctx.isPaletteSession = (!hasCustomAction && autoActionIndex < 0);
+    FindBpdfExe(ctx.targetExe, ARRAYSIZE(ctx.targetExe));
+    if (!ParseArguments(&ctx)) return 0;
 
     WNDCLASSEXW wc = { sizeof(wc) };
-    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = GuiWndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
@@ -1722,56 +1541,31 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     wc.lpszClassName = BPDF_GUI_CLASS;
     RegisterClassExW(&wc);
 
-    if (ctx.targetExe[0]) {
-        if (ctx.hasCustomAction && ctx.customAction.iconIndex >= 0) {
-            ExtractIconExW(ctx.targetExe, ctx.customAction.iconIndex, &ctx.hIcon, NULL, 1);
-        } else if (ctx.iconIndex >= 0) {
-            ExtractIconExW(ctx.targetExe, ctx.iconIndex, &ctx.hIcon, NULL, 1);
-        }
-        if (!ctx.hIcon) ExtractIconExW(ctx.targetExe, 0, &ctx.hIcon, NULL, 1);
-    }
-
-    int dpi = 96;
-    HDC hdc = GetDC(NULL);
-    if (hdc) {
-        dpi = GetDeviceCaps(hdc, LOGPIXELSY);
-        ReleaseDC(NULL, hdc);
-    }
-    if (dpi <= 0) dpi = 96;
-    ctx.dpi = dpi;
-
-    int winW = MulDiv(580, dpi, 96);
-    int winH = MulDiv(400, dpi, 96);
-    int posX = (GetSystemMetrics(SM_CXSCREEN) - winW) / 2;
-    int posY = (GetSystemMetrics(SM_CYSCREEN) - winH) / 2;
-
-    wchar_t winTitle[256];
-    lstrcpynW(winTitle, L"bpdf — Панель действий", ARRAYSIZE(winTitle));
-
+    // Created hidden: a single action shows it only when bpdf.exe runs for a
+    // while or ends with something to read; a cancelled {ask:...} dialog or a
+    // quick clean run leaves no window behind
     HWND hwnd = CreateWindowExW(
         WS_EX_APPWINDOW,
         BPDF_GUI_CLASS,
-        winTitle,
+        L"bpdf — Панель действий",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX,
-        posX, posY, winW, winH,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         NULL, NULL, hInst, &ctx
     );
-
     if (!hwnd) return 1;
 
-    if (!(ctx.hasCustomAction && ctx.customAction.guiMode == GUI_NONE) &&
-        !(ctx.autoActionIndex >= 0 && (size_t)ctx.autoActionIndex < ctx.actionCount && ctx.actionDefs[ctx.autoActionIndex].guiMode == GUI_NONE)) {
+    CenterOnMonitor(hwnd);
+    if (ctx.isPaletteSession) {
         ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
+        SetForegroundWindow(hwnd);
     }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        if (!IsDialogMessage(hwnd, &msg)) {
+        if (!IsDialogMessageW(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
-
     return 0;
 }

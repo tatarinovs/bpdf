@@ -100,6 +100,52 @@ fn clean_powershell_xml(value: &str) -> String {
     }
 }
 
+/// Start a child that outlives bpdf, such as a browser window. It gets none of
+/// our handles: a caller reading our output (bpdf-gui, a script) would
+/// otherwise wait for the child to close its copy of the pipe. On Windows it
+/// also leaves the caller's job object, so closing the job does not take the
+/// user's browser with it.
+pub fn spawn_detached(mut command: Command) -> std::io::Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        disinherit_std_handles();
+        command.creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+        if command.spawn().is_ok() {
+            return Ok(());
+        }
+        // A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK refuses the flag.
+        command.creation_flags(0);
+    }
+    command.spawn().map(drop)
+}
+
+/// Std handles inherited from the parent stay inheritable and would leak into
+/// every child. Rust duplicates them itself for `Stdio::inherit`, so they can
+/// stop being inheritable for good.
+#[cfg(windows)]
+fn disinherit_std_handles() {
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
+    use windows::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: changes only the inheritance flag of our own std handles.
+        unsafe {
+            if let Ok(handle) = GetStdHandle(id)
+                && !handle.is_invalid()
+            {
+                let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+            }
+        }
+    }
+}
+
 fn read_all(mut reader: impl Read) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = reader.read_to_end(&mut bytes);

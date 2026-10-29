@@ -15,64 +15,25 @@ static const wchar_t* CLSID_STRING = L"{B9DF0001-B000-4000-8000-000000000001}";
 static HINSTANCE g_hInst = NULL;
 static LONG g_refCount = 0;
 
-// 0 = not searched, 1 = searching, 2 = ready
-static wchar_t g_cachedExePath[MAX_PATH * 2] = {0};
-static volatile LONG g_cachedExeState = 0;
+// Paths of bpdf.exe (menu icons) and bpdf-gui.exe live as long as Explorer.
+// A cached path costs one existence check per use; a missing or moved file is
+// searched for again, so putting it in place needs no Explorer restart.
+static SRWLOCK g_pathsLock = SRWLOCK_INIT;
+static wchar_t g_exePath[MAX_PATH * 2] = {0};
+static wchar_t g_guiPath[MAX_PATH * 2] = {0};
 
-static wchar_t g_cachedGuiPath[MAX_PATH * 2] = {0};
-static volatile LONG g_cachedGuiState = 0;
+typedef bool (*FindPathFn)(wchar_t* outPath, size_t maxLen, HMODULE hMod);
 
-static bool GetCachedBpdfExe(wchar_t* outPath, size_t maxLen)
+static bool ResolvePath(wchar_t* cache, FindPathFn find, wchar_t* outPath, size_t maxLen)
 {
-    LONG state = InterlockedCompareExchange(&g_cachedExeState, 1, 0);
-    if (state == 0) {
-        wchar_t exe[MAX_PATH * 2] = {0};
-        if (FindBpdfExe(exe, ARRAYSIZE(exe), g_hInst)) {
-            lstrcpynW(g_cachedExePath, exe, ARRAYSIZE(g_cachedExePath));
-        }
-        InterlockedExchange(&g_cachedExeState, 2);
-    } else if (state == 1) {
-        while (InterlockedCompareExchange(&g_cachedExeState, 1, 1) == 1) {
-            SwitchToThread();
-        }
+    AcquireSRWLockExclusive(&g_pathsLock);
+    if (!cache[0] || GetFileAttributesW(cache) == INVALID_FILE_ATTRIBUTES) {
+        if (!find(cache, MAX_PATH * 2, g_hInst)) cache[0] = L'\0';
     }
-    if (g_cachedExePath[0]) {
-        lstrcpynW(outPath, g_cachedExePath, (int)maxLen);
-        return true;
-    }
-    return false;
-}
-
-static bool GetCachedBpdfGui(wchar_t* outPath, size_t maxLen)
-{
-    LONG state = InterlockedCompareExchange(&g_cachedGuiState, 1, 0);
-    if (state == 0) {
-        wchar_t gui[MAX_PATH * 2] = {0};
-        if (FindBpdfGui(gui, ARRAYSIZE(gui), g_hInst)) {
-            lstrcpynW(g_cachedGuiPath, gui, ARRAYSIZE(g_cachedGuiPath));
-        }
-        InterlockedExchange(&g_cachedGuiState, 2);
-    } else if (state == 1) {
-        while (InterlockedCompareExchange(&g_cachedGuiState, 1, 1) == 1) {
-            SwitchToThread();
-        }
-    }
-    if (g_cachedGuiPath[0]) {
-        lstrcpynW(outPath, g_cachedGuiPath, (int)maxLen);
-        return true;
-    }
-    return false;
-}
-
-static size_t LoadMenuConfig(const wchar_t* targetSection, MenuItemDef* outItems, size_t maxItems)
-{
-    wchar_t iniPath[MAX_PATH * 2] = {0};
-    StrW iniContent;
-    if (FindBpdfIni(iniPath, ARRAYSIZE(iniPath), g_hInst)) {
-        ReadTextFile(iniPath, iniContent);
-    }
-    if (iniContent.length() == 0) return 0;
-    return ParseIniSection(iniContent.c_str(), targetSection, outItems, maxItems);
+    bool found = cache[0] != L'\0';
+    if (found) lstrcpynW(outPath, cache, (int)maxLen);
+    ReleaseSRWLockExclusive(&g_pathsLock);
+    return found;
 }
 
 // -----------------------------------------------------------------------------
@@ -131,13 +92,12 @@ static HBITMAP CreateMenuBitmapFromIcon(HICON hIcon)
     return hBmp;
 }
 
-static HBITMAP GetCachedMenuIcon(int iconIndex)
+// exePath is NULL while bpdf.exe is not found: the icon is not cached then
+static HBITMAP GetCachedMenuIcon(int iconIndex, const wchar_t* exePath)
 {
     if (iconIndex < 0 || iconIndex >= MAX_SHELL_ACTIONS) return NULL;
     if (g_iconCache[iconIndex]) return g_iconCache[iconIndex];
-
-    wchar_t exePath[MAX_PATH * 2] = {0};
-    if (!GetCachedBpdfExe(exePath, ARRAYSIZE(exePath))) return NULL;
+    if (!exePath) return NULL;
 
     HICON hSmall = NULL;
     HBITMAP hBmp = NULL;
@@ -172,8 +132,8 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
 {
     if (files.empty()) return;
 
-    wchar_t guiExe[MAX_PATH * 2] = {0};
-    if (!GetCachedBpdfGui(guiExe, ARRAYSIZE(guiExe))) {
+    wchar_t guiExe[MAX_PATH * 2];
+    if (!ResolvePath(g_guiPath, FindBpdfGui, guiExe, ARRAYSIZE(guiExe))) {
         MessageBoxW(
             hwndOwner,
             L"Исполняемый файл bpdf-gui.exe не найден.\n"
@@ -185,9 +145,8 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
     }
 
     StrW guiCmd;
-    guiCmd.append(L"\"");
-    guiCmd.append(guiExe);
-    guiCmd.append(L"\" ");
+    AppendQuotedArg(guiCmd, guiExe);
+    guiCmd.append(L' ');
 
     size_t totalLen = 0;
     for (size_t i = 0; i < files.size(); i++) {
@@ -196,7 +155,6 @@ static void LaunchGui(const WStringList& files, int itemIndex, HWND hwndOwner)
 
     wchar_t tempManifestToDelete[MAX_PATH * 2] = {0};
 
-    // If few files and command line length fits well (< 3000 chars), pass files directly (no disk I/O)
     if (files.size() <= 16 && totalLen < 3000) {
         for (size_t i = 0; i < files.size(); i++) {
             AppendQuotedArg(guiCmd, files[i]);
@@ -256,6 +214,10 @@ public:
         InterlockedDecrement(&g_refCount);
     }
 
+    // No C++ runtime: allocation through the CRT heap
+    static void* operator new(size_t size) noexcept { return calloc(1, size); }
+    static void operator delete(void* p) noexcept { free(p); }
+
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
     {
@@ -286,6 +248,8 @@ public:
     // IShellExtInit
     STDMETHODIMP Initialize(PCIDLIST_ABSOLUTE pidlFolder, IDataObject* pdtobj, HKEY /*hkeyProgID*/) override
     {
+        // Paths are sized on the heap: the extension also runs on the threads of
+        // Open/Save dialogs in other programs, whose stacks may be small
         m_files.clear();
         if (pdtobj) {
             FORMATETC fmt = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
@@ -293,18 +257,20 @@ public:
             if (SUCCEEDED(pdtobj->GetData(&fmt, &stg))) {
                 HDROP hDrop = (HDROP)stg.hGlobal;
                 UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
-                wchar_t path[MAX_PATH * 2];
+                StrW path;
                 for (UINT i = 0; i < count; i++) {
-                    if (DragQueryFileW(hDrop, i, path, ARRAYSIZE(path)) > 0) {
-                        m_files.add(path);
+                    UINT len = DragQueryFileW(hDrop, i, NULL, 0);
+                    if (len > 0 && path.reserve(len) && DragQueryFileW(hDrop, i, path.data, len + 1) > 0) {
+                        m_files.add(path.data);
                     }
                 }
                 ReleaseStgMedium(&stg);
             }
         } else if (pidlFolder) {
-            wchar_t folderPath[MAX_PATH * 2] = {0};
-            if (SHGetPathFromIDListW(pidlFolder, folderPath)) {
+            PWSTR folderPath = NULL;
+            if (SUCCEEDED(SHGetNameFromIDList(pidlFolder, SIGDN_FILESYSPATH, &folderPath))) {
                 m_files.add(folderPath);
+                CoTaskMemFree(folderPath);
             }
         }
         return S_OK;
@@ -313,6 +279,7 @@ public:
     // IContextMenu
     STDMETHODIMP QueryContextMenu(HMENU hmenu, UINT indexMenu, UINT idCmdFirst, UINT idCmdLast, UINT uFlags) override
     {
+        m_actionCount = 0;
         if ((uFlags & CMF_DEFAULTONLY) != 0 || m_files.empty()) {
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
@@ -332,16 +299,25 @@ public:
         wchar_t targetSection[64] = {0};
         GetSectionForFiles(m_files, targetSection, ARRAYSIZE(targetSection));
 
-        MenuItemDef items[MAX_INI_ITEMS];
-        size_t totalItems = LoadMenuConfig(targetSection, items, ARRAYSIZE(items));
+        MenuItemDef* items = (MenuItemDef*)calloc(MAX_INI_ITEMS, sizeof(MenuItemDef));
+        if (!items) {
+            return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
+        }
+        size_t totalItems = LoadMenuItems(targetSection, items, MAX_INI_ITEMS, g_hInst);
         if (totalItems == 0) {
+            free(items);
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
         HMENU hSubMenu = CreatePopupMenu();
         if (!hSubMenu) {
+            free(items);
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
+
+        // Once per menu: icons not cached yet are taken from this bpdf.exe
+        wchar_t exeBuf[MAX_PATH * 2];
+        const wchar_t* exePath = ResolvePath(g_exePath, FindBpdfExe, exeBuf, ARRAYSIZE(exeBuf)) ? exeBuf : NULL;
 
         UINT actionIndex = 0;
         UINT menuPos = 0;
@@ -356,7 +332,7 @@ public:
                 mii.wID = idCmdFirst + actionIndex;
                 mii.dwTypeData = items[i].title;
 
-                HBITMAP hBmp = GetCachedMenuIcon(items[i].iconIndex);
+                HBITMAP hBmp = GetCachedMenuIcon(items[i].iconIndex, exePath);
                 if (hBmp) {
                     mii.fMask |= MIIM_BITMAP;
                     mii.hbmpItem = hBmp;
@@ -366,19 +342,19 @@ public:
             }
         }
 
-        m_actionCount = actionIndex;
-        if (m_actionCount == 0 || idCmdFirst + m_actionCount > idCmdLast + 1) {
+        free(items);
+
+        if (actionIndex == 0 || idCmdFirst + actionIndex > idCmdLast + 1) {
             DestroyMenu(hSubMenu);
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
 
-        // Parent cascaded menu item (pure submenu, no command ID)
         MENUITEMINFOW parentMii = { sizeof(parentMii) };
         parentMii.fMask = MIIM_STRING | MIIM_SUBMENU;
         parentMii.hSubMenu = hSubMenu;
         parentMii.dwTypeData = const_cast<LPWSTR>(L"bpdf");
 
-        HBITMAP hLogoBmp = GetCachedMenuIcon(0);
+        HBITMAP hLogoBmp = GetCachedMenuIcon(0, exePath);
         if (hLogoBmp) {
             parentMii.fMask |= MIIM_BITMAP;
             parentMii.hbmpItem = hLogoBmp;
@@ -388,6 +364,7 @@ public:
             DestroyMenu(hSubMenu);
             return MAKE_HRESULT(SEVERITY_SUCCESS, 0, 0);
         }
+        m_actionCount = actionIndex;
 
         return MAKE_HRESULT(SEVERITY_SUCCESS, 0, (ULONG)m_actionCount);
     }
@@ -430,6 +407,9 @@ public:
     {
         InterlockedDecrement(&g_refCount);
     }
+
+    static void* operator new(size_t size) noexcept { return calloc(1, size); }
+    static void operator delete(void* p) noexcept { free(p); }
 
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
     {
@@ -479,7 +459,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hInst;
+        // The static MSVC CRT (/MT) needs the thread notifications
+#if !(defined(_MSC_VER) && !defined(_DLL))
         DisableThreadLibraryCalls(hInst);
+#endif
     } else if (reason == DLL_PROCESS_DETACH) {
         if (!lpReserved) {
             ClearIconCache();
@@ -536,6 +519,9 @@ STDAPI DllRegisterServer(void)
     ok &= SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
     ok &= SetRegString(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\bpdf", NULL, CLSID_STRING);
 
+    // Register in Approved Shell Extensions under HKCU (supports modern Windows policy checks without Admin rights)
+    SetRegString(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved", CLSID_STRING, L"bpdf Shell Extension");
+
     if (!ok) {
         return SELFREG_E_CLASS;
     }
@@ -549,6 +535,13 @@ STDAPI DllUnregisterServer(void)
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shellex\\ContextMenuHandlers\\bpdf");
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Folder\\shellex\\ContextMenuHandlers\\bpdf");
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\Background\\shellex\\ContextMenuHandlers\\bpdf");
+
+    // Remove from Approved Shell Extensions
+    HKEY hKeyApproved = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Shell Extensions\\Approved", 0, KEY_SET_VALUE, &hKeyApproved) == ERROR_SUCCESS) {
+        RegDeleteValueW(hKeyApproved, CLSID_STRING);
+        RegCloseKey(hKeyApproved);
+    }
 
     wchar_t clsidKey[128];
     wnsprintfW(clsidKey, ARRAYSIZE(clsidKey), L"Software\\Classes\\CLSID\\%s", CLSID_STRING);
