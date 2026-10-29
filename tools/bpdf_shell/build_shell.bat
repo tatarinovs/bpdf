@@ -66,13 +66,15 @@ if exist "%DIST_DIR%" (
   echo Updated %DIST_DIR%\bpdf-gui.exe
   if exist "%DIST_SHELL%" (
     if exist "%DIST_SHELL%\bpdf_shell.dll" (
-      del /f /q "%DIST_SHELL%\bpdf_shell.dll.old*" 2>nul
-      move /y "%DIST_SHELL%\bpdf_shell.dll" "%DIST_SHELL%\bpdf_shell.dll.old" >nul 2>&1
+      del /f /q "%DIST_SHELL%\bpdf_shell.dll.old*" >nul 2>&1
+      rem Explorer may still hold an earlier .old, so every rename gets a new name.
+      move /y "%DIST_SHELL%\bpdf_shell.dll" "%DIST_SHELL%\bpdf_shell.dll.old%RANDOM%" >nul 2>&1
     )
     copy /y "%OUT_DLL%" "%DIST_SHELL%\bpdf_shell.dll" >nul
     copy /y "%~dp0bpdf_shell.ini" "%DIST_SHELL%\bpdf_shell.ini" >nul
+    copy /y "%~dp0bpdf_shell_en.ini" "%DIST_SHELL%\bpdf_shell_en.ini" >nul
     del /f /q "%DIST_SHELL%\bpdf-gui.exe" 2>nul
-    echo Updated %DIST_SHELL%\bpdf_shell.dll and bpdf_shell.ini
+    echo Updated %DIST_SHELL%\bpdf_shell.dll and the ini files
   )
 )
 

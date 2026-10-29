@@ -133,11 +133,31 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 - The executable entry point is also a library entry point, enabling cheap
   integration and differential tests without duplicating startup logic.
 
+## Windows shell components
+
+`tools/bpdf_shell` holds the C++ parts, built by `build_shell.bat` with MinGW
+or MSVC:
+
+- `bpdf_shell.dll`: the Explorer context menu handler. It picks the
+  `bpdf_shell.ini` section for the selection, builds the submenu and starts
+  `bpdf-gui.exe --item N` with the files (an `@list` for several).
+- `bpdf-gui.exe`: expands placeholders and `{ask:...}` dialogs, passes
+  passwords through `BPDF_*_PASSWORD` variables, runs `bpdf.exe --no-pause`
+  and shows its progress; without a command it is the action palette.
+- `bpdf_shell_common.h`: shared lookup of `bpdf.exe`, `bpdf-gui.exe` and the
+  ini, and the UTF-8 ini parser.
+
+The CLI stays the only place that touches documents; the shell parts only
+build command lines.
+
+`tools/bar` holds the Total Commander button bar generators. They are saved
+in the code page of the `.bar` they write (cp1251 for Russian, cp1252 for
+English) with CRLF line ends.
+
 ## Verification
 
 `cargo test` covers the CLI definition (including clap's consistency checks),
-the commands and the PDF transforms. `tools/benchmark-v1.ps1` compares split
-timings of two executables over the same source PDF.
+the commands and the PDF transforms.
 
 Live Groq OCR and Microsoft Office COM calls depend on external credentials and
 installed applications. Their internal unit tests remain part of the normal

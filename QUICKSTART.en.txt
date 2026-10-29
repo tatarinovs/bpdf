@@ -1,0 +1,73 @@
+﻿bpdf — quick start
+==================
+
+INSTALLATION
+------------
+1. Unpack the archive to a permanent folder, e.g. C:\Tools\bpdf.
+   Add it to PATH to run bpdf from any folder.
+2. Settings (optional): copy config.example.toml to config.toml beside
+   bpdf.exe.
+   Cloud OCR through Groq needs a key:
+     groq_api_key = "gsk_..."     or   groq_api_key = "%GROQ_API_KEY%"
+   Without a key the local Windows OCR works: ocr_engine = "windows"
+   in config.toml or -e windows in the command.
+3. Check: bpdf doctor
+
+Explorer menu
+  shell\bpdf_shell_en.ini   copy it over shell\bpdf_shell.ini for English items
+  shell\register.bat        add the "bpdf" submenu (no administrator rights needed)
+  shell\unregister.bat      remove it
+  On Windows 11 the submenu is under "Show more options" (Shift+F10).
+  Menu items are defined in shell\bpdf_shell.ini.
+
+Total Commander
+  Run a generator from the bar folder; it creates the button bar beside itself:
+    make_bar_en.bat       -> bpdf_en.bar       buttons run bpdf.exe in a console
+    make_bar_gui_en.bat   -> bpdf_gui_en.bar   progress window, dialogs, palette
+  Drag the .bar file onto the Total Commander toolbar.
+
+Action palette
+  Run bpdf-gui.exe, drop files onto its window and pick an action.
+  (bpdf-gui messages are in Russian only for now.)
+
+
+COMMANDS
+--------
+By default the result goes beside the source: NAME_action.pdf.
+  -o FILE or FOLDER   where to write
+  -i                  overwrite the source file
+Inputs: files, folders, masks (*.jpg), a file list @list.txt.
+Pages: 1-5,8  last  2-last  even  odd  reverse; in merge — doc.pdf:1-3.
+
+merge      Build one PDF from PDFs, images, Office, HTML, e-books and text
+             bpdf merge *.jpg -s A4 --auto-rotate --optimize -o scan.pdf
+             bpdf merge report.pdf:1-3 photo.heic notes.txt -o all.pdf
+             --bookmarks  a bookmark per file
+             --remove-blank  drop blank scanned pages
+ocr        Recognise text in scans and images
+             bpdf ocr scan.pdf                     text to scan.md (Groq)
+             bpdf ocr scan.pdf -e windows -i       text layer into the PDF itself
+             bpdf ocr *.jpg -e windows -o all.pdf  one searchable PDF
+text       Existing PDF text layer:        bpdf text doc.pdf -o doc.txt
+split      One file per page:              bpdf split doc.pdf
+extract    Pick pages:                     bpdf extract doc.pdf 1-3,last
+rotate     Rotate:                         bpdf rotate doc.pdf -a 90 -p even -i
+resize     PDF page size:                  bpdf resize doc.pdf -s A4
+           JPEG size:                      bpdf resize photo.jpg --long-edge 1920
+optimize   Compress a PDF:                 bpdf optimize doc.pdf --max-size 5MB
+             --gray  images to grayscale
+stamp      Stamp image:                    bpdf stamp doc.pdf stamp.png --blend multiply
+             --position br|bl|tr|tl|c   --pick  place it with the mouse in a browser
+number     Page numbers:                   bpdf number doc.pdf --format "{n} / {total}"
+watermark  Text watermark:                 bpdf watermark doc.pdf "COPY" --color red
+metadata   Properties:                     bpdf metadata doc.pdf --title "Report" -i
+strip      Remove metadata and EXIF:       bpdf strip *.jpg -i
+protect    AES-256 password:               bpdf protect doc.pdf --password 123
+             --no-print  --no-copy  --no-modify
+unlock     Remove the password:            bpdf unlock doc.pdf --password 123
+convert    To JPEG (PDF, images, HTML):    bpdf convert doc.pdf
+             --max-size 500KB  --long-edge 1600  --render (whole PDF pages)
+info       PDF details:                    bpdf info doc.pdf
+doctor     Check settings and external programs
+
+Help: bpdf --help, bpdf COMMAND --help. Details: README.en.md.

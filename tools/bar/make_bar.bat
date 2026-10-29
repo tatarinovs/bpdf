@@ -1,6 +1,6 @@
 @echo off
 rem Генерирует bpdf.bar (панель кнопок Total Commander) рядом с этим файлом.
-rem Файл должен лежать рядом с bpdf.exe. Если bpdf.exe находится внутри папки
+rem Скрипт лежит в папке bar рядом с bpdf.exe. Если bpdf.exe находится внутри папки
 rem Total Commander, путь пишется через %COMMANDER_PATH%, иначе - абсолютный.
 rem
 rem   make_bar.bat            - определить путь автоматически
@@ -12,8 +12,10 @@ setlocal EnableExtensions DisableDelayedExpansion
 for /f "tokens=2 delims=:." %%C in ('chcp') do set "OLD_CP=%%C"
 chcp 1251 >nul
 
-set "EXE_DIR=%~dp0"
-set "EXE_DIR=%EXE_DIR:~0,-1%"
+rem Скрипт лежит в папке bar рядом с bpdf.exe (или прямо рядом с ним).
+set "EXE_DIR=%~dp0.."
+if exist "%~dp0bpdf.exe" set "EXE_DIR=%~dp0."
+for %%I in ("%EXE_DIR%") do set "EXE_DIR=%%~fI"
 set "OUT=%~dp0bpdf.bar"
 set "Q="
 

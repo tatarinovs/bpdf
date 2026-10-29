@@ -1,0 +1,72 @@
+﻿bpdf — быстрый старт
+====================
+
+УСТАНОВКА
+---------
+1. Распакуйте архив в постоянную папку, например C:\Tools\bpdf.
+   Чтобы вызывать bpdf из любой папки, добавьте её в PATH.
+2. Настройки (необязательно): скопируйте config.example.toml в config.toml
+   рядом с bpdf.exe.
+   Облачный OCR через Groq требует ключ:
+     groq_api_key = "gsk_..."     или   groq_api_key = "%GROQ_API_KEY%"
+   Без ключа распознаёт локальный Windows OCR: ocr_engine = "windows"
+   в config.toml или ключ -e windows в команде.
+3. Проверка: bpdf doctor
+
+Меню Проводника
+  shell\register.bat     добавить подменю «bpdf» (права администратора не нужны)
+  shell\unregister.bat   убрать его
+  В Windows 11 подменю находится в «Показать дополнительные параметры»
+  (Shift+F10). Пункты меню задаются в shell\bpdf_shell.ini, английский
+  вариант — bpdf_shell_en.ini (скопируйте поверх bpdf_shell.ini).
+
+Total Commander
+  Запустите генератор из папки bar, он создаст панель рядом с собой:
+    make_bar.bat       -> bpdf.bar       кнопки запускают bpdf.exe в консоли
+    make_bar_gui.bat   -> bpdf_gui.bar   окно прогресса, диалоги, палитра
+  Перетащите .bar на панель инструментов Total Commander.
+
+Палитра действий
+  Запустите bpdf-gui.exe, перетащите файлы в окно и выберите действие.
+
+
+КОМАНДЫ
+-------
+Результат по умолчанию пишется рядом с исходным: ИМЯ_действие.pdf.
+  -o ФАЙЛ или ПАПКА   куда записать
+  -i                  перезаписать исходный файл
+Входы: файлы, папки, маски (*.jpg), список файлов @list.txt.
+Страницы: 1-5,8  last  2-last  even  odd  reverse; в merge — doc.pdf:1-3.
+
+merge      Собрать один PDF из PDF, картинок, Office, HTML, книг и текста
+             bpdf merge *.jpg -s A4 --auto-rotate --optimize -o scan.pdf
+             bpdf merge report.pdf:1-3 photo.heic notes.txt -o all.pdf
+             --bookmarks  закладка на каждый файл
+             --remove-blank  убрать пустые страницы сканов
+ocr        Распознать текст сканов и картинок
+             bpdf ocr scan.pdf                     текст в scan.md (Groq)
+             bpdf ocr scan.pdf -e windows -i       текстовый слой в сам PDF
+             bpdf ocr *.jpg -e windows -o all.pdf  один PDF с поиском по тексту
+text       Готовый текстовый слой PDF:     bpdf text doc.pdf -o doc.txt
+split      По файлу на страницу:           bpdf split doc.pdf
+extract    Выбрать страницы:               bpdf extract doc.pdf 1-3,last
+rotate     Повернуть:                      bpdf rotate doc.pdf -a 90 -p even -i
+resize     Формат страниц PDF:             bpdf resize doc.pdf -s A4
+           Размер JPEG:                    bpdf resize photo.jpg --long-edge 1920
+optimize   Сжать PDF:                      bpdf optimize doc.pdf --max-size 5MB
+             --gray  картинки в оттенки серого
+stamp      Печать:                         bpdf stamp doc.pdf stamp.png --blend multiply
+             --position br|bl|tr|tl|c   --pick  поставить мышью в браузере
+number     Номера страниц:                 bpdf number doc.pdf --format "{n} / {total}"
+watermark  Водяной знак:                   bpdf watermark doc.pdf "КОПИЯ" --color red
+metadata   Свойства:                       bpdf metadata doc.pdf --title "Отчёт" -i
+strip      Удалить метаданные и EXIF:      bpdf strip *.jpg -i
+protect    Пароль AES-256:                 bpdf protect doc.pdf --password 123
+             --no-print  --no-copy  --no-modify
+unlock     Снять пароль:                   bpdf unlock doc.pdf --password 123
+convert    В JPEG (PDF, картинки, HTML):   bpdf convert doc.pdf
+             --max-size 500KB  --long-edge 1600  --render (страницы PDF целиком)
+info       Сведения о PDF:                 bpdf info doc.pdf
+doctor     Проверка настроек и внешних программ
+
+Справка: bpdf --help, bpdf КОМАНДА --help. Подробности — README.md.

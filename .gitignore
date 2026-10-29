@@ -17,3 +17,4 @@
 *.dll
 *.exe
 !/resources/**
+!/QUICKSTART*.txt

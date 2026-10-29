@@ -1,6 +1,6 @@
 @echo off
 rem Generates bpdf_en.bar (Total Commander button bar) beside this file.
-rem The file must be located next to bpdf.exe. If bpdf.exe is inside Total Commander,
+rem The script lives in the bar folder beside bpdf.exe. If bpdf.exe is inside Total Commander,
 rem the path is written using %COMMANDER_PATH%, otherwise an absolute path is used.
 rem
 rem   make_bar_en.bat            - detect path automatically (creates bpdf_en.bar)
@@ -12,9 +12,11 @@ setlocal EnableExtensions DisableDelayedExpansion
 for /f "tokens=2 delims=:." %%C in ('chcp') do set "OLD_CP=%%C"
 chcp 1252 >nul
 
-set "EXE_DIR=%~dp0"
-set "EXE_DIR=%EXE_DIR:~0,-1%"
-set "OUT=%EXE_DIR%\bpdf_en.bar"
+rem The script lives in the bar folder beside bpdf.exe (or right beside it).
+set "EXE_DIR=%~dp0.."
+if exist "%~dp0bpdf.exe" set "EXE_DIR=%~dp0."
+for %%I in ("%EXE_DIR%") do set "EXE_DIR=%%~fI"
+set "OUT=%~dp0bpdf_en.bar"
 set "FORCED_BASE="
 set "Q="
 
@@ -26,12 +28,12 @@ if /i "%~1"=="/default" (
   goto :parse_args
 )
 if /i "%~1"=="/bpdf" (
-  set "OUT=%EXE_DIR%\bpdf.bar"
+  set "OUT=%~dp0bpdf.bar"
   shift
   goto :parse_args
 )
 if /i "%~x1"==".bar" (
-  set "OUT=%EXE_DIR%\%~nx1"
+  set "OUT=%~dp0%~nx1"
   shift
   goto :parse_args
 )

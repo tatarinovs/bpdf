@@ -12,8 +12,10 @@ setlocal EnableExtensions DisableDelayedExpansion
 for /f "tokens=2 delims=:." %%C in ('chcp') do set "OLD_CP=%%C"
 chcp 1251 >nul
 
-set "EXE_DIR=%~dp0"
-set "EXE_DIR=%EXE_DIR:~0,-1%"
+rem Скрипт лежит в папке bar рядом с bpdf-gui.exe (или прямо рядом с ним).
+set "EXE_DIR=%~dp0.."
+if exist "%~dp0bpdf-gui.exe" set "EXE_DIR=%~dp0."
+for %%I in ("%EXE_DIR%") do set "EXE_DIR=%%~fI"
 set "OUT=%~dp0bpdf_gui.bar"
 rem Путь в cmd= всегда в кавычках: в нём могут быть пробелы ("Program Files").
 set Q="
@@ -25,7 +27,7 @@ if /i "%~1"=="/default" (
 
 if not exist "%EXE_DIR%\bpdf-gui.exe" (
   if exist "%EXE_DIR%\..\dist\bpdf-gui.exe" (
-    set "EXE_DIR=%EXE_DIR%\..\dist"
+    for %%I in ("%EXE_DIR%\..\dist") do set "EXE_DIR=%%~fI"
   ) else (
     echo Предупреждение: рядом нет bpdf-gui.exe: "%EXE_DIR%"
   )

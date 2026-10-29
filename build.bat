@@ -65,12 +65,15 @@ copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
 copy /y "%CD%\config.example.toml" "%CD%\dist\config.example.toml" >nul || goto :error
 copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
 copy /y "%CD%\README.en.md" "%CD%\dist\README.en.md" >nul || goto :error
+copy /y "%CD%\QUICKSTART.txt" "%CD%\dist\QUICKSTART.txt" >nul || goto :error
+copy /y "%CD%\QUICKSTART.en.txt" "%CD%\dist\QUICKSTART.en.txt" >nul || goto :error
 copy /y "%CD%\LICENSE" "%CD%\dist\LICENSE" >nul || goto :error
-copy /y "%CD%\tools\make_bar.bat" "%CD%\dist\make_bar.bat" >nul || goto :error
-copy /y "%CD%\tools\make_bar_en.bat" "%CD%\dist\make_bar_en.bat" >nul || goto :error
-rem bpdf.bar and bpdf_en.bar are generated on the user's machine.
-if exist "%CD%\dist\bpdf.bar" del /q "%CD%\dist\bpdf.bar"
-if exist "%CD%\dist\bpdf_en.bar" del /q "%CD%\dist\bpdf_en.bar"
+rem Total Commander bar generators live in dist\bar\; the .bar files
+rem themselves are generated on the user's machine.
+if not exist "%CD%\dist\bar" mkdir "%CD%\dist\bar"
+if errorlevel 1 goto :error
+del /q "%CD%\dist\make_bar*.bat" "%CD%\dist\*.bar" "%CD%\dist\bar\*.bar" >nul 2>&1
+copy /y "%CD%\tools\bar\make_bar*.bat" "%CD%\dist\bar\" >nul || goto :error
 
 rem Prepare Windows Explorer context menu extension in dist\shell\
 if not exist "%CD%\dist\shell" mkdir "%CD%\dist\shell"
@@ -79,10 +82,12 @@ if exist "%CD%\tools\bpdf_shell\bpdf_shell.dll" (
   del /f /q "%CD%\dist\shell\bpdf_shell.dll.old*" >nul 2>&1
   copy /y "%CD%\tools\bpdf_shell\bpdf_shell.dll" "%CD%\dist\shell\bpdf_shell.dll" >nul 2>&1
   if errorlevel 1 (
-    move /y "%CD%\dist\shell\bpdf_shell.dll" "%CD%\dist\shell\bpdf_shell.dll.old" >nul 2>&1
+    rem Explorer may still hold an earlier .old, so every rename gets a new name.
+    move /y "%CD%\dist\shell\bpdf_shell.dll" "%CD%\dist\shell\bpdf_shell.dll.old%RANDOM%" >nul 2>&1
     copy /y "%CD%\tools\bpdf_shell\bpdf_shell.dll" "%CD%\dist\shell\bpdf_shell.dll" >nul || goto :error
   )
   copy /y "%CD%\tools\bpdf_shell\bpdf_shell.ini" "%CD%\dist\shell\bpdf_shell.ini" >nul || goto :error
+  copy /y "%CD%\tools\bpdf_shell\bpdf_shell_en.ini" "%CD%\dist\shell\bpdf_shell_en.ini" >nul || goto :error
   if exist "%CD%\tools\bpdf_shell\bpdf-gui.exe" (
     copy /y "%CD%\tools\bpdf_shell\bpdf-gui.exe" "%CD%\dist\bpdf-gui.exe" >nul || goto :error
   )
@@ -103,10 +108,15 @@ set "ZIP_FILE=%CD%\dist\bpdf-%VERSION%-win-x64.zip"
 powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
   "$ErrorActionPreference = 'Stop'; $d = '%CD%\dist';" ^
   "$stage = Join-Path $env:TEMP ('bpdf_pkg_' + [Guid]::NewGuid().ToString());" ^
-  "New-Item -ItemType Directory -Path (Join-Path $stage 'shell') -Force | Out-Null;" ^
-  "@('bpdf.exe', 'bpdf-gui.exe', 'make_bar.bat', 'make_bar_en.bat', 'config.example.toml', 'README.md', 'README.en.md', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
-  "@('bpdf_shell.dll', 'bpdf_shell.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
-  "Compress-Archive -Force -DestinationPath '%ZIP_FILE%' -Path (Join-Path $stage '*');" ^
+  "New-Item -ItemType Directory -Path (Join-Path $stage 'shell'), (Join-Path $stage 'bar') -Force | Out-Null;" ^
+  "@('bpdf.exe', 'bpdf-gui.exe', 'config.example.toml', 'QUICKSTART.txt', 'QUICKSTART.en.txt', 'README.md', 'README.en.md', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
+  "@('make_bar.bat', 'make_bar_en.bat', 'make_bar_gui.bat', 'make_bar_gui_en.bat') | ForEach-Object { Copy-Item (Join-Path $d ('bar\' + $_)) (Join-Path $stage 'bar') };" ^
+  "@('bpdf_shell.dll', 'bpdf_shell.ini', 'bpdf_shell_en.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
+  "Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem;" ^
+  "if (Test-Path '%ZIP_FILE%') { Remove-Item -Force '%ZIP_FILE%' };" ^
+  "$zip = [IO.Compression.ZipFile]::Open('%ZIP_FILE%', 'Create');" ^
+  "Get-ChildItem -Recurse -File $stage | ForEach-Object { $name = $_.FullName.Substring($stage.Length + 1).Replace('\', '/'); [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $name, 'Optimal') };" ^
+  "$zip.Dispose();" ^
   "Remove-Item -Recurse -Force $stage;"
 if errorlevel 1 goto :error
 
