@@ -1,3 +1,7 @@
+// Preprocessing and text correction are portable (and unit-tested everywhere),
+// but only the Windows engine calls them.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 #[cfg(windows)]
 use anyhow::Context;
 use std::borrow::Cow;
