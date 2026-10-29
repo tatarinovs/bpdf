@@ -433,6 +433,8 @@ Configuration lookup order:
 
 String parameters automatically expand system environment variables formatted as `%NAME%`.
 
+**Groq key** is needed only for cloud OCR (`ocr_engine = "groq"` or `auto`). It is free, with rate limits: sign up at [console.groq.com](https://console.groq.com), click *Create API Key* on the [API Keys](https://console.groq.com/keys) page and copy the key (`gsk_...`) — it is not shown again. Put it into `groq_api_key`, or keep it in an environment variable and set `groq_api_key = "%GROQ_API_KEY%"`. If Groq is not available from your country, set `proxy`. Check with `bpdf doctor`.
+
 ### Example `config.toml`
 
 ```toml

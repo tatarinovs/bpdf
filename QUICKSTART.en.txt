@@ -7,8 +7,13 @@ INSTALLATION
    Add it to PATH to run bpdf from any folder.
 2. Settings (optional): copy config.example.toml to config.toml beside
    bpdf.exe.
-   Cloud OCR through Groq needs a key:
+   Cloud OCR through Groq needs a key. To get one for free:
+     1) sign up at https://console.groq.com
+     2) open https://console.groq.com/keys and click Create API Key
+     3) copy the key (gsk_...) — it is not shown again later
+   and put it into config.toml:
      groq_api_key = "gsk_..."     or   groq_api_key = "%GROQ_API_KEY%"
+   If Groq is not available from your country, set proxy in config.toml.
    Without a key the local Windows OCR works: ocr_engine = "windows"
    in config.toml or -e windows in the command.
 3. Check: bpdf doctor

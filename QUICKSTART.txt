@@ -7,8 +7,13 @@
    Чтобы вызывать bpdf из любой папки, добавьте её в PATH.
 2. Настройки (необязательно): скопируйте config.example.toml в config.toml
    рядом с bpdf.exe.
-   Облачный OCR через Groq требует ключ:
+   Облачный OCR через Groq требует ключ. Получить его бесплатно:
+     1) зарегистрируйтесь на https://console.groq.com
+     2) откройте https://console.groq.com/keys и нажмите Create API Key
+     3) скопируйте ключ (gsk_...) — позже его не показывают ещё раз
+   и впишите в config.toml:
      groq_api_key = "gsk_..."     или   groq_api_key = "%GROQ_API_KEY%"
+   Если Groq недоступен из вашей страны, задайте proxy в config.toml.
    Без ключа распознаёт локальный Windows OCR: ocr_engine = "windows"
    в config.toml или ключ -e windows в команде.
 3. Проверка: bpdf doctor
