@@ -74,7 +74,7 @@ rem Total Commander bar generators live in dist\bar\; the .bar files
 rem themselves are generated on the user's machine.
 if not exist "%CD%\dist\bar" mkdir "%CD%\dist\bar"
 if errorlevel 1 goto :error
-del /q "%CD%\dist\make_bar*.bat" "%CD%\dist\*.bar" "%CD%\dist\bar\*.bar" >nul 2>&1
+del /q "%CD%\dist\make_bar*.bat" "%CD%\dist\*.bar" "%CD%\dist\bar\*.bat" "%CD%\dist\bar\*.bar" >nul 2>&1
 copy /y "%CD%\tools\bar\make_bar*.bat" "%CD%\dist\bar\" >nul || goto :error
 
 rem Prepare Windows Explorer context menu extension in dist\shell\
@@ -113,7 +113,7 @@ powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
   "New-Item -ItemType Directory -Path (Join-Path $stage 'shell'), (Join-Path $stage 'bar'), (Join-Path $stage 'docs') -Force | Out-Null;" ^
   "@('bpdf.exe', 'bpdf-gui.exe', 'config.example.toml') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
   "@('README.md', 'README.en.md', 'QUICKSTART.txt', 'QUICKSTART.en.txt', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d ('docs\' + $_)) (Join-Path $stage 'docs') };" ^
-  "@('make_bar.bat', 'make_bar_en.bat', 'make_bar_gui.bat', 'make_bar_gui_en.bat') | ForEach-Object { Copy-Item (Join-Path $d ('bar\' + $_)) (Join-Path $stage 'bar') };" ^
+  "@('make_bar.bat', 'make_bar_ru.bat', 'make_bar_gui.bat', 'make_bar_gui_ru.bat') | ForEach-Object { Copy-Item (Join-Path $d ('bar\' + $_)) (Join-Path $stage 'bar') };" ^
   "@('bpdf_shell.dll', 'bpdf_shell.ini', 'bpdf_shell_ru.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
   "Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem;" ^
   "if (Test-Path '%ZIP_FILE%') { Remove-Item -Force '%ZIP_FILE%' };" ^

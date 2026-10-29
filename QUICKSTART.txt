@@ -23,8 +23,9 @@
 
 Total Commander
   Запустите генератор из папки bar, он создаст панель рядом с собой:
-    make_bar.bat       -> bpdf.bar       кнопки запускают bpdf.exe в консоли
-    make_bar_gui.bat   -> bpdf_gui.bar   окно прогресса, диалоги, палитра
+    make_bar_ru.bat       -> bpdf_ru.bar       кнопки запускают bpdf.exe в консоли
+    make_bar_gui_ru.bat   -> bpdf_gui_ru.bar   окно прогресса, диалоги, палитра
+  Без _ru — те же панели с английскими подписями.
   Перетащите .bar на панель инструментов Total Commander.
 
 Палитра действий

@@ -23,8 +23,9 @@ Explorer menu
 
 Total Commander
   Run a generator from the bar folder; it creates the button bar beside itself:
-    make_bar_en.bat       -> bpdf_en.bar       buttons run bpdf.exe in a console
-    make_bar_gui_en.bat   -> bpdf_gui_en.bar   progress window, dialogs, palette
+    make_bar.bat       -> bpdf.bar       buttons run bpdf.exe in a console
+    make_bar_gui.bat   -> bpdf_gui.bar   progress window, dialogs, palette
+  The _ru versions make the same bars with Russian labels.
   Drag the .bar file onto the Total Commander toolbar.
 
 Action palette
