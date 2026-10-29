@@ -22,6 +22,11 @@ const UPRIGHT_PLAUSIBILITY: f64 = 0.7;
 /// Characters in plausible words below which the other orientations are
 /// tried as well: a sideways page often yields a few short "words" only.
 const MIN_PLAUSIBLE: usize = 200;
+/// Share of plausible characters below which a page counts as hard and is
+/// read a second time lightened; clean pages score 0.8 and more.
+const HARD_PAGE: f64 = 0.75;
+/// Gamma of the lightened reading: mid-grey 128 becomes about 162.
+const LIGHTEN_GAMMA: f64 = 0.67;
 /// Lines whose centres are closer than this share of their height sit on
 /// one row (cells of a table, label and value of a form).
 const SAME_ROW: f64 = 0.35;
@@ -131,36 +136,66 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
             Ok::<_, anyhow::Error>(result)
         };
 
-        let upright = read(&enlarged, 0)?;
-        let (upright_score, total) = plausibility(&upright.text);
-        if upright_score >= MIN_PLAUSIBLE
-            && upright_score as f64 >= UPRIGHT_PLAUSIBILITY * total as f64
-        {
-            return Ok(upright);
-        }
-        // Orientations are compared on the unenlarged image, which is read
-        // several times faster and well enough to tell text from noise;
-        // only the winner is read again at full size.
-        let probe = resize_for_engine(&grey, 0, max_dim);
-        let mut best = None;
-        let mut best_score = upright_score;
-        for turns in [1, 3, 2] {
-            let (score, _) = plausibility(&read(&turn(&probe, turns), turns)?.text);
-            if score > best_score {
-                best = Some(turns);
-                best_score = score;
+        let result = 'orientation: {
+            let upright = read(&enlarged, 0)?;
+            let (upright_score, total) = plausibility(&upright.text);
+            if upright_score >= MIN_PLAUSIBLE
+                && upright_score as f64 >= UPRIGHT_PLAUSIBILITY * total as f64
+            {
+                break 'orientation upright;
             }
-        }
-        let Some(turns) = best else {
-            return Ok(upright);
+            // Orientations are compared on the unenlarged image, which is
+            // read several times faster and well enough to tell text from
+            // noise; only the winner is read again at full size.
+            let probe = resize_for_engine(&grey, 0, max_dim);
+            let mut best = None;
+            let mut best_score = upright_score;
+            for turns in [1, 3, 2] {
+                let (score, _) = plausibility(&read(&turn(&probe, turns), turns)?.text);
+                if score > best_score {
+                    best = Some(turns);
+                    best_score = score;
+                }
+            }
+            let Some(turns) = best else {
+                break 'orientation upright;
+            };
+            let turned = read(&turn(&enlarged, turns), turns)?;
+            if plausibility(&turned.text).0 > upright_score {
+                turned
+            } else {
+                upright
+            }
         };
-        let turned = read(&turn(&enlarged, turns), turns)?;
-        Ok(if plausibility(&turned.text).0 > upright_score {
-            turned
+
+        // A hard page (print over a grey pattern or tint) is read once more
+        // with lightened mid-greys, which fades the background more than
+        // the ink; the better reading is kept.
+        let (score, total) = plausibility(&result.text);
+        if score as f64 >= HARD_PAGE * total as f64 {
+            return Ok(result);
+        }
+        let turns = result.quarter_turns;
+        let lightened = read(&lighten(turn(&enlarged, turns)), turns)?;
+        Ok(if plausibility(&lightened.text).0 > score {
+            lightened
         } else {
-            upright
+            result
         })
     }
+}
+
+/// The image with its mid-greys lightened (black and white stay).
+#[cfg(windows)]
+fn lighten(mut image: GrayImage) -> GrayImage {
+    let mut table = [0u8; 256];
+    for (level, value) in table.iter_mut().enumerate() {
+        *value = (255.0 * (level as f64 / 255.0).powf(LIGHTEN_GAMMA)).round() as u8;
+    }
+    for level in image.iter_mut() {
+        *level = table[usize::from(*level)];
+    }
+    image
 }
 
 /// The image turned clockwise by `turns` quarter turns.
