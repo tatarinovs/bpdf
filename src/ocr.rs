@@ -540,7 +540,7 @@ impl OcrEngine {
     fn recognize_image_winocr(&self, original: &[u8], label: &str) -> Result<OcrPageResult> {
         let lang = self.options.lang.as_deref();
         let key_parts: [&[u8]; 4] = [
-            b"bpdf-ocr-winocr-v2\0",
+            b"bpdf-ocr-winocr-v3\0",
             lang.unwrap_or("default").as_bytes(),
             b"\0",
             original,

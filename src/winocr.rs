@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 const TARGET_LONG_EDGE: u32 = 3500;
 /// Enlargement limit; beyond it the glyphs only get blurrier.
 const MAX_UPSCALE: f64 = 3.0;
+/// Blur radius of the unsharp mask applied after enlarging, in pixels of
+/// the enlarged image.
+const UNSHARP_SIGMA: f32 = 1.5;
 /// Share of the recognised characters in plausible words above which the
 /// upright reading is kept without trying the other orientations.
 const UPRIGHT_PLAUSIBILITY: f64 = 0.6;
@@ -291,12 +294,19 @@ fn resize_for_engine(image: &GrayImage, target: u32, max_dim: u32) -> Cow<'_, Gr
     if (target_width, target_height) == (width, height) {
         return Cow::Borrowed(image);
     }
-    Cow::Owned(image::imageops::resize(
+    let resized = image::imageops::resize(
         image,
         target_width,
         target_height,
         image::imageops::FilterType::CatmullRom,
-    ))
+    );
+    // Enlarging softens the glyph edges; sharpening them back gains a few
+    // more correctly read words.
+    Cow::Owned(if factor > 1.0 {
+        image::imageops::unsharpen(&resized, UNSHARP_SIGMA, 2)
+    } else {
+        resized
+    })
 }
 
 /// Stretch the grey levels between the darkest and the lightest percent of
