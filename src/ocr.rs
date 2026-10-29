@@ -209,6 +209,15 @@ impl OcrEngine {
         })
     }
 
+    /// Images recognised at once: `jobs` limits the requests to Groq, while
+    /// Windows OCR runs locally on every core.
+    fn workers(&self) -> usize {
+        match self.options.backend {
+            OcrBackend::Windows => self.options.jobs.max(parallel::cpu_jobs()),
+            OcrBackend::Groq | OcrBackend::Auto => self.options.jobs,
+        }
+    }
+
     pub fn extract_spec(&self, spec: &InputSpec) -> Result<String> {
         self.extract_many_specs(std::slice::from_ref(spec))
             .pop()
@@ -219,7 +228,7 @@ impl OcrEngine {
     /// `jobs` workers, so a long PDF next to small files keeps them all busy;
     /// inputs are prepared in chunks to bound the memory held by images.
     pub fn extract_many_specs(&self, specs: &[InputSpec]) -> Vec<Result<String>> {
-        let chunk = (self.options.jobs * 4).max(8);
+        let chunk = (self.workers() * 4).max(8);
         specs
             .chunks(chunk)
             .flat_map(|chunk| self.extract_chunk(chunk))
@@ -233,7 +242,7 @@ impl OcrEngine {
             .filter_map(|job| job.as_ref().ok())
             .flat_map(|job| &job.images)
             .collect::<Vec<_>>();
-        let mut results = parallel::map(&tasks, self.options.jobs, |image| {
+        let mut results = parallel::map(&tasks, self.workers(), |image| {
             output::info(format!("OCR {}...", image.label));
             self.recognize_image(&image.bytes, &image.label)
         })
@@ -400,7 +409,7 @@ impl OcrEngine {
             bail!("no extractable images found in {}", source.display());
         }
         let source = file_label(source);
-        let overlays = parallel::map(&images, self.options.jobs, |(page_id, image)| {
+        let overlays = parallel::map(&images, self.workers(), |(page_id, image)| {
             self.image_overlay(*page_id, image, source)
         });
         let overlays = overlays.into_iter().flatten().collect::<Vec<_>>();
@@ -432,14 +441,31 @@ impl OcrEngine {
             f64::from(image.width.max(1)),
             f64::from(image.height.max(1)),
         );
+        // The area is the image as recognised, turned clockwise; it maps
+        // back onto the unit square of the upright image.
+        let (to_unit, area) = match result.quarter_turns % 4 {
+            1 => (
+                [0.0, 1.0 / height, -1.0 / width, 0.0, 1.0, 0.0],
+                (height, width),
+            ),
+            2 => (
+                [-1.0 / width, 0.0, 0.0, -1.0 / height, 1.0, 1.0],
+                (width, height),
+            ),
+            3 => (
+                [0.0, -1.0 / height, 1.0 / width, 0.0, 0.0, 1.0],
+                (height, width),
+            ),
+            _ => (
+                [1.0 / width, 0.0, 0.0, 1.0 / height, 0.0, 0.0],
+                (width, height),
+            ),
+        };
         Some(PageTextOverlay {
             page_id,
-            matrix: pdf_image::multiply(
-                [1.0 / width, 0.0, 0.0, 1.0 / height, 0.0, 0.0],
-                image.placement,
-            ),
-            width,
-            height,
+            matrix: pdf_image::multiply(to_unit, image.placement),
+            width: area.0,
+            height: area.1,
             words: result.words,
             fallback_text: (!result.text.trim().is_empty()).then_some(result.text),
         })
@@ -514,7 +540,7 @@ impl OcrEngine {
     fn recognize_image_winocr(&self, original: &[u8], label: &str) -> Result<OcrPageResult> {
         let lang = self.options.lang.as_deref();
         let key_parts: [&[u8]; 4] = [
-            b"bpdf-ocr-winocr-v1\0",
+            b"bpdf-ocr-winocr-v2\0",
             lang.unwrap_or("default").as_bytes(),
             b"\0",
             original,
@@ -1014,10 +1040,12 @@ mod tests {
                 line_y: 2.0,
                 line_height: 4.0,
             }],
+            quarter_turns: 1,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: OcrPageResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.words[0].line_height, 4.0);
+        assert_eq!(parsed.quarter_turns, 1);
         // Entries written before the image size was dropped still load.
         let old = r#"{"text":"x","words":[],"width":10,"height":20}"#;
         assert_eq!(
