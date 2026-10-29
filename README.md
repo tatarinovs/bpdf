@@ -86,8 +86,7 @@ cargo test --all-targets
 ```text
 bpdf.exe, bpdf-gui.exe          утилита и графическая оболочка
 config.example.toml             пример конфигурации
-QUICKSTART.txt, QUICKSTART.en.txt  краткая установка и команды
-README.md, README.en.md, LICENSE
+docs\                           README, краткая инструкция QUICKSTART.txt, LICENSE
 bar\                            генераторы панелей Total Commander
 shell\                          расширение Проводника, bpdf_shell.ini / bpdf_shell_en.ini,
                                 register.bat, unregister.bat

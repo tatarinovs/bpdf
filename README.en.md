@@ -86,8 +86,7 @@ The script will:
 ```text
 bpdf.exe, bpdf-gui.exe          the tool and its graphical shell
 config.example.toml             sample configuration
-QUICKSTART.txt, QUICKSTART.en.txt  short installation and command guide
-README.md, README.en.md, LICENSE
+docs\                           README, short guide QUICKSTART.en.txt, LICENSE
 bar\                            Total Commander button bar generators
 shell\                          Explorer extension, bpdf_shell.ini / bpdf_shell_en.ini,
                                 register.bat, unregister.bat

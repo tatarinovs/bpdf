@@ -63,11 +63,13 @@ if not exist "%CD%\dist" mkdir "%CD%\dist"
 if errorlevel 1 goto :error
 copy /y "%CD%\target\release\bpdf.exe" "%CD%\dist\bpdf.exe" >nul || goto :error
 copy /y "%CD%\config.example.toml" "%CD%\dist\config.example.toml" >nul || goto :error
-copy /y "%CD%\README.md" "%CD%\dist\README.md" >nul || goto :error
-copy /y "%CD%\README.en.md" "%CD%\dist\README.en.md" >nul || goto :error
-copy /y "%CD%\QUICKSTART.txt" "%CD%\dist\QUICKSTART.txt" >nul || goto :error
-copy /y "%CD%\QUICKSTART.en.txt" "%CD%\dist\QUICKSTART.en.txt" >nul || goto :error
-copy /y "%CD%\LICENSE" "%CD%\dist\LICENSE" >nul || goto :error
+rem Documentation and the license go to dist\docs\.
+if not exist "%CD%\dist\docs" mkdir "%CD%\dist\docs"
+if errorlevel 1 goto :error
+del /q "%CD%\dist\README*.md" "%CD%\dist\QUICKSTART*.txt" "%CD%\dist\LICENSE" >nul 2>&1
+for %%F in (README.md README.en.md QUICKSTART.txt QUICKSTART.en.txt LICENSE) do (
+  copy /y "%CD%\%%F" "%CD%\dist\docs\%%F" >nul || goto :error
+)
 rem Total Commander bar generators live in dist\bar\; the .bar files
 rem themselves are generated on the user's machine.
 if not exist "%CD%\dist\bar" mkdir "%CD%\dist\bar"
@@ -108,8 +110,9 @@ set "ZIP_FILE=%CD%\dist\bpdf-%VERSION%-win-x64.zip"
 powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
   "$ErrorActionPreference = 'Stop'; $d = '%CD%\dist';" ^
   "$stage = Join-Path $env:TEMP ('bpdf_pkg_' + [Guid]::NewGuid().ToString());" ^
-  "New-Item -ItemType Directory -Path (Join-Path $stage 'shell'), (Join-Path $stage 'bar') -Force | Out-Null;" ^
-  "@('bpdf.exe', 'bpdf-gui.exe', 'config.example.toml', 'QUICKSTART.txt', 'QUICKSTART.en.txt', 'README.md', 'README.en.md', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
+  "New-Item -ItemType Directory -Path (Join-Path $stage 'shell'), (Join-Path $stage 'bar'), (Join-Path $stage 'docs') -Force | Out-Null;" ^
+  "@('bpdf.exe', 'bpdf-gui.exe', 'config.example.toml') | ForEach-Object { Copy-Item (Join-Path $d $_) $stage };" ^
+  "@('README.md', 'README.en.md', 'QUICKSTART.txt', 'QUICKSTART.en.txt', 'LICENSE') | ForEach-Object { Copy-Item (Join-Path $d ('docs\' + $_)) (Join-Path $stage 'docs') };" ^
   "@('make_bar.bat', 'make_bar_en.bat', 'make_bar_gui.bat', 'make_bar_gui_en.bat') | ForEach-Object { Copy-Item (Join-Path $d ('bar\' + $_)) (Join-Path $stage 'bar') };" ^
   "@('bpdf_shell.dll', 'bpdf_shell.ini', 'bpdf_shell_en.ini', 'register.bat', 'unregister.bat') | ForEach-Object { Copy-Item (Join-Path $d ('shell\' + $_)) (Join-Path $stage 'shell') };" ^
   "Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem;" ^
