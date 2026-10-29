@@ -103,6 +103,12 @@ impl Config {
         }
     }
 
+    /// The OCR cache directory, when caching is on and a directory is known.
+    pub fn active_ocr_cache_dir(&self) -> Option<&Path> {
+        (self.ocr_cache && !self.ocr_cache_dir.as_os_str().is_empty())
+            .then_some(self.ocr_cache_dir.as_path())
+    }
+
     pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
         if let Some(path) = explicit_path {
             let text = fs::read_to_string(path)
@@ -132,12 +138,17 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Self> {
+        Self::parse_with(text, &|name| std::env::var(name).ok())
+    }
+
+    /// Parse with `variable` looking up the `%NAME%` references.
+    fn parse_with(text: &str, variable: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let mut config: Self =
             basic_toml::from_str(text).map_err(|error| anyhow::anyhow!("{error}"))?;
         // `%NAME%` is expanded in the parsed values, so a variable holding
         // backslashes or quotes cannot break the TOML syntax.
         for value in [&mut config.groq_api_key, &mut config.proxy] {
-            *value = expand_env_string(value);
+            *value = expand_variables(value, variable);
         }
         for path in [
             Some(&mut config.ffmpeg),
@@ -149,7 +160,7 @@ impl Config {
         .into_iter()
         .flatten()
         {
-            *path = PathBuf::from(expand_env_string(&path.to_string_lossy()));
+            *path = PathBuf::from(expand_variables(&path.to_string_lossy(), variable));
         }
 
         if !(1..=100).contains(&config.jpeg_quality) {
@@ -176,14 +187,22 @@ impl Config {
     }
 }
 
+/// The user's own cache directory. Recognised text is private, so a shared
+/// location such as `/tmp` is never used; without one the cache is off
+/// until `ocr_cache_dir` is set.
 fn default_cache_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(path).join("bpdf").join("ocr-cache");
-    }
-    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("bpdf").join("ocr-cache");
-    }
-    std::env::temp_dir().join("bpdf-ocr-cache")
+    let env = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let base = if cfg!(windows) {
+        env("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|home| PathBuf::from(home).join("Library").join("Caches"))
+    } else {
+        env("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    };
+    base.map(|base| base.join("bpdf").join("ocr-cache"))
+        .unwrap_or_default()
 }
 
 /// Only the file beside the executable: the working directory belongs to the
@@ -197,31 +216,34 @@ fn config_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
-fn expand_env_string(text: &str) -> String {
-    let mut result = text.to_owned();
-    let mut i = 0;
-    while let Some(start) = result[i..].find('%') {
-        let absolute_start = i + start;
-        if let Some(end) = result[absolute_start + 1..].find('%') {
-            let absolute_end = absolute_start + 1 + end;
-            let var_name = &result[absolute_start + 1..absolute_end];
-
-            // Reject variable names with whitespace (avoids treating '% 10 % 20' as an env var)
-            if var_name.contains(|c: char| c.is_whitespace()) || var_name.is_empty() {
-                i = absolute_start + 1;
-                continue;
-            }
-
-            if let Ok(val) = std::env::var(var_name) {
-                result.replace_range(absolute_start..=absolute_end, &val);
-                i = absolute_start + val.len();
-            } else {
-                i = absolute_end + 1;
-            }
-        } else {
+/// Replace every `%NAME%` that `variable` knows; names with whitespace (as
+/// in `% 10 % 20`) and unknown names stay as written.
+fn expand_variables(text: &str, variable: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
             break;
+        };
+        let name = &after[..end];
+        let value = (!name.is_empty() && !name.contains(char::is_whitespace))
+            .then(|| variable(name))
+            .flatten();
+        result.push_str(&rest[..start]);
+        match value {
+            Some(value) => {
+                result.push_str(&value);
+                rest = &after[end + 1..];
+            }
+            // The closing `%` may open the next reference.
+            None => {
+                result.push('%');
+                rest = after;
+            }
         }
     }
+    result.push_str(rest);
     result
 }
 
@@ -312,48 +334,50 @@ mod tests {
         assert!(config.ocr_endpoint.starts_with("https://"));
     }
 
-    #[test]
-    fn expand_env_string_replaces_known_variable() {
-        unsafe { std::env::set_var("BPDF_TEST_VAR", "hello") };
-        let result = expand_env_string("%BPDF_TEST_VAR% world");
-        assert_eq!(result, "hello world");
-        unsafe { std::env::remove_var("BPDF_TEST_VAR") };
+    fn variables(name: &str) -> Option<String> {
+        match name {
+            "BPDF_TEST_VAR" => Some("hello".to_owned()),
+            "BPDF_PATH_VAR" => Some(r"C:\Tools\bin".to_owned()),
+            "BPDF_KEY_VAR" => Some("secret_key_123".to_owned()),
+            _ => None,
+        }
     }
 
     #[test]
-    fn expand_env_string_ignores_unknown_variable() {
-        let result = expand_env_string("%BPDF_DEFINITELY_NOT_SET% world");
-        assert_eq!(result, "%BPDF_DEFINITELY_NOT_SET% world");
-    }
-
-    #[test]
-    fn expand_env_string_rejects_whitespace_names() {
-        let result = expand_env_string("% not a var % rest");
-        assert_eq!(result, "% not a var % rest");
+    fn expands_known_variables_only() {
+        assert_eq!(
+            expand_variables("%BPDF_TEST_VAR% world", &variables),
+            "hello world"
+        );
+        assert_eq!(
+            expand_variables("%BPDF_UNKNOWN% world", &variables),
+            "%BPDF_UNKNOWN% world"
+        );
+        assert_eq!(
+            expand_variables("% not a var % rest", &variables),
+            "% not a var % rest"
+        );
+        assert_eq!(
+            expand_variables("100%%BPDF_TEST_VAR%", &variables),
+            "100%hello"
+        );
     }
 
     #[test]
     fn expand_env_in_config_fields() {
-        unsafe {
-            std::env::set_var("BPDF_PATH_VAR", r"C:\Tools\bin");
-            std::env::set_var("BPDF_KEY_VAR", "secret_key_123");
-        }
-        let config = Config::parse(
+        let config = Config::parse_with(
             r#"
                 groq_api_key = "%BPDF_KEY_VAR%"
                 ffmpeg = '%BPDF_PATH_VAR%\ffmpeg.exe'
                 ocr_cache_dir = "%BPDF_PATH_VAR%/cache"
             "#,
+            &variables,
         )
         .unwrap();
         assert_eq!(config.groq_api_key, "secret_key_123");
         assert_eq!(config.ffmpeg, PathBuf::from(r"C:\Tools\bin\ffmpeg.exe"));
         // Backslashes of the value inside a "..." string are no TOML escapes.
         assert_eq!(config.ocr_cache_dir, PathBuf::from(r"C:\Tools\bin/cache"));
-        unsafe {
-            std::env::remove_var("BPDF_PATH_VAR");
-            std::env::remove_var("BPDF_KEY_VAR");
-        }
     }
 
     #[test]

@@ -30,25 +30,23 @@ impl Default for TextOptions {
     }
 }
 
-/// Recognised words of one existing PDF page, in points of the displayed
-/// page measured from its top-left corner.
+/// Recognised text of one area of an existing PDF page (an image), with
+/// word boxes measured from the area's top-left corner.
 #[derive(Clone, Debug)]
 pub struct PageTextOverlay {
     pub page_id: ObjectId,
-    /// `cm` matrix from the displayed page (origin bottom-left) to the page's
-    /// user space; it accounts for `/Rotate` and the box origin.
+    /// `cm` matrix from the area (`width` x `height`, origin bottom-left) to
+    /// the page's user space.
     pub matrix: [f64; 6],
-    pub page_width: f64,
-    pub page_height: f64,
-    pub scaled_words: Vec<OcrWordBox>,
+    pub width: f64,
+    pub height: f64,
+    pub words: Vec<OcrWordBox>,
+    /// Text without word boxes, laid out over the area.
     pub fallback_text: Option<String>,
 }
 
 /// Resource name (or its prefix) of the font of bpdf's OCR text layer.
 pub const OCR_FONT_NAME: &str = "BpdfF0";
-
-/// The identity `cm` matrix.
-pub const IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// A loaded TrueType font that records which glyphs a document uses, so only
 /// those are embedded.
@@ -435,14 +433,29 @@ pub fn overlay_searchable_text(
     let ascender = f64::from(font.face.ascender());
     let ascent_ratio = ascender / (ascender - f64::from(font.face.descender()));
 
-    // Glyph usage must be complete before the font is embedded.
-    let mut page_contents = Vec::with_capacity(overlays.len());
+    // Glyph usage must be complete before the font is embedded. The areas of
+    // one page share one content stream.
+    let mut page_contents: Vec<(ObjectId, String)> = Vec::new();
     for overlay in overlays {
+        let index = match page_contents
+            .iter()
+            .position(|(id, _)| *id == overlay.page_id)
+        {
+            Some(index) => index,
+            None => {
+                page_contents.push((overlay.page_id, String::new()));
+                page_contents.len() - 1
+            }
+        };
+        let content = &mut page_contents[index].1;
         let [a, b, c, d, e, f] = overlay.matrix;
-        let mut content = format!("\nq\n{a:.6} {b:.6} {c:.6} {d:.6} {e:.3} {f:.3} cm\nBT\n3 Tr\n");
-        if !overlay.scaled_words.is_empty() {
+        let _ = write!(
+            content,
+            "\nq\n{a:.8} {b:.8} {c:.8} {d:.8} {e:.3} {f:.3} cm\nBT\n3 Tr\n"
+        );
+        if !overlay.words.is_empty() {
             let mut line_y = None;
-            for word in &overlay.scaled_words {
+            for word in &overlay.words {
                 if word.text.trim().is_empty() {
                     continue;
                 }
@@ -456,7 +469,7 @@ pub fn overlay_searchable_text(
                 // A uniform size per line keeps the selection highlight steady;
                 // the baseline sits one ascent below the line top.
                 let font_size = word.line_height.max(word.height).max(4.0);
-                let baseline = overlay.page_height - word.line_y - font_size * ascent_ratio;
+                let baseline = overlay.height - word.line_y - font_size * ascent_ratio;
                 let natural_width = font.text_width(&text, font_size);
                 let horizontal_scale = if natural_width > 0.0 {
                     word.width / natural_width * 100.0
@@ -471,22 +484,26 @@ pub fn overlay_searchable_text(
                 );
             }
         } else if let Some(fallback) = &overlay.fallback_text {
-            let font_size = 10.0;
+            // Sized to the area, whatever its units: about 12 pt on A4.
+            let font_size = overlay.height / 70.0;
+            let margin = font_size * 2.0;
             let _ = write!(content, "100 Tz\n/{font_name} {font_size:.3} Tf\n");
-            let mut y = overlay.page_height - 20.0 - font_size;
-            for line in font.wrap(fallback, font_size, overlay.page_width - 40.0) {
+            let mut y = overlay.height - margin - font_size;
+            for line in font.wrap(fallback, font_size, overlay.width - 2.0 * margin) {
                 if !line.trim().is_empty() {
                     let hex = font.encode(&format!("{line} "));
-                    let _ = write!(content, "1 0 0 1 20.000 {y:.3} Tm\n<{hex}> Tj\nET\nBT\n");
+                    let _ = write!(
+                        content,
+                        "1 0 0 1 {margin:.3} {y:.3} Tm\n<{hex}> Tj\nET\nBT\n"
+                    );
                 }
                 y -= font_size * 1.25;
-                if y < 20.0 {
+                if y < margin {
                     break;
                 }
             }
         }
         content.push_str("100 Tz\nET\nQ\n");
-        page_contents.push((overlay.page_id, content));
     }
 
     let font_id = font.embed(document)?;
@@ -535,8 +552,11 @@ pub fn add_text_marks(
     if !(0.0..=1.0).contains(&style.opacity) {
         bail!("opacity must be between 0 and 1");
     }
-    if style.font_size < 0.0 {
-        bail!("font size cannot be negative");
+    if !style.font_size.is_finite() || style.font_size < 0.0 {
+        bail!("font size must be a number of at least 0");
+    }
+    if !style.angle.is_finite() {
+        bail!("angle must be a number");
     }
     let pages = transform::selected_pages(document, &style.pages)?;
     let page_ids = pages.iter().map(|(_, id, _)| *id).collect::<Vec<_>>();
@@ -657,10 +677,10 @@ mod tests {
         let page_id = *document.get_pages().get(&1).unwrap();
         let overlay = PageTextOverlay {
             page_id,
-            matrix: IDENTITY,
-            page_width: 842.0,
-            page_height: 595.0,
-            scaled_words: ["ТестовоеСлово", "второе", "Следующая"]
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            width: 842.0,
+            height: 595.0,
+            words: ["ТестовоеСлово", "второе", "Следующая"]
                 .into_iter()
                 .enumerate()
                 .map(|(index, text)| OcrWordBox {

@@ -20,10 +20,6 @@ pub struct OcrPageResult {
     pub text: String,
     #[serde(default)]
     pub words: Vec<OcrWordBox>,
-    #[serde(default, rename = "width")]
-    pub image_width: u32,
-    #[serde(default, rename = "height")]
-    pub image_height: u32,
 }
 
 impl OcrPageResult {
@@ -32,8 +28,6 @@ impl OcrPageResult {
         Self {
             text,
             words: Vec::new(),
-            image_width: 0,
-            image_height: 0,
         }
     }
 }
@@ -96,8 +90,10 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
         };
 
         let max_dim = OcrEngine::MaxImageDimension()?;
-
-        let decode_result = (|| -> Result<(SoftwareBitmap, u32, u32, f64)> {
+        // The system decoder first; an image larger than the engine reads, or
+        // in a format the system cannot decode, is scaled down from our own
+        // decoding. `scale` maps engine pixels back to image pixels.
+        let system = (|| -> Result<SoftwareBitmap> {
             let stream = InMemoryRandomAccessStream::new()
                 .context("failed to create InMemoryRandomAccessStream")?;
             let writer =
@@ -110,60 +106,43 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
             let decoder = BitmapDecoder::CreateAsync(&stream)?
                 .join()
                 .context("failed to create BitmapDecoder for image")?;
-            let pixel_width = decoder.PixelWidth()?;
-            let pixel_height = decoder.PixelHeight()?;
-
-            if pixel_width > max_dim || pixel_height > max_dim {
-                bail!("image too large for Windows OCR, fallback to scaling");
+            if decoder.PixelWidth()? > max_dim || decoder.PixelHeight()? > max_dim {
+                bail!("image too large for Windows OCR");
             }
-
-            let bitmap = decoder
+            decoder
                 .GetSoftwareBitmapAsync()?
                 .join()
-                .context("failed to get SoftwareBitmap")?;
-            Ok((bitmap, pixel_width, pixel_height, 1.0))
+                .context("failed to get SoftwareBitmap")
         })();
 
-        let (bitmap, pixel_width, pixel_height, scale_factor) = match decode_result {
-            Ok(tuple) => tuple,
+        let (bitmap, scale) = match system {
+            Ok(bitmap) => (bitmap, 1.0),
             Err(_) => {
-                let mut dynamic_image = image::load_from_memory(bytes)
+                let mut image = image::load_from_memory(bytes)
                     .context("failed to decode image bytes via fallback image decoder")?;
-                let mut width = dynamic_image.width();
-                let mut height = dynamic_image.height();
-
-                let scale_factor = if width > max_dim || height > max_dim {
-                    let sf = (max_dim as f64) / (width.max(height) as f64);
-                    let new_w = (width as f64 * sf).round() as u32;
-                    let new_h = (height as f64 * sf).round() as u32;
-                    dynamic_image = dynamic_image.resize_exact(
-                        new_w,
-                        new_h,
-                        image::imageops::FilterType::Lanczos3,
-                    );
-                    width = new_w;
-                    height = new_h;
-                    sf
-                } else {
-                    1.0
-                };
-
-                let rgba = dynamic_image.to_rgba8();
-
+                let original_width = image.width();
+                if image.width() > max_dim || image.height() > max_dim {
+                    image = image.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3);
+                }
+                let (width, height) = (image.width(), image.height());
+                // The engine reads BGRA.
+                let mut pixels = image.into_rgba8().into_raw();
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
                 let writer = DataWriter::new().context("failed to create DataWriter")?;
                 writer
-                    .WriteBytes(rgba.as_raw())
+                    .WriteBytes(&pixels)
                     .context("failed to write pixel bytes")?;
                 let buffer = writer.DetachBuffer().context("failed to detach buffer")?;
-
                 let bitmap = SoftwareBitmap::CreateCopyFromBuffer(
                     &buffer,
-                    BitmapPixelFormat::Rgba8,
+                    BitmapPixelFormat::Bgra8,
                     width as i32,
                     height as i32,
                 )
-                .context("failed to create SoftwareBitmap from RGBA buffer")?;
-                (bitmap, width, height, scale_factor)
+                .context("failed to create SoftwareBitmap from BGRA buffer")?;
+                (bitmap, f64::from(original_width) / f64::from(width))
             }
         };
 
@@ -175,12 +154,6 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
         let full_text = result.Text()?.to_string();
         let mut words = Vec::new();
 
-        let inv_scale = if scale_factor < 1.0 {
-            1.0 / scale_factor
-        } else {
-            1.0
-        };
-
         for line in result.Lines()? {
             let mut words_in_line = Vec::new();
             let mut min_y = f64::MAX;
@@ -189,8 +162,8 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
             for word in line.Words()? {
                 let text = word.Text()?.to_string();
                 let rect = word.BoundingRect()?;
-                let y = (rect.Y as f64) * inv_scale;
-                let height = (rect.Height as f64) * inv_scale;
+                let y = (rect.Y as f64) * scale;
+                let height = (rect.Height as f64) * scale;
                 if y < min_y {
                     min_y = y;
                 }
@@ -200,9 +173,9 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
 
                 words_in_line.push((
                     text,
-                    (rect.X as f64) * inv_scale,
+                    (rect.X as f64) * scale,
                     y,
-                    (rect.Width as f64) * inv_scale,
+                    (rect.Width as f64) * scale,
                     height,
                 ));
             }
@@ -226,8 +199,6 @@ pub fn recognize_image_bytes(bytes: &[u8], lang_tag: Option<&str>) -> Result<Ocr
         Ok(OcrPageResult {
             text: full_text,
             words,
-            image_width: pixel_width,
-            image_height: pixel_height,
         })
     }
 }

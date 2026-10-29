@@ -9,15 +9,12 @@ if not exist "%DLL%" (
   exit /b 1
 )
 
-rem Find bpdf.exe (beside DLL or in parent folder)
+rem The extension finds bpdf.exe itself: beside the DLL, in its parent
+rem folder or in PATH. It is looked up here only to show the layout.
 set "EXE="
 if exist "%~dp0bpdf.exe" set "EXE=%~dp0bpdf.exe"
 if not defined EXE if exist "%~dp0..\bpdf.exe" (
   for %%F in ("%~dp0..\bpdf.exe") do set "EXE=%%~fF"
-)
-
-if defined EXE (
-  reg add "HKCU\Software\bpdf" /v "ExePath" /t REG_SZ /d "%EXE%" /f >nul 2>&1
 )
 
 echo Registering bpdf context menu shell extension...

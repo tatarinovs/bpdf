@@ -58,7 +58,12 @@ pub fn run(arguments: Vec<OsString>) -> Result<()> {
             print!("{error}");
             return Ok(());
         }
-        Err(error) => return Err(anyhow!(error.to_string())),
+        // Our own report adds the "Error:" prefix.
+        Err(error) => {
+            let message = error.to_string();
+            let message = message.strip_prefix("error: ").unwrap_or(&message);
+            return Err(anyhow!("{}", message.trim_end()));
+        }
     };
     output::init(cli.quiet, cli.json);
     // Report-only commands keep their window open when launched from a file manager.

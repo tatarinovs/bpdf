@@ -37,13 +37,8 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
             if args.remove_blank {
                 remove_blank_pages(&mut document, &args.input.display().to_string())?;
             }
-            optimize_document(
-                &mut document,
-                config.image_dpi,
-                config.jpeg_quality,
-                args.gray,
-            );
-            let bytes = pdf_bytes(document, &config, args.max_size, args.gray)?;
+            let optimize = optimize_options(&config, args.gray);
+            let bytes = pdf_bytes(document, &config, Some(optimize), args.max_size)?;
             common::write_output(&destination, &bytes)
         }
         Command::Stamp(args) => pdf_edit::stamp(args, &config),
@@ -57,17 +52,22 @@ pub fn run(command: Command, config: Config, fail_fast: bool) -> Result<()> {
     }
 }
 
-/// Downsample images to `image_dpi` (and turn them gray) and tidy the PDF.
-fn optimize_document(document: &mut lopdf::Document, image_dpi: u32, jpeg_quality: u8, gray: bool) {
-    let report = transform::optimize(
-        document,
-        OptimizeOptions {
-            image_dpi,
-            jpeg_quality,
-            recompress_all: false,
-            gray,
-        },
-    );
+/// Downsampling to `image_dpi` at `jpeg_quality`, optionally to gray.
+fn optimize_options(config: &Config, gray: bool) -> OptimizeOptions {
+    OptimizeOptions {
+        image_dpi: config.image_dpi,
+        jpeg_quality: config.jpeg_quality,
+        recompress_all: false,
+        gray,
+    }
+}
+
+/// Downsample images (and turn them gray) as `options` say and tidy the PDF.
+fn optimize_document(document: &mut lopdf::Document, options: OptimizeOptions) {
+    let OptimizeOptions {
+        image_dpi, gray, ..
+    } = options;
+    let report = transform::optimize(document, options);
     for warning in report.warnings {
         output::warn(format!("Image optimization warning: {warning}"));
     }
@@ -102,28 +102,34 @@ fn remove_blank_pages(document: &mut lopdf::Document, label: &str) -> Result<()>
     Ok(())
 }
 
-/// Serialise a document, lowering image resolution and JPEG quality until it
-/// fits `max_size`. Without a limit the document is saved as is.
+/// Serialise a document, optimised with `optimize` when given. With
+/// `max_size`, image resolution and JPEG quality are then lowered until the
+/// PDF fits; every attempt starts from the original images, so none is
+/// encoded twice.
 ///
 /// Steps get smaller monotonically, so the best fitting step is searched:
 /// the gentlest one first (often enough), then the strongest (is it possible
 /// at all?), then bisection in between. Each attempt re-encodes every image,
 /// so this needs about four attempts instead of up to nine.
 fn pdf_bytes(
-    document: lopdf::Document,
+    mut document: lopdf::Document,
     config: &Config,
+    optimize: Option<OptimizeOptions>,
     max_size: Option<u64>,
-    gray: bool,
 ) -> Result<Vec<u8>> {
-    let mut document = document;
-    let Some(limit) = max_size else {
-        return pdf::save_to_bytes(&mut document);
+    let original = max_size.map(|_| document.clone());
+    if let Some(options) = optimize {
+        optimize_document(&mut document, options);
+    }
+    let bytes = pdf::save_to_bytes(&mut document)?;
+    let (Some(limit), Some(document)) = (max_size, original) else {
+        return Ok(bytes);
     };
     let fits = |bytes: &[u8]| bytes.len() as u64 <= limit;
-    let original = pdf::save_to_bytes(&mut document.clone())?;
-    if fits(&original) {
-        return Ok(original);
+    if fits(&bytes) {
+        return Ok(bytes);
     }
+    let gray = optimize.is_some_and(|options| options.gray);
 
     let base_dpi = if config.image_dpi == 0 {
         300
@@ -176,7 +182,11 @@ fn pdf_bytes(
         return Ok(first);
     }
     let last_index = steps.len() - 1;
-    let mut best = attempt(last_index)?;
+    let mut best = if last_index == 0 {
+        first.clone()
+    } else {
+        attempt(last_index)?
+    };
     if !fits(&best) {
         bail!(
             "cannot reduce the PDF to {}; the smallest result was {} (text, fonts and vector content are not reduced)",
@@ -232,10 +242,11 @@ mod tests {
     #[test]
     fn size_fitting_finds_a_step_within_the_limit() {
         let config = Config::default();
-        let full = pdf_bytes(noisy_page(), &config, None, false).unwrap().len() as u64;
+        let full = pdf_bytes(noisy_page(), &config, None, None).unwrap().len() as u64;
         let limit = full * 2 / 5;
-        let fitted = pdf_bytes(noisy_page(), &config, Some(limit), false).unwrap();
+        let optimize = Some(optimize_options(&config, false));
+        let fitted = pdf_bytes(noisy_page(), &config, optimize, Some(limit)).unwrap();
         assert!(fitted.len() as u64 <= limit, "{} > {limit}", fitted.len());
-        assert!(pdf_bytes(noisy_page(), &config, Some(1000), false).is_err());
+        assert!(pdf_bytes(noisy_page(), &config, None, Some(1000)).is_err());
     }
 }

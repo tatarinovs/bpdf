@@ -195,7 +195,7 @@ static inline FileKind ClassifyPath(const wchar_t* path)
         const wchar_t* ext = dot + 1;
         if (StrCmpIW(ext, L"pdf") == 0) return KIND_PDF;
         if (MatchExt(ext, L".jpg.jpeg.png.webp.bmp.gif.tif.tiff.avif.heic.heif.cr2.nef.arw.dng.raf.")) return KIND_IMAGE;
-        if (MatchExt(ext, L".docx.xlsx.pptx.rtf.odt.ods.odp.doc.xls.ppt.html.htm.xhtml.svg.epub.fb2.htmlz.djvu.xps.oxps.cbz.txt.md.")) return KIND_OTHER_SUPPORTED;
+        if (MatchExt(ext, L".docx.xlsx.pptx.ppsx.rtf.odt.ods.odp.doc.xls.ppt.pps.html.htm.xhtml.svg.epub.fb2.htmlz.cbz.txt.md.")) return KIND_OTHER_SUPPORTED;
     }
 
     DWORD attrs = GetFileAttributesW(path);

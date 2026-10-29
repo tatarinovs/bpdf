@@ -7,21 +7,21 @@ use anyhow::{Context, Result, bail};
 use image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
+use super::transform::PageGeometry;
 use super::{MAX_DECOMPRESSED_BYTES, resolve};
-use crate::{imageconv, output, parallel};
+use crate::imageconv::{self, MAX_IMAGE_PIXELS};
+use crate::{output, parallel};
 
-/// Largest raw image decoded from a PDF (an A3 page at 1200 DPI fits).
-const MAX_IMAGE_PIXELS: u64 = 300_000_000;
-
-/// A page image re-encoded (or copied) as JPEG, oriented like the page.
+/// A page image re-encoded (or copied) as JPEG, upright as it is shown on
+/// the displayed page.
 #[derive(Debug)]
 pub struct ExtractedImage {
-    /// The image XObject; `None` for images that are not part of a PDF.
-    pub id: Option<ObjectId>,
     pub label: String,
     pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// `cm` matrix of the upright image's unit square in page user space.
+    pub placement: Matrix,
 }
 
 /// Page images to extract: every image on a page, or only its largest one.
@@ -70,9 +70,23 @@ pub(crate) fn page_images(
     // Largest first; for `Largest`, fall back to smaller ones only when the
     // largest cannot be decoded.
     images.sort_by_key(|image| std::cmp::Reverse(area(image)));
-    let rotation = super::transform::page_geometry(document, page_id)
-        .map(|geometry| geometry.rotation)
-        .unwrap_or(0);
+    let crop = match super::transform::page_crop_geometry(document, page_id) {
+        Ok(crop) => crop,
+        Err(error) => {
+            output::warn(format!("page {page_number}: {error:#}"));
+            return Vec::new();
+        }
+    };
+    let drawings = largest_drawings(document, page_id).unwrap_or_default();
+    // An image the content does not draw itself (pattern, annotation) is
+    // taken to cover the page as it is shown.
+    let whole_page = super::transform::upright_stamp_matrix(
+        crop,
+        0.0,
+        0.0,
+        crop.display_width(),
+        crop.display_height(),
+    );
 
     let mut output = Vec::new();
     for (index, image) in images.iter().enumerate() {
@@ -88,7 +102,8 @@ pub(crate) fn page_images(
             Selection::Largest => format!("page_{page_number}"),
             Selection::AllFrom(_) => format!("page_{page_number}_image_{}", index + 1),
         };
-        match extract_one(document, image.id, stream, rotation, jpeg_quality, label) {
+        let matrix = drawings.get(&image.id).copied().unwrap_or(whole_page);
+        match extract_one(document, stream, matrix, crop, jpeg_quality, label) {
             Ok(extracted) => output.push(extracted),
             Err(_) => continue,
         }
@@ -99,16 +114,21 @@ pub(crate) fn page_images(
     output
 }
 
+/// Decode an image as the page shows it: the stored samples (a PDF viewer
+/// ignores EXIF orientation), turned by quarter turns to stand upright
+/// under the matrix it is drawn with and the page rotation.
 fn extract_one(
     document: &Document,
-    id: ObjectId,
     stream: &Stream,
-    rotation: i64,
+    matrix: Matrix,
+    crop: PageGeometry,
     jpeg_quality: u8,
     label: String,
 ) -> Result<ExtractedImage> {
+    let turns = upright_turns(matrix, crop);
+    let placement = multiply(TURNS[turns], matrix);
     // An upright RGB/grayscale JPEG is copied without recompression.
-    if rotation == 0
+    if turns == 0
         && !stream.dict.has(b"Decode")
         && let Some(jpeg) = embedded_jpeg(stream)
         && crate::metadata::jpeg_orientation(jpeg) == 1
@@ -116,32 +136,52 @@ fn extract_one(
         && matches!(info.components, 1 | 3)
     {
         return Ok(ExtractedImage {
-            id: Some(id),
             label,
             bytes: jpeg.to_vec(),
             width: u32::from(info.width),
             height: u32::from(info.height),
+            placement,
         });
     }
-    // Extracted images are shown upright: EXIF orientation first, then the
-    // page rotation.
-    let mut image = match embedded_jpeg(stream) {
-        Some(jpeg) => imageconv::decode_bytes(jpeg)?,
-        None => decode(document, stream)?,
-    };
-    image = match rotation {
-        90 => image.rotate90(),
-        180 => image.rotate180(),
-        270 => image.rotate270(),
+    let image = decode(document, stream)?;
+    let image = match turns {
+        1 => image.rotate90(),
+        2 => image.rotate180(),
+        3 => image.rotate270(),
         _ => image,
     };
     Ok(ExtractedImage {
-        id: Some(id),
         label,
         bytes: imageconv::encode_jpeg_on_white(&image, jpeg_quality)?,
         width: image.width(),
         height: image.height(),
+        placement,
     })
+}
+
+/// For each count of clockwise quarter turns of the stored samples, the map
+/// from the turned image's unit square to the stored image's unit square.
+const TURNS: [Matrix; 4] = [
+    [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    [0.0, 1.0, -1.0, 0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0, -1.0, 1.0, 1.0],
+    [0.0, -1.0, 1.0, 0.0, 0.0, 1.0],
+];
+
+/// Clockwise quarter turns (0-3) of the stored samples that make an image
+/// drawn with `matrix` stand upright on the displayed page.
+fn upright_turns(matrix: Matrix, crop: PageGeometry) -> usize {
+    let [a, b, c, d, e, f] = matrix;
+    let (_, origin) = crop.page_to_display(e, f);
+    // How far the image's x and y axes rise on the displayed page.
+    let rise = |x: f64, y: f64| crop.page_to_display(e + x, f + y).1 - origin;
+    let (right, up) = (rise(a, b), rise(c, d));
+    // Rise of the turned image's y axis for each turn (see `TURNS`).
+    [up, -right, -up, right]
+        .into_iter()
+        .enumerate()
+        .max_by(|left, other| left.1.total_cmp(&other.1))
+        .map_or(0, |(turns, _)| turns)
 }
 
 /// Largest size in points at which each image XObject is drawn on a page,
@@ -160,12 +200,8 @@ pub(crate) fn placements(
     Ok(found)
 }
 
-/// Bounding box `[left, bottom, right, top]` in user space of the largest
-/// drawing of each image XObject on a page.
-pub(crate) fn placement_boxes(
-    document: &Document,
-    page_id: ObjectId,
-) -> Result<HashMap<ObjectId, [f64; 4]>> {
+/// The matrix of the largest drawing of each image XObject on a page.
+fn largest_drawings(document: &Document, page_id: ObjectId) -> Result<HashMap<ObjectId, Matrix>> {
     let mut largest = HashMap::<ObjectId, (f64, Matrix)>::new();
     for (id, matrix) in drawn_images(document, page_id)? {
         let (width, height) = drawn_size(matrix);
@@ -176,14 +212,7 @@ pub(crate) fn placement_boxes(
     }
     Ok(largest
         .into_iter()
-        .map(|(id, (_, [a, b, c, d, e, f]))| {
-            // Corners of the unit square the image is drawn into.
-            let xs = [e, a + e, c + e, a + c + e];
-            let ys = [f, b + f, d + f, b + d + f];
-            let min = |values: [f64; 4]| values.into_iter().fold(f64::INFINITY, f64::min);
-            let max = |values: [f64; 4]| values.into_iter().fold(f64::NEG_INFINITY, f64::max);
-            (id, [min(xs), min(ys), max(xs), max(ys)])
-        })
+        .map(|(id, (_, matrix))| (id, matrix))
         .collect())
 }
 
@@ -198,7 +227,11 @@ fn drawn_images(document: &Document, page_id: ObjectId) -> Result<Vec<(ObjectId,
         return Ok(found);
     }
     let content = document.get_page_content_with_limit(page_id, MAX_DECOMPRESSED_BYTES)?;
-    walk_placements(document, &content, resources, IDENTITY, 0, &mut found)?;
+    let mut walk = Walk {
+        forms_left: MAX_FORM_VISITS,
+        found: &mut found,
+    };
+    walk.content(document, &content, resources, IDENTITY, 0)?;
     Ok(found)
 }
 
@@ -206,12 +239,13 @@ fn drawn_size(matrix: Matrix) -> (f64, f64) {
     (matrix[0].hypot(matrix[1]), matrix[2].hypot(matrix[3]))
 }
 
-type Matrix = [f64; 6];
+/// A PDF transformation matrix `[a b c d e f]`.
+pub(crate) type Matrix = [f64; 6];
 
 const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// `first` applied, then `then`.
-fn multiply(first: Matrix, then: Matrix) -> Matrix {
+pub(crate) fn multiply(first: Matrix, then: Matrix) -> Matrix {
     [
         first[0] * then[0] + first[1] * then[2],
         first[0] * then[1] + first[1] * then[3],
@@ -245,73 +279,99 @@ fn has_xobjects(document: &Document, resources: &Dictionary) -> bool {
     sub_dictionary(document, resources, b"XObject").is_some_and(|xobjects| !xobjects.is_empty())
 }
 
-fn walk_placements(
-    document: &Document,
-    content: &[u8],
-    resources: &Dictionary,
-    base: Matrix,
-    depth: u8,
-    found: &mut Vec<(ObjectId, Matrix)>,
-) -> Result<()> {
-    if depth > 8 {
-        bail!("form XObjects are nested too deeply");
-    }
-    let xobjects = sub_dictionary(document, resources, b"XObject");
-    let mut current = base;
-    let mut saved = Vec::new();
-    for operation in lopdf::content::Content::decode(content)?.operations {
-        match operation.operator.as_str() {
-            "q" => saved.push(current),
-            "Q" => current = saved.pop().unwrap_or(base),
-            "cm" => {
-                if let Some(applied) = matrix(&operation.operands) {
-                    current = multiply(applied, current);
-                }
-            }
-            "Do" => {
-                let Some(id) = operation
-                    .operands
-                    .first()
-                    .and_then(|name| name.as_name().ok())
-                    .and_then(|name| xobjects?.get(name).ok()?.as_reference().ok())
-                else {
-                    continue;
-                };
-                let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
-                    continue;
-                };
-                match stream.dict.get(b"Subtype").and_then(Object::as_name) {
-                    Ok(b"Image") => found.push((id, current)),
-                    Ok(b"Form") => {
-                        let form_matrix = stream
-                            .dict
-                            .get(b"Matrix")
-                            .and_then(Object::as_array)
-                            .ok()
-                            .and_then(|values| matrix(values))
-                            .unwrap_or(IDENTITY);
-                        let form_resources = sub_dictionary(document, &stream.dict, b"Resources")
-                            .unwrap_or(resources);
-                        if has_xobjects(document, form_resources) {
-                            let form_content =
-                                stream.decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)?;
-                            walk_placements(
-                                document,
-                                &form_content,
-                                form_resources,
-                                multiply(form_matrix, current),
-                                depth + 1,
-                                found,
-                            )?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
+/// Form XObjects drawn while walking one page: a small form drawn many
+/// times by forms that are themselves drawn many times would otherwise
+/// multiply the work beyond any bound.
+const MAX_FORM_VISITS: usize = 10_000;
+
+/// The image drawings found on a page so far.
+struct Walk<'a> {
+    forms_left: usize,
+    found: &'a mut Vec<(ObjectId, Matrix)>,
+}
+
+impl Walk<'_> {
+    /// Follow `content`, drawn under `base`, into images and nested forms.
+    fn content(
+        &mut self,
+        document: &Document,
+        content: &[u8],
+        resources: &Dictionary,
+        base: Matrix,
+        depth: u8,
+    ) -> Result<()> {
+        if depth > 8 {
+            bail!("form XObjects are nested too deeply");
         }
+        let xobjects = sub_dictionary(document, resources, b"XObject");
+        let mut current = base;
+        let mut saved = Vec::new();
+        for operation in lopdf::content::Content::decode(content)?.operations {
+            match operation.operator.as_str() {
+                "q" => saved.push(current),
+                "Q" => current = saved.pop().unwrap_or(base),
+                "cm" => {
+                    if let Some(applied) = matrix(&operation.operands) {
+                        current = multiply(applied, current);
+                    }
+                }
+                "Do" => {
+                    let Some(id) = operation
+                        .operands
+                        .first()
+                        .and_then(|name| name.as_name().ok())
+                        .and_then(|name| xobjects?.get(name).ok()?.as_reference().ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(stream) = document.get_object(id).and_then(Object::as_stream) else {
+                        continue;
+                    };
+                    match stream.dict.get(b"Subtype").and_then(Object::as_name) {
+                        Ok(b"Image") => self.found.push((id, current)),
+                        Ok(b"Form") => self.form(document, stream, resources, current, depth)?,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
-    Ok(())
+
+    fn form(
+        &mut self,
+        document: &Document,
+        stream: &Stream,
+        resources: &Dictionary,
+        current: Matrix,
+        depth: u8,
+    ) -> Result<()> {
+        let form_resources =
+            sub_dictionary(document, &stream.dict, b"Resources").unwrap_or(resources);
+        if !has_xobjects(document, form_resources) {
+            return Ok(());
+        }
+        self.forms_left = self
+            .forms_left
+            .checked_sub(1)
+            .context("the page draws too many form XObjects")?;
+        let form_matrix = stream
+            .dict
+            .get(b"Matrix")
+            .and_then(Object::as_array)
+            .ok()
+            .and_then(|values| matrix(values))
+            .unwrap_or(IDENTITY);
+        let content = stream.decompressed_content_with_limit(MAX_DECOMPRESSED_BYTES)?;
+        self.content(
+            document,
+            &content,
+            form_resources,
+            multiply(form_matrix, current),
+            depth + 1,
+        )
+    }
 }
 
 /// Colour space of the decoded samples, resolved through references,
@@ -744,6 +804,48 @@ mod tests {
         assert_eq!(
             decode(&document, &stream).unwrap().into_luma8().into_raw(),
             [0, 255, 0, 255, 0, 255]
+        );
+    }
+
+    /// Corners of the unit square under `matrix`, rounded to whole points.
+    fn corners(matrix: Matrix) -> [(i64, i64); 4] {
+        let [a, b, c, d, e, f] = matrix;
+        [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(u, v)| {
+            (
+                (a * u + c * v + e).round() as i64,
+                (b * u + d * v + f).round() as i64,
+            )
+        })
+    }
+
+    #[test]
+    fn images_are_extracted_as_the_page_shows_them() {
+        // A 40x20 JPEG tagged "rotate 90° clockwise": the page shows it 20x40.
+        let stored = crate::commands::common::test_utils::sample_jpeg_bytes(40, 20);
+        let tagged = crate::metadata::with_jpeg_orientation(&stored, 6).unwrap();
+        let mut document = super::super::jpeg_document(tagged, super::super::PageSize::A4).unwrap();
+        let page_id = *document.get_pages().get(&1).unwrap();
+        let shown = |document: &Document| {
+            let image = page_images(document, 1, page_id, Selection::Largest, 90).remove(0);
+            ((image.width, image.height), corners(image.placement))
+        };
+        let (size, upright) = shown(&document);
+        assert_eq!(size, (20, 40));
+        // The upright unit square: x to the right, y up, on the portrait page.
+        let [origin, right, top, _] = upright;
+        assert!(right.0 > origin.0 && right.1 == origin.1, "{upright:?}");
+        assert!(top.1 > origin.1 && top.0 == origin.0, "{upright:?}");
+
+        // A page turned a quarter shows the picture lying on its side again.
+        super::super::transform::rotate_pages(&mut document, "all", 90).unwrap();
+        let (size, turned) = shown(&document);
+        assert_eq!(size, (40, 20));
+        assert_eq!(
+            turned
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            upright.iter().copied().collect()
         );
     }
 

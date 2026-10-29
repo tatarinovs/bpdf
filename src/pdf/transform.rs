@@ -396,11 +396,17 @@ pub fn apply_stamp(document: &mut Document, options: &StampOptions) -> Result<()
     if !(0.0..=1.0).contains(&options.opacity) {
         bail!("stamp opacity must be between 0 and 1");
     }
-    if options.scale.is_some_and(|scale| scale < 0.0) {
-        bail!("stamp scale cannot be negative");
+    if options
+        .scale
+        .is_some_and(|scale| !scale.is_finite() || scale < 0.0)
+    {
+        bail!("stamp scale must be a number of at least 0");
     }
-    if options.dpi.is_some_and(|dpi| dpi <= 0.0) {
-        bail!("stamp dpi must be positive");
+    if options
+        .dpi
+        .is_some_and(|dpi| !dpi.is_finite() || dpi <= 0.0)
+    {
+        bail!("stamp dpi must be a number above 0");
     }
 
     let bytes = std::fs::read(&options.path)

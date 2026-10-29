@@ -26,22 +26,7 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
     match formats::detect(&spec.path) {
         Some(format) if format.is_image() => {
             spec.reject_pages()?;
-            let page_size = options.text.page_size;
-            let jpegs = imageconv::to_jpegs_for_pdf(&spec.path, &options.image, Some(page_size))?;
-            // A fitted page uses the resolution of the source, which a
-            // re-encoded JPEG no longer records.
-            let dpi = if page_size == PageSize::Fit {
-                std::fs::read(&spec.path)
-                    .ok()
-                    .and_then(|bytes| crate::metadata::image_dpi(&bytes))
-            } else {
-                None
-            };
-            let documents = jpegs
-                .into_iter()
-                .map(|jpeg| pdf::jpeg_document_at(jpeg, page_size, dpi))
-                .collect::<Result<Vec<_>>>()?;
-            pdf::merge_documents(documents)
+            image_document(&spec.path, &options.image, options.text.page_size)
         }
         Some(Format::Pdf) => {
             let mut document = pdf::load(&spec.path)?;
@@ -93,6 +78,29 @@ pub fn load(spec: &InputSpec, options: &LoadOptions) -> Result<Document> {
         }
         _ => bail!("unsupported merge format: {}", spec.path.display()),
     }
+}
+
+/// One page per frame of an image file (TIFF pages, animation frames).
+pub fn image_document(
+    path: &Path,
+    options: &ImageOptions,
+    page_size: PageSize,
+) -> Result<Document> {
+    let jpegs = imageconv::to_jpegs_for_pdf(path, options, Some(page_size))?;
+    // A fitted page uses the resolution of the source, which a re-encoded
+    // JPEG no longer records.
+    let dpi = if page_size == PageSize::Fit {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| crate::metadata::image_dpi(&bytes))
+    } else {
+        None
+    };
+    let documents = jpegs
+        .into_iter()
+        .map(|jpeg| pdf::jpeg_document_at(jpeg, page_size, dpi))
+        .collect::<Result<Vec<_>>>()?;
+    pdf::merge_documents(documents)
 }
 
 /// Browser layout of an HTML page, or its text when no browser can render it.

@@ -197,6 +197,9 @@ fn detect_zip_content(path: &Path) -> Option<Format> {
         let Some(Ok(name)) = archive.name_for_index(index) else {
             continue;
         };
+        if crate::archive::is_hidden_entry(&name) {
+            continue;
+        }
         let name = name.to_ascii_lowercase();
         if name.ends_with("container.xml") {
             has_epub_container = true;

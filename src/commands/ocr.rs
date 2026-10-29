@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::json;
 
 use super::common::{
@@ -36,7 +36,10 @@ pub fn run(args: OcrArgs, config: &Config, fail_fast: bool) -> Result<()> {
         lang: args.lang.or_else(|| config.ocr_lang.clone()),
         force_image_ocr: args.force_ocr,
         jobs: config.ocr_jobs.clamp(1, 64),
-        cache_dir: (!args.no_cache && config.ocr_cache).then(|| config.ocr_cache_dir.clone()),
+        cache_dir: config
+            .active_ocr_cache_dir()
+            .filter(|_| !args.no_cache)
+            .map(Path::to_path_buf),
         ..OcrOptions::from_config(config)
     })?;
 
@@ -68,29 +71,29 @@ fn clear_cache(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Add a text layer to every source PDF. Pages of one file are recognised
-/// in parallel; files follow one another.
+/// Add a text layer to every source PDF; an image becomes a searchable
+/// `NAME.pdf` beside it. Pages of one file are recognised in parallel;
+/// files follow one another.
 fn searchable_in_place(
     engine: &OcrEngine,
     specs: &[InputSpec],
     config: &Config,
     fail_fast: bool,
 ) -> Result<()> {
-    if let Some(spec) = specs
+    let mut registry = OutputRegistry::default();
+    let destinations = specs
         .iter()
-        .find(|spec| formats::detect(&spec.path) != Some(Format::Pdf))
-    {
-        bail!(
-            "--in-place is only supported for PDF files, but found {}",
-            spec.path.display()
-        );
-    }
-    let results = specs.iter().map(|spec| {
+        .map(|spec| match formats::detect(&spec.path) {
+            Some(Format::Pdf) => spec.path.clone(),
+            _ => registry.unique(spec.path.with_extension("pdf")),
+        })
+        .collect::<Vec<_>>();
+    let results = specs.iter().zip(&destinations).map(|(spec, destination)| {
         output::info(format!("OCR (in-place): {}", describe(spec)));
         // A page range picks the pages to recognise; the rest are kept.
         let result = searchable(engine, spec, config, true)
             .and_then(|mut document| pdf::save_to_bytes(&mut document))
-            .and_then(|bytes| write_output(&spec.path, &bytes));
+            .and_then(|bytes| write_output(destination, &bytes));
         (&spec.path, result)
     });
     let failures = handle_results(
@@ -314,6 +317,23 @@ mod tests {
         let result = run(args, &Config::default(), true);
         assert!(result.is_ok(), "in-place OCR failed: {:?}", result.err());
         let doc = lopdf::Document::load(&input_pdf).unwrap();
+        assert_eq!(doc.get_pages().len(), 1);
+    }
+
+    #[test]
+    fn ocr_in_place_turns_an_image_into_a_pdf_beside_it() {
+        if !cfg!(windows) || !crate::winocr::is_available() {
+            return;
+        }
+        let temp_dir = tempfile::tempdir().unwrap();
+        let image_path = temp_dir.path().join("scan.png");
+        crate::commands::common::test_utils::sample_png_with_size(&image_path, 120, 60);
+        std::fs::write(temp_dir.path().join("scan.pdf"), b"taken").unwrap();
+        let before = std::fs::read(&image_path).unwrap();
+        let args = windows_ocr_args(vec![image_path.to_str().unwrap().to_owned()], None, true);
+        run(args, &Config::default(), true).unwrap();
+        assert_eq!(std::fs::read(&image_path).unwrap(), before);
+        let doc = lopdf::Document::load(temp_dir.path().join("scan_2.pdf")).unwrap();
         assert_eq!(doc.get_pages().len(), 1);
     }
 

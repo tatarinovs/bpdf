@@ -80,6 +80,9 @@ mod platform {
             if width == 0 || height == 0 {
                 bail!("WIC decoder returned empty image dimensions");
             }
+            if u64::from(width) * u64::from(height) > crate::imageconv::MAX_IMAGE_PIXELS {
+                bail!("image is too large ({width}x{height})");
+            }
 
             // SAFETY: Creating converter from valid factory
             let converter = unsafe { self.factory.CreateFormatConverter() }

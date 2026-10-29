@@ -24,6 +24,11 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo test --all-targets --locked
+      # The Explorer extension and bpdf-gui are C++; MinGW g++ is preinstalled.
+      - name: Build shell extension and GUI
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: tools\bpdf_shell\build_shell.bat
 
   # The rust-version declared in Cargo.toml must keep building.
   msrv:

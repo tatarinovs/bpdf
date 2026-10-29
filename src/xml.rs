@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::File;
 
 use anyhow::{Context, Result};
@@ -103,20 +104,148 @@ fn decode_entity(name: &str) -> Option<char> {
     })
 }
 
-/// Strip all XML/HTML tags, returning only text content with entities decoded.
-pub fn strip_tags(input: &str) -> String {
-    let mut result = String::new();
-    let mut inside = false;
-    for c in input.chars() {
-        if c == '<' {
-            inside = true;
-        } else if c == '>' {
-            inside = false;
-        } else if !inside {
-            result.push(c);
+/// One piece of an XML document, in document order.
+#[derive(Debug, PartialEq)]
+pub enum Event<'a> {
+    /// A start tag with its attribute text; a self-closing tag is followed
+    /// by its `End`.
+    Start {
+        name: &'a str,
+        attributes: &'a str,
+    },
+    End(&'a str),
+    /// Character data with entities decoded; CDATA sections as written.
+    Text(Cow<'a, str>),
+}
+
+/// The events of `xml`. Comments, processing instructions and declarations
+/// are skipped; a tag that never closes ends the document.
+pub fn events(xml: &str) -> Events<'_> {
+    Events {
+        rest: xml,
+        pending_end: None,
+    }
+}
+
+pub struct Events<'a> {
+    rest: &'a str,
+    pending_end: Option<&'a str>,
+}
+
+impl<'a> Iterator for Events<'a> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        if let Some(name) = self.pending_end.take() {
+            return Some(Event::End(name));
+        }
+        loop {
+            if self.rest.is_empty() {
+                return None;
+            }
+            if !self.rest.starts_with('<') {
+                let end = self.rest.find('<').unwrap_or(self.rest.len());
+                let text = &self.rest[..end];
+                self.rest = &self.rest[end..];
+                return Some(Event::Text(decode(text)));
+            }
+            if let Some(comment) = self.rest.strip_prefix("<!--") {
+                self.rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+                continue;
+            }
+            if let Some(instruction) = self.rest.strip_prefix("<?") {
+                self.rest = instruction
+                    .find("?>")
+                    .map_or("", |end| &instruction[end + 2..]);
+                continue;
+            }
+            if let Some(cdata) = self.rest.strip_prefix("<![CDATA[") {
+                let end = cdata.find("]]>").unwrap_or(cdata.len());
+                self.rest = cdata.get(end + 3..).unwrap_or("");
+                return Some(Event::Text(Cow::Borrowed(&cdata[..end])));
+            }
+            if self.rest.starts_with("<!") {
+                self.rest = self.rest.find('>').map_or("", |end| &self.rest[end + 1..]);
+                continue;
+            }
+            // The tag ends at the first `>` outside a quoted attribute value.
+            let mut quote = None;
+            let end = self
+                .rest
+                .char_indices()
+                .skip(1)
+                .find_map(|(index, character)| {
+                    match (quote, character) {
+                        (None, '"' | '\'') => quote = Some(character),
+                        (Some(open), _) if open == character => quote = None,
+                        (None, '>') => return Some(index),
+                        _ => {}
+                    }
+                    None
+                })?;
+            let tag = &self.rest[1..end];
+            self.rest = &self.rest[end + 1..];
+            if let Some(name) = tag.strip_prefix('/') {
+                return Some(Event::End(name.trim()));
+            }
+            let (tag, empty) = match tag.strip_suffix('/') {
+                Some(tag) => (tag, true),
+                None => (tag, false),
+            };
+            let split = tag.find(char::is_whitespace).unwrap_or(tag.len());
+            let (name, attributes) = tag.split_at(split);
+            if empty {
+                self.pending_end = Some(name);
+            }
+            return Some(Event::Start {
+                name,
+                attributes: attributes.trim(),
+            });
         }
     }
-    decode_entities(&result)
+}
+
+/// The name without its namespace prefix (`w:p` is `p`).
+pub fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Value of the attribute `name` (as written, prefix included) in the
+/// attribute text of a start tag, entities decoded.
+pub fn attribute<'a>(attributes: &'a str, name: &str) -> Option<Cow<'a, str>> {
+    let mut rest = attributes;
+    loop {
+        let equals = rest.find('=')?;
+        let key = rest[..equals].trim();
+        let value = rest[equals + 1..].trim_start();
+        let quote = value
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '"' | '\''))?;
+        let end = value[1..].find(quote)? + 1;
+        if key == name {
+            return Some(decode(&value[1..end]));
+        }
+        rest = &value[end + 1..];
+    }
+}
+
+fn decode(text: &str) -> Cow<'_, str> {
+    if text.contains('&') {
+        Cow::Owned(decode_entities(text))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// The character data of an XML/HTML fragment, entities decoded.
+pub fn strip_tags(input: &str) -> String {
+    events(input)
+        .filter_map(|event| match event {
+            Event::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Read a named entry from a ZIP archive to `String`.
@@ -132,30 +261,6 @@ pub fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Stri
         .by_name(lookup)
         .with_context(|| format!("entry {name} not found in ZIP archive"))?;
     crate::archive::read_text_entry(entry, name)
-}
-
-/// Collect text fragments enclosed between `open_tag` and `close_tag` in XML.
-/// Each match starts at the first `open_tag`, skips to the closing `>` of that
-/// tag (to handle attributes), then captures text up to `close_tag`.
-pub fn collect_tag_texts(xml: &str, open_tag: &str, close_tag: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut cursor = xml;
-    while let Some(start) = cursor.find(open_tag) {
-        if let Some(gt) = cursor[start..].find('>') {
-            let text_start = start + gt + 1;
-            if let Some(end) = cursor[text_start..].find(close_tag) {
-                let text = &cursor[text_start..text_start + end];
-                let decoded = decode_entities(text);
-                if !decoded.trim().is_empty() {
-                    result.push(decoded);
-                }
-                cursor = &cursor[text_start + end + close_tag.len()..];
-                continue;
-            }
-        }
-        break;
-    }
-    result
 }
 
 /// List ZIP entries whose names start with `prefix` and end with `suffix`,
@@ -177,7 +282,38 @@ pub fn collect_sorted_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_entities;
+    use super::*;
+
+    #[test]
+    fn events_follow_the_document() {
+        let xml =
+            r#"<?xml version="1.0"?><!-- <a> --><a x='1>2' y="&amp;"><b/>t&lt;<![CDATA[<c>]]></a>"#;
+        let events = events(xml).collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [
+                Event::Start {
+                    name: "a",
+                    attributes: r#"x='1>2' y="&amp;""#
+                },
+                Event::Start {
+                    name: "b",
+                    attributes: ""
+                },
+                Event::End("b"),
+                Event::Text("t<".into()),
+                Event::Text("<c>".into()),
+                Event::End("a"),
+            ]
+        );
+        let Event::Start { attributes, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(attribute(attributes, "x").as_deref(), Some("1>2"));
+        assert_eq!(attribute(attributes, "y").as_deref(), Some("&"));
+        assert_eq!(attribute(attributes, "z"), None);
+        assert_eq!(local_name("w:p"), "p");
+    }
 
     #[test]
     fn decodes_entities_in_one_pass() {

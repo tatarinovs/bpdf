@@ -26,69 +26,24 @@ impl InputSpec {
     }
 }
 
+/// Input specs of command-line arguments: files, non-recursive directories,
+/// globs and `@list.txt` manifests. A manifest entry is expanded like an
+/// argument of its own, relative to the list (manifests do not nest).
 pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<InputSpec>> {
     let mut files = Vec::new();
 
     for argument in arguments {
-        if let Some(manifest_arg) = argument.strip_prefix('@') {
-            let (manifest_path, pages) = split_pdf_range(manifest_arg);
-            let manifest_path = Path::new(&manifest_path);
-            // Relative entries are relative to the list, not to the
-            // directory bpdf happens to run in.
-            let base = manifest_path.parent().unwrap_or(Path::new(""));
-            for entry in read_manifest(manifest_path)? {
-                let (entry_path, entry_pages) = split_pdf_range(&entry);
-                files.push(InputSpec {
-                    path: base.join(entry_path),
-                    pages: entry_pages.or_else(|| pages.clone()),
-                });
-            }
+        let Some(manifest) = argument.strip_prefix('@') else {
+            expand_one(Path::new(""), argument, None, formats, &mut files)?;
             continue;
-        }
-
-        let (base, pages) = split_pdf_range(argument);
-        let path = Path::new(&base);
-
-        if path.is_dir() {
-            let mut entries = fs::read_dir(path)
-                .with_context(|| format!("failed to read directory {}", path.display()))?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry
-                        .file_type()
-                        .map(|kind| kind.is_file())
-                        .unwrap_or(false)
-                })
-                .map(|entry| entry.path())
-                .filter(|entry| formats.includes(entry))
-                .filter(|entry| !is_office_lock_file(entry))
-                .collect::<Vec<_>>();
-            natural_sort(&mut entries);
-            files.extend(entries.into_iter().map(|path| InputSpec {
-                path,
-                pages: pages.clone(),
-            }));
-        } else if base.contains(['*', '?']) {
-            // Like a directory listing: files of the formats the command reads.
-            let mut matches = glob(&base)
-                .with_context(|| format!("invalid glob pattern {base}"))?
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.is_file() && formats.includes(entry))
-                .filter(|entry| !is_office_lock_file(entry))
-                .collect::<Vec<_>>();
-            natural_sort(&mut matches);
-            if matches.is_empty() {
-                crate::output::warn(format!("no supported files match {base}, skipping"));
-            }
-            files.extend(matches.into_iter().map(|path| InputSpec {
-                path,
-                pages: pages.clone(),
-            }));
-        } else {
-            files.push(InputSpec {
-                path: path.to_path_buf(),
-                pages,
-            });
+        };
+        let (manifest_path, pages) = split_pdf_range(manifest);
+        let manifest_path = Path::new(&manifest_path);
+        // Relative entries are relative to the list, not to the directory
+        // bpdf happens to run in.
+        let base = manifest_path.parent().unwrap_or(Path::new(""));
+        for entry in read_manifest(manifest_path)? {
+            expand_one(base, &entry, pages.as_deref(), formats, &mut files)?;
         }
     }
 
@@ -96,6 +51,60 @@ pub fn expand(arguments: &[String], formats: InputFormatSet) -> Result<Vec<Input
         bail!("no input files found");
     }
     Ok(files)
+}
+
+/// Expand one argument, relative to `base`; its own page range wins over
+/// `default_pages` (the range of the manifest it comes from).
+fn expand_one(
+    base: &Path,
+    argument: &str,
+    default_pages: Option<&str>,
+    formats: InputFormatSet,
+    files: &mut Vec<InputSpec>,
+) -> Result<()> {
+    let (relative, pages) = split_pdf_range(argument);
+    let pages = pages.or_else(|| default_pages.map(str::to_owned));
+    let path = base.join(&relative);
+    let mut push_all = |mut paths: Vec<PathBuf>| {
+        natural_sort(&mut paths);
+        files.extend(paths.into_iter().map(|path| InputSpec {
+            path,
+            pages: pages.clone(),
+        }));
+    };
+
+    if path.is_dir() {
+        let entries = fs::read_dir(&path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.path())
+            .filter(|entry| formats.includes(entry) && !is_office_lock_file(entry))
+            .collect();
+        push_all(entries);
+    } else if relative.contains(['*', '?']) {
+        // The base directory is literal: brackets in its name are no pattern.
+        let pattern = if base.as_os_str().is_empty() || Path::new(&relative).is_absolute() {
+            relative.clone()
+        } else {
+            let base = glob::Pattern::escape(&base.to_string_lossy());
+            format!("{base}{}{relative}", std::path::MAIN_SEPARATOR)
+        };
+        // Like a directory listing: files of the formats the command reads.
+        let matches = glob(&pattern)
+            .with_context(|| format!("invalid glob pattern {pattern}"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.is_file() && formats.includes(entry))
+            .filter(|entry| !is_office_lock_file(entry))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            crate::output::warn(format!("no supported files match {pattern}, skipping"));
+        }
+        push_all(matches);
+    } else {
+        files.push(InputSpec { path, pages });
+    }
+    Ok(())
 }
 
 fn split_pdf_range(argument: &str) -> (String, Option<String>) {
@@ -233,6 +242,29 @@ mod tests {
         assert_eq!(specs[0].path, directory.path().join("scan.pdf"));
         assert_eq!(specs[0].pages.as_deref(), Some("2"));
         assert_eq!(specs[1].path, directory.path().join("sub/photo.jpg"));
+    }
+
+    #[test]
+    fn manifest_entries_expand_like_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("scans [2024]");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["2.jpg", "10.jpg", "notes.txt"] {
+            std::fs::write(folder.join(name), "x").unwrap();
+        }
+        std::fs::write(directory.path().join("a.png"), "x").unwrap();
+        let list = directory.path().join("list.txt");
+        std::fs::write(&list, "scans [2024]\n*.png\n").unwrap();
+        let specs = expand(&[format!("@{}", list.display())], InputFormatSet::Ocr).unwrap();
+        let paths = specs.into_iter().map(|spec| spec.path).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            [
+                folder.join("2.jpg"),
+                folder.join("10.jpg"),
+                directory.path().join("a.png")
+            ]
+        );
     }
 
     #[test]

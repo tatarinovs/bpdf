@@ -23,6 +23,9 @@ use crate::pdf::PageSize;
 use crate::process;
 
 const MAX_IMAGE_FRAMES: usize = 10_000;
+/// Largest image decoded into memory by a decoder without limits of its own
+/// (an A3 page at 1200 DPI fits). Sizes come from headers, which may lie.
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 300_000_000;
 /// Longest edge sent to vision OCR; larger images are downscaled first.
 const OCR_MAX_EDGE: u32 = 1536;
 /// Demuxers FFmpeg may use for an input: still-image readers, plus `mov`

@@ -13,13 +13,12 @@ set "RES_GUI=%TEMP%\bpdf_gui_res"
 
 echo [1/3] Looking for C++ compiler (g++ or cl)...
 
-set "CXX="
+rem CXX may name a g++ outside PATH, e.g. set "CXX=D:\w64devkit\bin\g++.exe"
 for /f "delims=" %%C in ('where g++ 2^>nul') do if not defined CXX set "CXX=%%C"
-if not defined CXX if exist "e:\_SOFT\w64devkit\bin\g++.exe" set "CXX=e:\_SOFT\w64devkit\bin\g++.exe"
 if not defined CXX for /f "delims=" %%C in ('where cl 2^>nul') do if not defined CXX set "CXX=cl"
 
 if not defined CXX (
-  echo Error: neither g++ nor cl.exe was found in PATH.
+  echo Error: neither g++ nor cl.exe was found in PATH; set CXX to the compiler.
   exit /b 1
 )
 

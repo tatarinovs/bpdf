@@ -39,6 +39,9 @@ pub fn merge_outlined(sources: Vec<(Document, Option<String>)>) -> Result<Docume
     let mut first_info: Option<Object> = None;
     let mut first_form: Option<Dictionary> = None;
     let mut all_fields = Vec::new();
+    let mut field_names = HashSet::new();
+    // PDF 1.1 `Dests` dictionary (names) and the `Dests` name tree (strings).
+    let mut legacy_destinations = BTreeMap::<Vec<u8>, Object>::new();
     let mut destinations = BTreeMap::<Vec<u8>, Object>::new();
     let mut outlines = Vec::new();
 
@@ -76,33 +79,32 @@ pub fn merge_outlined(sources: Vec<(Document, Option<String>)>) -> Result<Docume
             .get(b"AcroForm")
             .ok()
             .and_then(|form| transform::resolve_dictionary(&document, form));
-        if let Some(form) = &form {
-            if let Some(fields) = form
+        if let Some(form) = &form
+            && let Some(mut fields) = form
                 .get(b"Fields")
                 .ok()
                 .and_then(|fields| resolve(&document, fields).ok()?.as_array().ok())
-            {
-                all_fields.extend(fields.iter().cloned());
+                .cloned()
+        {
+            // Fields of one name share one value: a second copy of a form
+            // must not fill in the first.
+            for field in &mut fields {
+                rename_field(&mut document, field, &mut field_names, index + 1);
             }
-            first_form.get_or_insert_with(|| form.clone());
+            all_fields.extend(fields);
+        }
+        if let Some(form) = form {
+            first_form.get_or_insert(form);
         }
 
         // A name another document already uses gets a suffix, and this
         // document's links follow it.
-        let mut renamed = HashMap::new();
-        for (name, destination) in named_destinations(&document, &catalog) {
-            let mut unique = name.clone();
-            let mut counter = index + 1;
-            while destinations.contains_key(&unique) {
-                unique = [name.as_slice(), format!("_{counter}").as_bytes()].concat();
-                counter += 1;
-            }
-            if unique != name {
-                renamed.insert(name, unique.clone());
-            }
-            destinations.insert(unique, destination);
-        }
-        if !renamed.is_empty() {
+        let (legacy, tree) = named_destinations(&document, &catalog);
+        let renamed = Renamed {
+            names: add_unique(&mut legacy_destinations, legacy, index + 1),
+            strings: add_unique(&mut destinations, tree, index + 1),
+        };
+        if !renamed.names.is_empty() || !renamed.strings.is_empty() {
             for object in document.objects.values_mut() {
                 rename_destination_links(object, &renamed);
             }
@@ -167,6 +169,9 @@ pub fn merge_outlined(sources: Vec<(Document, Option<String>)>) -> Result<Docume
         catalog.remove(b"Names");
     } else {
         catalog.set("Names", names);
+    }
+    if !legacy_destinations.is_empty() {
+        catalog.set("Dests", Dictionary::from_iter(legacy_destinations));
     }
     if let Some(outline_id) = build_outline(&mut result, &mut next_id, outlines)? {
         catalog.set("Outlines", outline_id);
@@ -287,30 +292,87 @@ fn link_siblings(document: &mut Document, items: &[ObjectId], parent: ObjectId) 
     Ok(())
 }
 
-/// Named destinations of a document: the PDF 1.1 `Dests` dictionary and the
-/// `Dests` name tree.
-fn named_destinations(document: &Document, catalog: &Dictionary) -> Vec<(Vec<u8>, Object)> {
-    let mut found = Vec::new();
-    if let Some(dests) = catalog
+/// Named destinations of a document: those of the PDF 1.1 `Dests`
+/// dictionary (named by name objects) and those of the `Dests` name tree
+/// (named by strings).
+fn named_destinations(document: &Document, catalog: &Dictionary) -> (Destinations, Destinations) {
+    let legacy = catalog
         .get(b"Dests")
         .ok()
         .and_then(|dests| transform::resolve_dictionary(document, dests))
-    {
-        found.extend(
+        .map(|dests| {
             dests
                 .iter()
-                .map(|(name, destination)| (name.clone(), destination.clone())),
-        );
-    }
-    if let Some(tree) = catalog
+                .map(|(name, destination)| (name.clone(), destination.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut tree = Vec::new();
+    if let Some(root) = catalog
         .get(b"Names")
         .ok()
         .and_then(|names| transform::resolve_dictionary(document, names))
         .and_then(|names| transform::resolve_dictionary(document, names.get(b"Dests").ok()?))
     {
-        collect_name_tree(document, &tree, 0, &mut found);
+        collect_name_tree(document, &root, 0, &mut tree);
     }
-    found
+    (legacy, tree)
+}
+
+type Destinations = Vec<(Vec<u8>, Object)>;
+
+/// Add `found` to `all`. A name already taken gets a suffix (`_2`, ...,
+/// counted from `first_suffix`); the returned map holds the renames.
+fn add_unique(
+    all: &mut BTreeMap<Vec<u8>, Object>,
+    found: Destinations,
+    first_suffix: usize,
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let mut renamed = HashMap::new();
+    for (name, destination) in found {
+        let mut unique = name.clone();
+        let mut counter = first_suffix;
+        while all.contains_key(&unique) {
+            unique = [name.as_slice(), format!("_{counter}").as_bytes()].concat();
+            counter += 1;
+        }
+        if unique != name {
+            renamed.insert(name, unique.clone());
+        }
+        all.insert(unique, destination);
+    }
+    renamed
+}
+
+/// Give a top-level form field (an entry of `Fields`) a name no earlier
+/// document used, and remember it.
+fn rename_field(
+    document: &mut Document,
+    field: &mut Object,
+    taken: &mut HashSet<String>,
+    first_suffix: usize,
+) {
+    let field = match field {
+        Object::Reference(id) => match document.get_object_mut(*id).and_then(Object::as_dict_mut) {
+            Ok(field) => field,
+            Err(_) => return,
+        },
+        Object::Dictionary(field) => field,
+        _ => return,
+    };
+    let Ok(name) = field.get(b"T").map(super::pdf_text) else {
+        return;
+    };
+    let mut unique = name.clone();
+    let mut counter = first_suffix;
+    while taken.contains(&unique) {
+        unique = format!("{name}_{counter}");
+        counter += 1;
+    }
+    if unique != name {
+        field.set("T", info_string(&unique));
+    }
+    taken.insert(unique);
 }
 
 fn collect_name_tree(
@@ -346,16 +408,25 @@ fn collect_name_tree(
     }
 }
 
+/// Renamed destinations of one document: names of the `Dests` dictionary
+/// and strings of the name tree.
+struct Renamed {
+    names: HashMap<Vec<u8>, Vec<u8>>,
+    strings: HashMap<Vec<u8>, Vec<u8>>,
+}
+
 /// Point `Dest` entries and GoTo actions that name a renamed destination at
 /// its new name.
-fn rename_destination_links(object: &mut Object, renamed: &HashMap<Vec<u8>, Vec<u8>>) {
-    let rename = |value: &mut Object| match value {
-        Object::String(name, _) | Object::Name(name) => {
-            if let Some(new) = renamed.get(name.as_slice()) {
-                *name = new.clone();
-            }
+fn rename_destination_links(object: &mut Object, renamed: &Renamed) {
+    let rename = |value: &mut Object| {
+        let (name, map) = match value {
+            Object::Name(name) => (name, &renamed.names),
+            Object::String(name, _) => (name, &renamed.strings),
+            _ => return,
+        };
+        if let Some(new) = map.get(name.as_slice()) {
+            *name = new.clone();
         }
-        _ => {}
     };
     match object {
         Object::Dictionary(dictionary) => {
@@ -482,6 +553,51 @@ mod tests {
         let merged = reload(&mut merged);
         let root = outline_root(&merged);
         assert_eq!(titles(&merged, &root), ["a 1", "a 2", "b 1", "b 2"]);
+    }
+
+    #[test]
+    fn legacy_destinations_stay_names_and_clashing_fields_are_renamed() {
+        let form_copy = || {
+            let mut document = jpeg_document(sample_jpeg(3, 2), PageSize::A4).unwrap();
+            let page = *document.get_pages().get(&1).unwrap();
+            let field = document.add_object(dictionary! {
+                "FT" => "Tx", "T" => Object::string_literal("name"),
+            });
+            let form =
+                document.add_object(dictionary! { "Fields" => vec![Object::Reference(field)] });
+            let catalog = document.catalog_mut().unwrap();
+            catalog.set(
+                "Dests",
+                dictionary! { "start" => vec![Object::Reference(page), Object::Name(b"Fit".to_vec())] },
+            );
+            catalog.set("AcroForm", form);
+            document
+        };
+        let mut merged = merge_documents(vec![form_copy(), form_copy()]).unwrap();
+        let merged = reload(&mut merged);
+        let catalog = merged.catalog().unwrap();
+        let dests = transform::resolve_dictionary(&merged, catalog.get(b"Dests").unwrap()).unwrap();
+        let keys = dests
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [b"start".to_vec(), b"start_2".to_vec()]);
+        let form =
+            transform::resolve_dictionary(&merged, catalog.get(b"AcroForm").unwrap()).unwrap();
+        let names = form
+            .get(b"Fields")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| {
+                let field = merged
+                    .get_dictionary(field.as_reference().unwrap())
+                    .unwrap();
+                pdf_text(field.get(b"T").unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["name", "name_2"]);
     }
 
     #[test]

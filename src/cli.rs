@@ -185,7 +185,7 @@ pub struct OcrArgs {
     /// Combined output: .md for text, .pdf for a searchable PDF; otherwise one .md per input.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
-    /// Add a searchable text layer to the source PDFs.
+    /// Add a searchable text layer to the source PDFs; images become searchable NAME.pdf beside them.
     #[arg(short, long, conflicts_with = "out")]
     pub in_place: bool,
     /// OCR engine (default: ocr_engine).
@@ -277,13 +277,13 @@ pub struct StampArgs {
     #[arg(long, default_value = "br", value_parser = parse_position)]
     pub position: String,
     /// Scale multiplier; omit for the physical size, 0 fits up to a quarter of the page.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_non_negative)]
     pub scale: Option<f64>,
     /// Opacity from 0 (transparent) to 1 (opaque).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_opacity)]
     pub opacity: f64,
     /// Stamp image resolution in DPI (default: from PNG/JPEG metadata, else 96).
-    #[arg(long)]
+    #[arg(long, value_parser = parse_positive)]
     pub dpi: Option<f64>,
     /// Pages to stamp, for example all, first, last, 1-5, even or odd.
     #[arg(short, long, default_value = "all")]
@@ -309,7 +309,7 @@ pub struct NumberArgs {
     #[arg(long, default_value = "bc", value_parser = parse_position)]
     pub position: String,
     /// Font size in points.
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, default_value_t = 10.0, value_parser = parse_positive)]
     pub size: f64,
     /// Number given to the first numbered page.
     #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
@@ -321,7 +321,7 @@ pub struct NumberArgs {
     #[arg(long, default_value = "black", value_parser = parse_color)]
     pub color: [f64; 3],
     /// Text opacity from 0 (transparent) to 1 (opaque).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_opacity)]
     pub opacity: f64,
     #[command(flatten)]
     pub output: OutputArgs,
@@ -334,10 +334,10 @@ pub struct WatermarkArgs {
     /// Watermark text.
     pub text: String,
     /// Font size in points; 0 fits the text to the page.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_non_negative)]
     pub size: f64,
     /// Counter-clockwise angle in degrees.
-    #[arg(long, default_value_t = 45.0, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = 45.0, allow_negative_numbers = true, value_parser = parse_number)]
     pub angle: f64,
     /// Anchor (c, tc, bc, ...) or X,Y mm offset from bottom-right.
     #[arg(long, default_value = "c", value_parser = parse_position)]
@@ -346,7 +346,7 @@ pub struct WatermarkArgs {
     #[arg(long, default_value = "gray", value_parser = parse_color)]
     pub color: [f64; 3],
     /// Text opacity from 0 (transparent) to 1 (opaque).
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = 0.3, value_parser = parse_opacity)]
     pub opacity: f64,
     /// Pages to mark, for example all, first, 1-5, even or odd.
     #[arg(short, long, default_value = "all")]
@@ -383,10 +383,10 @@ pub struct ProtectArgs {
     /// Source PDF file.
     pub input: PathBuf,
     /// Password needed to open the PDF (omit to let anyone open it).
-    #[arg(long, env = "BPDF_PASSWORD", hide_env_values = true)]
+    #[arg(long, env = "BPDF_PROTECT_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
     /// Password that lifts the restrictions (default: the open password, or a random one with restrictions).
-    #[arg(long, env = "BPDF_OWNER_PASSWORD", hide_env_values = true)]
+    #[arg(long, env = "BPDF_PROTECT_OWNER_PASSWORD", hide_env_values = true)]
     pub owner_password: Option<String>,
     /// Forbid printing.
     #[arg(long)]
@@ -406,7 +406,7 @@ pub struct UnlockArgs {
     /// Source PDF file.
     pub input: PathBuf,
     /// Open or owner password (omit for PDFs that open without one but carry restrictions).
-    #[arg(long, env = "BPDF_PASSWORD", hide_env_values = true)]
+    #[arg(long, env = "BPDF_UNLOCK_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
     #[command(flatten)]
     pub output: OutputArgs,
@@ -464,6 +464,40 @@ pub fn parse_position(value: &str) -> Result<String, String> {
     crate::pdf::transform::parse_position(value)
         .map(|_| value.to_owned())
         .map_err(|error| error.to_string())
+}
+
+/// A finite number (`nan` and `inf` would end up in the page content).
+pub fn parse_number(value: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("'{value}' is not a number"))
+}
+
+/// A number of at least 0.
+pub fn parse_non_negative(value: &str) -> Result<f64, String> {
+    match parse_number(value)? {
+        number if number >= 0.0 => Ok(number),
+        _ => Err(format!("'{value}' must not be negative")),
+    }
+}
+
+/// A number above 0.
+pub fn parse_positive(value: &str) -> Result<f64, String> {
+    match parse_number(value)? {
+        number if number > 0.0 => Ok(number),
+        _ => Err(format!("'{value}' must be above 0")),
+    }
+}
+
+/// An opacity from 0 to 1.
+pub fn parse_opacity(value: &str) -> Result<f64, String> {
+    match parse_number(value)? {
+        number if (0.0..=1.0).contains(&number) => Ok(number),
+        _ => Err(format!("opacity '{value}' must be between 0 and 1")),
+    }
 }
 
 /// Parse a colour name or `#RRGGBB` into RGB components in 0..=1.
@@ -591,6 +625,11 @@ mod tests {
         assert!(parse(&["ocr", "a.pdf", "-e", "tesseract"]).is_err());
         assert!(parse(&["convert", "a.jpg", "--long-edge", "9", "--short-edge", "5"]).is_err());
         assert!(parse(&["convert", "a.jpg", "--orient", "diagonal"]).is_err());
+        assert!(parse(&["watermark", "a.pdf", "x", "--angle", "nan"]).is_err());
+        assert!(parse(&["watermark", "a.pdf", "x", "--angle", "-30"]).is_ok());
+        assert!(parse(&["stamp", "a.pdf", "s.png", "--dpi", "inf"]).is_err());
+        assert!(parse(&["stamp", "a.pdf", "s.png", "--scale", "-1"]).is_err());
+        assert!(parse(&["number", "a.pdf", "--opacity", "1.5"]).is_err());
     }
 
     #[test]

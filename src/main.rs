@@ -35,7 +35,11 @@ fn owns_console() -> bool {
 }
 
 fn pause_if(standalone: bool) {
-    if !standalone || bpdf::is_json_mode() || bpdf::is_no_pause() || std::env::var_os("BPDF_NO_PAUSE").is_some() {
+    if !standalone
+        || bpdf::is_json_mode()
+        || bpdf::is_no_pause()
+        || std::env::var_os("BPDF_NO_PAUSE").is_some()
+    {
         return;
     }
     println!("\nPress Enter to exit...");

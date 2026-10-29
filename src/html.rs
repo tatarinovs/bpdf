@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use lopdf::Document;
 
-use crate::process;
+use crate::{process, xml};
 
 /// HTML pages are laid out by a headless Chromium-based browser (Microsoft
 /// Edge ships with Windows; Chrome and Chromium are found elsewhere). Without
@@ -183,20 +183,17 @@ fn capture(
 /// `viewBox` of its root element; 300x150 (the browser default) without them.
 pub fn svg_size(path: &Path) -> Result<(f64, f64)> {
     let text = crate::encoding::read_text(path)?;
-    let start = text
-        .match_indices("<svg")
-        .map(|(index, _)| index)
-        .find(|&index| {
-            text[index + 4..]
-                .chars()
-                .next()
-                .is_some_and(|next| next.is_whitespace() || next == '>')
+    let attributes = xml::events(&text)
+        .find_map(|event| match event {
+            xml::Event::Start { name, attributes } if xml::local_name(name) == "svg" => {
+                Some(attributes)
+            }
+            _ => None,
         })
         .with_context(|| format!("{} has no <svg> element", path.display()))?;
-    let tag = &text[start..start + text[start..].find('>').unwrap_or(text.len() - start)];
-    let width = attribute(tag, "width").and_then(css_pixels);
-    let height = attribute(tag, "height").and_then(css_pixels);
-    let view_box = attribute(tag, "viewBox").and_then(|value| {
+    let length = |name: &str| xml::attribute(attributes, name).and_then(|value| css_pixels(&value));
+    let (width, height) = (length("width"), length("height"));
+    let view_box = xml::attribute(attributes, "viewBox").and_then(|value| {
         let numbers = value
             .split(|character: char| character.is_whitespace() || character == ',')
             .filter(|part| !part.is_empty())
@@ -218,27 +215,6 @@ pub fn svg_size(path: &Path) -> Result<(f64, f64)> {
         (None, None, Some(size)) => size,
         _ => (300.0, 150.0),
     })
-}
-
-/// Value of attribute `name` in a start tag.
-fn attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let mut from = 0;
-    while let Some(offset) = tag[from..].find(name) {
-        let at = from + offset;
-        from = at + name.len();
-        // `width` must not match the end of `stroke-width`.
-        if !tag[..at].ends_with(|character: char| character.is_whitespace()) {
-            continue;
-        }
-        let rest = tag[from..].trim_start().strip_prefix('=')?.trim_start();
-        let quote = rest
-            .chars()
-            .next()
-            .filter(|quote| *quote == '"' || *quote == '\'')?;
-        let value = &rest[1..];
-        return value.find(quote).map(|end| &value[..end]);
-    }
-    None
 }
 
 /// A CSS length in pixels; `None` for percentages and unknown units.

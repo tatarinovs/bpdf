@@ -34,6 +34,13 @@ pub fn read_entry(entry: impl Read, name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// An entry that is archive metadata rather than content: macOS resource
+/// forks (`__MACOSX/`, `._name`) and other hidden files.
+pub fn is_hidden_entry(name: &str) -> bool {
+    name.split(['/', '\\'])
+        .any(|part| part == "__MACOSX" || (part.starts_with('.') && part != "." && part != ".."))
+}
+
 /// [`read_entry`] as UTF-8 text.
 pub fn read_text_entry(entry: impl Read, name: &str) -> Result<String> {
     String::from_utf8(read_entry(entry, name)?)
@@ -50,6 +57,7 @@ pub fn load_cbz(path: &Path, options: &ImageOptions, page_size: PageSize) -> Res
 
     let mut image_names = (0..archive.len())
         .filter_map(|index| Some(archive.name_for_index(index)?.ok()?.into_owned()))
+        .filter(|name| !is_hidden_entry(name))
         .filter(|name| formats::detect_by_extension(Path::new(name)).is_some_and(Format::is_image))
         .collect::<Vec<_>>();
     if image_names.is_empty() {
@@ -119,6 +127,11 @@ mod tests {
         zip.write_all(&img_bytes).unwrap();
         zip.start_file("page_01.png", zip_opts).unwrap();
         zip.write_all(&img_bytes).unwrap();
+        // Written by macOS beside every file; not images.
+        zip.start_file("__MACOSX/._page_01.png", zip_opts).unwrap();
+        zip.write_all(b"resource fork").unwrap();
+        zip.start_file("._page_02.png", zip_opts).unwrap();
+        zip.write_all(b"resource fork").unwrap();
         zip.finish().unwrap();
 
         let image_opts = ImageOptions {

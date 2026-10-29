@@ -13,12 +13,16 @@ pub struct ProcessOutput {
 
 /// Run a child with bounded lifetime and concurrent pipe draining. Draining
 /// both pipes prevents a verbose child from deadlocking while the parent waits.
+/// On timeout the child is killed with every process it started.
 pub fn run(mut command: Command, timeout: Duration, label: &str) -> Result<ProcessOutput> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_window(&mut command);
+    // Its own process group, so the whole tree can be killed at once.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
 
     let mut child = command
         .spawn()
@@ -37,8 +41,8 @@ pub fn run(mut command: Command, timeout: Duration, label: &str) -> Result<Proce
             terminate_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            // The readers are left to finish on their own: a process that
+            // escaped the kill may hold the pipes open.
             bail!("{label} timed out after {} seconds", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(25));
@@ -170,7 +174,17 @@ fn terminate_tree(pid: u32) {
     let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
-#[cfg(not(windows))]
+/// Kill the process group the child leads (see `run`).
+#[cfg(unix)]
+fn terminate_tree(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(windows, unix)))]
 fn terminate_tree(_pid: u32) {}
 
 #[cfg(test)]

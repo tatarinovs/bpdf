@@ -140,7 +140,7 @@ bpdf ocr <INPUTS>... [OPTIONS]
   - `.pdf` — create a **Searchable PDF** with an invisible text layer;
   - `.md` (or other extension) — single combined Markdown file;
   - omitted — creates individual `.md` files beside each input.
-- `-i, --in-place` — Inject the searchable text layer directly into source PDFs (specifying `doc.pdf:2-4` limits OCR to the given range).
+- `-i, --in-place` — Inject the searchable text layer directly into source PDFs (specifying `doc.pdf:2-4` limits OCR to the given range); an image becomes a searchable `NAME.pdf` beside it (`NAME_2.pdf` when the name is taken).
 - `-e, --engine <ENGINE>` — `groq`, `windows`, or `auto` (default: `ocr_engine`). In `auto` mode, network or key failures trigger an automatic fallback to Windows OCR.
 - `--lang <LANG>` — Windows OCR language tag (`ru`, `en-US`; default: `ocr_lang`).
 - `--force-ocr` — Force recognition of pages that already contain a text layer.
@@ -311,6 +311,10 @@ bpdf unlock <INPUT> [--password <PW>] [-o <OUT> | -i]
 - `--password` — Password required to open the document.
 - `--owner-password` — Owner password required to alter restrictions.
 - `--no-print`, `--no-copy`, `--no-modify` — Restrict printing, content copying, and editing.
+
+Passwords can come from the environment to keep them off the command line: `BPDF_PROTECT_PASSWORD` and `BPDF_PROTECT_OWNER_PASSWORD` for `protect`, `BPDF_UNLOCK_PASSWORD` for `unlock` (this is how `bpdf-gui` passes `{ask_pass:...}`). Each command has variables of its own, so a password meant for `unlock` never encrypts a file.
+
+PDF restrictions are an agreement with viewers, not protection of the content: `unlock` lifts them without the owner password, and `merge` builds a new document without the sources' restrictions. `split` and the editing commands (`rotate`, `stamp`, ...) keep a file's protection.
 
 ---
 

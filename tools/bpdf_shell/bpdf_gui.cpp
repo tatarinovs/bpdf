@@ -827,13 +827,16 @@ static bool AskValue(GuiContext* ctx, const wchar_t* title, const wchar_t* conte
     return ShowInputBox(ctx->hwnd, title, prompt, defVal.c_str(), value, valueLen, isPass, ctx->hFontUi, ctx->dpi);
 }
 
-// For `--password {ask_pass:...}` or `--password "{ask_pass:...}"`: removes the
-// option from out and returns the environment variable bpdf reads it from
+// For `--password {ask_pass:...}` or `--password "{ask_pass:...}"` of a command
+// that also reads the password from its environment: removes the option from
+// out and returns that variable. Every command has variables of its own, so a
+// password left in an environment never reaches another command
 static const wchar_t* TakePasswordOption(StrW& out, bool inQuotes, wchar_t next)
 {
-    static const wchar_t* const kOptions[][2] = {
-        { L"--password", L"BPDF_PASSWORD" },
-        { L"--owner-password", L"BPDF_OWNER_PASSWORD" },
+    static const wchar_t* const kOptions[][3] = {
+        { L"protect", L"--password", L"BPDF_PROTECT_PASSWORD" },
+        { L"protect", L"--owner-password", L"BPDF_PROTECT_OWNER_PASSWORD" },
+        { L"unlock", L"--password", L"BPDF_UNLOCK_PASSWORD" },
     };
 
     size_t end = out.len;
@@ -848,11 +851,21 @@ static const wchar_t* TakePasswordOption(StrW& out, bool inQuotes, wchar_t next)
     size_t start = optEnd;
     while (start > 0 && out.data[start - 1] != L' ' && out.data[start - 1] != L'\t') start--;
 
+    // The bpdf command is the first word that is not an option
+    const wchar_t* command = out.data;
+    for (;;) {
+        command += wcsspn(command, L" \t");
+        if (*command != L'-') break;
+        command += wcscspn(command, L" \t");
+    }
+    size_t commandLen = wcscspn(command, L" \t");
+
     for (size_t i = 0; i < ARRAYSIZE(kOptions); i++) {
-        size_t n = wcslen(kOptions[i][0]);
-        if (optEnd - start == n && wcsncmp(out.data + start, kOptions[i][0], n) == 0) {
+        size_t n = wcslen(kOptions[i][1]);
+        if (commandLen == wcslen(kOptions[i][0]) && wcsncmp(command, kOptions[i][0], commandLen) == 0 &&
+            optEnd - start == n && wcsncmp(out.data + start, kOptions[i][1], n) == 0) {
             out.truncate(start);
-            return kOptions[i][1];
+            return kOptions[i][2];
         }
     }
     return NULL;
@@ -1179,7 +1192,7 @@ static void BrowseForFiles(GuiContext* ctx)
 
     OPENFILENAMEW ofn = { sizeof(ofn) };
     ofn.hwndOwner = ctx->hwnd;
-    ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.djvu;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFilter = L"Все поддерживаемые файлы\0*.pdf;*.docx;*.xlsx;*.pptx;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tiff;*.tif;*.avif;*.heic;*.epub;*.cbz;*.fb2;*.txt;*.md;*.html\0PDF документы (*.pdf)\0*.pdf\0Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.tiff;*.webp;*.avif;*.heic\0Все файлы (*.*)\0*.*\0";
     ofn.lpstrFile = buf;
     ofn.nMaxFile = bufLen;
     ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -1428,7 +1441,8 @@ static void ShowHelp()
         L"Параметры диалогов в командах:\n"
         L"  {ask:Подсказка:Дефолт} — диалог ввода значения\n"
         L"  {ask_pass:Подсказка}   — ввод пароля со звёздочками; после --password\n"
-        L"                           передаётся bpdf через окружение, а не командную строку\n\n"
+        L"                           команд protect и unlock передаётся bpdf через\n"
+        L"                           окружение, а не командную строку\n\n"
         L"Кнопки Total Commander:\n"
         L"  Команда:    bpdf-gui.exe --icon 7\n"
         L"  Параметры:  -- rotate @\"%UL\" -a \"{ask:Угол поворота (90, 180, 270, portrait):90}\" -i",

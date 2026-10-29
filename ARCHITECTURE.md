@@ -63,7 +63,17 @@ such as default output names, `--fail-fast`, summaries, and user messages.
 - PDF image decoding and page-image extraction are implemented once in
   `pdf/image.rs` and are shared by optimize, OCR, and convert. Colour spaces
   are resolved through ICC profiles, Indexed palettes and Separation; stream
-  filters, predictors and decompression limits come from lopdf.
+  filters, predictors and decompression limits come from lopdf. Images are
+  extracted as the page shows them: the stored samples (EXIF is ignored, as
+  by PDF viewers) are turned by quarter turns to stand upright under their
+  drawing matrix and `/Rotate`, and each carries its `placement` matrix. The
+  OCR text layer is laid out in the image's pixels through that matrix, and
+  an image input is OCR'd through the same path after `input::image_document`
+  builds its pages.
+- XML is read by one event tokenizer (`xml::events`): the Office/OpenDocument
+  text fallback (`office_fallback.rs`) and SVG sizes use it.
+- `@list.txt` entries are expanded exactly like arguments (directories, globs,
+  page ranges), relative to the list.
 - Embedded text fonts (`textpdf.rs`) are written by one `FontWriter` and
   subset by `font_subset.rs`, keeping glyph ids so `CIDToGIDMap /Identity`
   stays valid.

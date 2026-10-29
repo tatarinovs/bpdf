@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -19,9 +19,8 @@ use crate::hash::sha256_hex;
 use crate::imageconv::{self, ImageOptions};
 use crate::pdf::PageSize;
 use crate::pdf::image::{self as pdf_image, ExtractedImage, Selection};
-use crate::pdf::transform::PageGeometry;
 use crate::textpdf::{OCR_FONT_NAME, PageTextOverlay, overlay_searchable_text};
-use crate::winocr::{OcrPageResult, OcrWordBox};
+use crate::winocr::OcrPageResult;
 use crate::{atomic, output, parallel, pdf};
 
 const MAX_ATTEMPTS: usize = 10;
@@ -231,15 +230,10 @@ impl OcrEngine {
         let jobs = parallel::map(specs, parallel::cpu_jobs(), |spec| self.prepare_text(spec));
         let tasks = jobs
             .iter()
-            .enumerate()
-            .filter_map(|(index, job)| Some((index, job.as_ref().ok()?)))
-            .flat_map(|(index, job)| (0..job.images.len()).map(move |image| (index, image)))
+            .filter_map(|job| job.as_ref().ok())
+            .flat_map(|job| &job.images)
             .collect::<Vec<_>>();
-        let mut results = parallel::map(&tasks, self.options.jobs, |&(index, image)| {
-            let Ok(job) = &jobs[index] else {
-                unreachable!("tasks come from prepared jobs")
-            };
-            let image = &job.images[image].1;
+        let mut results = parallel::map(&tasks, self.options.jobs, |image| {
             output::info(format!("OCR {}...", image.label));
             self.recognize_image(&image.bytes, &image.label)
         })
@@ -276,16 +270,20 @@ impl OcrEngine {
                 }
                 let images = pending
                     .iter()
-                    .flat_map(|&(number, page_id)| {
+                    .flat_map(|&(page, page_id)| {
                         pdf_image::page_images(
                             &document,
-                            number,
+                            page,
                             page_id,
                             Selection::Largest,
                             self.options.image.jpeg_quality,
                         )
                         .into_iter()
-                        .map(move |image| (number, image))
+                        .map(move |image| PendingImage {
+                            page,
+                            label: format!("{} {}", file_label(path), image.label),
+                            bytes: image.bytes,
+                        })
                     })
                     .collect();
                 Ok(TextJob {
@@ -296,17 +294,14 @@ impl OcrEngine {
             }
             Some(format) if format.is_image() => {
                 spec.reject_pages()?;
-                let bytes = imageconv::for_ocr(path, &self.options.image)?;
-                let image = ExtractedImage {
-                    id: None,
+                let image = PendingImage {
+                    page: 1,
                     label: file_label(path).to_owned(),
-                    bytes,
-                    width: 0,
-                    height: 0,
+                    bytes: imageconv::for_ocr(path, &self.options.image)?,
                 };
                 Ok(TextJob {
                     texts: BTreeMap::new(),
-                    images: vec![(1, image)],
+                    images: vec![image],
                     is_pdf: false,
                 })
             }
@@ -315,10 +310,11 @@ impl OcrEngine {
     }
 
     /// A PDF with an invisible text layer: existing PDF pages keep their
-    /// content, images become single-page documents. Pages that already
-    /// carry text are left alone unless OCR is forced. A page range of the
-    /// input selects the pages of the result, or with `keep_all_pages` only
-    /// the pages to recognise (the source is rewritten in place).
+    /// content, an image becomes a page of `page_size` (one per frame).
+    /// Pages that already carry text are left alone unless OCR is forced. A
+    /// page range of the input selects the pages of the result, or with
+    /// `keep_all_pages` only the pages to recognise (the source is rewritten
+    /// in place).
     pub fn create_searchable_pdf_for_spec(
         &self,
         spec: &InputSpec,
@@ -338,111 +334,24 @@ impl OcrEngine {
                         pdf::select_pages(&mut document, pages)?;
                     }
                 }
-                let mut pages = self.pages_to_recognise(&document, &page_texts(&document));
-                if let Some(only) = &only {
-                    pages.retain(|(number, _)| only.contains(&(*number as usize)));
-                }
-                let scans = parallel::map(&pages, parallel::cpu_jobs(), |&(number, page_id)| {
-                    let images = pdf_image::page_images(
-                        &document,
-                        number,
-                        page_id,
-                        Selection::AllFrom(MIN_SEARCHABLE_IMAGE_AREA),
-                        self.options.image.jpeg_quality,
-                    );
-                    (page_id, images)
-                })
-                .into_iter()
-                .filter(|(_, images)| !images.is_empty())
-                .map(|(page_id, images)| {
-                    let crop = pdf::transform::page_crop_geometry(&document, page_id)?;
-                    let boxes = pdf_image::placement_boxes(&document, page_id).unwrap_or_default();
-                    let images = images
-                        .into_iter()
-                        .map(|image| {
-                            let area = image
-                                .id
-                                .and_then(|id| boxes.get(&id))
-                                .map(|bounds| displayed_area(crop, *bounds));
-                            (image, area)
-                        })
-                        .collect::<Vec<_>>();
-                    Ok((page_id, crop, images))
-                })
-                .collect::<Result<Vec<_>>>()?;
-                if scans.is_empty() {
-                    if pages.is_empty() {
-                        output::info(format!(
-                            "{} already has a text layer on every page",
-                            spec.path.display()
-                        ));
-                        return Ok(document);
-                    }
-                    bail!("no extractable images found in {}", spec.path.display());
-                }
-
-                let overlays =
-                    parallel::map(&scans, self.options.jobs, |(page_id, crop, images)| {
-                        self.page_overlay(*page_id, *crop, images)
-                    });
-                overlay_searchable_text(&mut document, &overlays, font_path)?;
+                self.add_text_layer(
+                    &mut document,
+                    only.as_ref(),
+                    MIN_SEARCHABLE_IMAGE_AREA,
+                    font_path,
+                    &spec.path,
+                )?;
                 Ok(document)
             }
             Some(format) if format.is_image() => {
                 spec.reject_pages()?;
-                let mut jpeg = imageconv::to_jpeg(&spec.path, &self.options.image, None)?;
-                // Word boxes refer to the pixels the engine sees, so a photo
-                // rotated only by its EXIF tag is made upright first.
-                if crate::metadata::jpeg_orientation(&jpeg) != 1 {
-                    jpeg = imageconv::encode_jpeg_on_white(
-                        &imageconv::decode_bytes(&jpeg)?,
-                        self.options.image.jpeg_quality,
-                    )?;
-                }
-                let info = pdf::jpeg_info(&jpeg)?;
-                let (width, height) = (u32::from(info.width), u32::from(info.height));
-                output::info(format!("OCR {} (searchable layer)...", spec.path.display()));
-                let result = self.recognize_image(&jpeg, file_label(&spec.path))?;
-
-                let mut document = pdf::jpeg_document(jpeg, page_size)?;
-                let page_id = *document
-                    .get_pages()
-                    .get(&1)
-                    .context("image page is missing")?;
-                let geometry = pdf::transform::page_geometry(&document, page_id)?;
-                let placement = pdf::image_placement(
-                    width,
-                    height,
-                    page_size,
-                    // The size the page was given, whatever resolution it took.
-                    (page_size == PageSize::Fit)
-                        .then(|| 72.0 * f64::from(width) / geometry.raw_width()),
-                );
-                // Image pixels -> page points, measured from the page top.
-                let scale = placement.width / f64::from(width);
-                let top = placement.page_height - placement.y - placement.height;
-                let words = result
-                    .words
-                    .into_iter()
-                    .map(|word| OcrWordBox {
-                        x: placement.x + word.x * scale,
-                        y: top + word.y * scale,
-                        width: word.width * scale,
-                        height: word.height * scale,
-                        line_y: top + word.line_y * scale,
-                        line_height: word.line_height * scale,
-                        text: word.text,
-                    })
-                    .collect();
-                let overlay = PageTextOverlay {
-                    page_id,
-                    matrix: crate::textpdf::IDENTITY,
-                    page_width: placement.page_width,
-                    page_height: placement.page_height,
-                    scaled_words: words,
-                    fallback_text: Some(result.text),
+                // Recognised at full resolution, so no downsampling.
+                let options = ImageOptions {
+                    image_dpi: 0,
+                    ..self.options.image.clone()
                 };
-                overlay_searchable_text(&mut document, &[overlay], font_path)?;
+                let mut document = crate::input::image_document(&spec.path, &options, page_size)?;
+                self.add_text_layer(&mut document, None, 1, font_path, &spec.path)?;
                 Ok(document)
             }
             _ => bail!(
@@ -452,53 +361,88 @@ impl OcrEngine {
         }
     }
 
-    /// Recognise the images of one page and map their words onto the area
-    /// each image covers on the visible page (`[left, top, width, height]`
-    /// from the top-left corner), or the whole page when it is not known.
-    /// Extracted images are upright, so words are placed on the displayed
-    /// page and `matrix` turns them with it.
-    fn page_overlay(
+    /// Recognise the images of at least `min_area` pixels on the pages that
+    /// need it (only those numbered in `only`, when given) and lay their text
+    /// over them. `source` names the document in messages.
+    fn add_text_layer(
+        &self,
+        document: &mut Document,
+        only: Option<&BTreeSet<usize>>,
+        min_area: u64,
+        font_path: Option<&Path>,
+        source: &Path,
+    ) -> Result<()> {
+        let mut pages = self.pages_to_recognise(document, &page_texts(document));
+        if let Some(only) = only {
+            pages.retain(|(number, _)| only.contains(&(*number as usize)));
+        }
+        if pages.is_empty() {
+            output::info(format!(
+                "{} already has a text layer on every page",
+                source.display()
+            ));
+            return Ok(());
+        }
+        let images = parallel::map(&pages, parallel::cpu_jobs(), |&(number, page_id)| {
+            let images = pdf_image::page_images(
+                document,
+                number,
+                page_id,
+                Selection::AllFrom(min_area),
+                self.options.image.jpeg_quality,
+            );
+            images.into_iter().map(move |image| (page_id, image))
+        })
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if images.is_empty() {
+            bail!("no extractable images found in {}", source.display());
+        }
+        let source = file_label(source);
+        let overlays = parallel::map(&images, self.options.jobs, |(page_id, image)| {
+            self.image_overlay(*page_id, image, source)
+        });
+        let overlays = overlays.into_iter().flatten().collect::<Vec<_>>();
+        overlay_searchable_text(document, &overlays, font_path)
+    }
+
+    /// The recognised text of one page image, laid over the image: word
+    /// boxes are pixels of the upright image, which `placement` puts on the
+    /// page. `None` when nothing was recognised.
+    fn image_overlay(
         &self,
         page_id: lopdf::ObjectId,
-        crop: PageGeometry,
-        images: &[(ExtractedImage, Option<[f64; 4]>)],
-    ) -> PageTextOverlay {
-        let (page_width, page_height) = (crop.display_width(), crop.display_height());
-        let mut words = Vec::new();
-        let mut fallback = Vec::new();
-        for (image, area) in images {
-            output::info(format!("OCR {} (searchable layer)...", image.label));
-            let result = match self.recognize_image(&image.bytes, &image.label) {
-                Ok(result) => result,
-                Err(error) => {
-                    output::warn(format!("Failed to OCR {}: {error:#}", image.label));
-                    continue;
-                }
-            };
-            let [left, top, width, height] = area.unwrap_or([0.0, 0.0, page_width, page_height]);
-            let scale_x = width / f64::from(image.width.max(1));
-            let scale_y = height / f64::from(image.height.max(1));
-            words.extend(result.words.into_iter().map(|mut word| {
-                word.x = left + word.x * scale_x;
-                word.y = top + word.y * scale_y;
-                word.width *= scale_x;
-                word.height *= scale_y;
-                word.line_y = top + word.line_y * scale_y;
-                word.line_height *= scale_y;
-                word
-            }));
-            if !result.text.is_empty() {
-                fallback.push(result.text);
+        image: &ExtractedImage,
+        source: &str,
+    ) -> Option<PageTextOverlay> {
+        let label = format!("{source} {}", image.label);
+        output::info(format!("OCR {label} (searchable layer)..."));
+        let result = match self.recognize_image(&image.bytes, &label) {
+            Ok(result) => result,
+            Err(error) => {
+                output::warn(format!("Failed to OCR {label}: {error:#}"));
+                return None;
             }
+        };
+        if result.words.is_empty() && result.text.trim().is_empty() {
+            return None;
         }
-        PageTextOverlay {
+        let (width, height) = (
+            f64::from(image.width.max(1)),
+            f64::from(image.height.max(1)),
+        );
+        Some(PageTextOverlay {
             page_id,
-            matrix: pdf::transform::upright_stamp_matrix(crop, 0.0, 0.0, 1.0, 1.0),
-            page_width,
-            page_height,
-            scaled_words: words,
-            fallback_text: (!fallback.is_empty()).then(|| fallback.join("\n\n")),
-        }
+            matrix: pdf_image::multiply(
+                [1.0 / width, 0.0, 0.0, 1.0 / height, 0.0, 0.0],
+                image.placement,
+            ),
+            width,
+            height,
+            words: result.words,
+            fallback_text: (!result.text.trim().is_empty()).then_some(result.text),
+        })
     }
 
     pub fn check_connection(&self) -> Result<()> {
@@ -604,10 +548,18 @@ impl OcrEngine {
             &key_parts,
             "md",
             label,
-            Some,
-            |text| Some(text.clone()),
+            |text| {
+                Some(VisionAnswer {
+                    text,
+                    complete: true,
+                })
+            },
+            // A cut-off answer is not kept: a larger ocr_max_tokens, or the
+            // next try, may give the whole text.
+            |answer| answer.complete.then(|| answer.text.clone()),
             || self.run_vision_uncached(&image),
         )
+        .map(|answer| answer.text)
     }
 
     /// Content-addressed cache around an OCR call. Concurrent requests for
@@ -647,8 +599,7 @@ impl OcrEngine {
 
         let value = compute()?;
         if let Some(data) = encode(&value)
-            && let Err(error) = fs::create_dir_all(cache_dir)
-                .map_err(anyhow::Error::from)
+            && let Err(error) = create_cache_dir(cache_dir)
                 .and_then(|()| atomic::write_atomic(&path, data.as_bytes()))
         {
             output::warn(format!(
@@ -663,7 +614,7 @@ impl OcrEngine {
         format!("Bearer {}", self.options.api_key)
     }
 
-    fn run_vision_uncached(&self, image: &[u8]) -> Result<String> {
+    fn run_vision_uncached(&self, image: &[u8]) -> Result<VisionAnswer> {
         self.ensure_api_key()?;
         let mime = match image::guess_format(image) {
             Ok(image::ImageFormat::Png) => "image/png",
@@ -755,20 +706,22 @@ impl OcrEngine {
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
                 .context("OCR API response has no choices[0].message.content")?;
-            let mut text = strip_think_blocks(content.trim());
+            let (mut text, mut complete) = strip_think_blocks(content.trim());
             if response
                 .pointer("/choices/0/finish_reason")
                 .and_then(Value::as_str)
                 == Some("length")
-                && !text.ends_with(TRUNCATION_NOTE)
             {
                 output::warn(format!(
                     "the OCR answer reached ocr_max_tokens ({}) and is cut off",
                     self.options.max_tokens
                 ));
-                text.push_str(TRUNCATION_NOTE);
+                if complete {
+                    text.push_str(TRUNCATION_NOTE);
+                }
+                complete = false;
             }
-            return Ok(text);
+            return Ok(VisionAnswer { text, complete });
         }
 
         bail!("OCR exceeded {MAX_ATTEMPTS} attempts")
@@ -786,18 +739,25 @@ impl OcrEngine {
 /// images of the pages still to recognise.
 struct TextJob {
     texts: BTreeMap<u32, String>,
-    images: Vec<(u32, ExtractedImage)>,
+    images: Vec<PendingImage>,
     is_pdf: bool,
+}
+
+/// An image to recognise for the text of page `page`.
+struct PendingImage {
+    page: u32,
+    label: String,
+    bytes: Vec<u8>,
 }
 
 impl TextJob {
     /// Pages in order, recognised text replacing the page's own.
     fn finish(mut self, recognised: Vec<Result<OcrPageResult>>, path: &Path) -> Result<String> {
         let mut first_error = None;
-        for ((number, image), result) in self.images.iter().zip(recognised) {
+        for (image, result) in self.images.iter().zip(recognised) {
             match result {
                 Ok(result) if !result.text.trim().is_empty() => {
-                    self.texts.insert(*number, result.text.trim().to_owned());
+                    self.texts.insert(image.page, result.text.trim().to_owned());
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -854,21 +814,6 @@ fn has_text_layer(document: &Document, page_id: lopdf::ObjectId, text: &str) -> 
             .any(|name| name.starts_with(OCR_FONT_NAME.as_bytes()))
     });
     has_bpdf_layer || has_enough_text(text)
-}
-
-/// Where an image covers the displayed page, as `[left, top, width, height]`
-/// in points from its top-left corner; `bounds` are in user space.
-fn displayed_area(crop: PageGeometry, [left, bottom, right, top]: [f64; 4]) -> [f64; 4] {
-    let corners = [(left, bottom), (right, top)].map(|(x, y)| crop.page_to_display(x, y));
-    let (x0, x1) = (
-        corners[0].0.min(corners[1].0),
-        corners[0].0.max(corners[1].0),
-    );
-    let (y0, y1) = (
-        corners[0].1.min(corners[1].1),
-        corners[0].1.max(corners[1].1),
-    );
-    [x0, crop.display_height() - y1, x1 - x0, y1 - y0]
 }
 
 fn has_enough_text(text: &str) -> bool {
@@ -934,21 +879,42 @@ fn retry_after(header: Option<&str>, body: &str, attempt: usize) -> Duration {
     Duration::from_secs_f64(seconds.max(0.1)).min(MAX_RETRY_WAIT)
 }
 
-fn strip_think_blocks(content: &str) -> String {
+/// The answer without reasoning blocks, and whether it is complete: an
+/// unclosed block means the answer was cut off inside it.
+fn strip_think_blocks(content: &str) -> (String, bool) {
     let mut content = content.to_owned();
     loop {
         let Some(start) = content.find("<think>") else {
-            return content;
+            return (content, true);
         };
         let Some(relative_end) = content[start..].find("</think>") else {
             content.truncate(start);
             content.push_str(TRUNCATION_NOTE);
-            return content;
+            return (content, false);
         };
         let end = start + relative_end + "</think>".len();
         content.replace_range(start..end, "");
         content = content.trim().to_owned();
     }
+}
+
+/// Text of a vision model; an incomplete one was cut off by the token limit.
+#[derive(Debug)]
+struct VisionAnswer {
+    text: String,
+    complete: bool,
+}
+
+/// Create the OCR cache directory, private to the user where the platform
+/// has file modes.
+pub fn create_cache_dir(directory: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(directory)
+        .with_context(|| format!("failed to create {}", directory.display()))
 }
 
 /// Appended to an OCR answer cut off by the token limit.
@@ -982,31 +948,6 @@ mod tests {
         );
         assert_eq!("winocr".parse::<OcrBackend>().unwrap(), OcrBackend::Windows);
         assert!("tesseract".parse::<OcrBackend>().is_err());
-    }
-
-    #[test]
-    fn image_areas_follow_page_rotation() {
-        let crop = PageGeometry {
-            left: 0.0,
-            bottom: 0.0,
-            right: 600.0,
-            top: 800.0,
-            rotation: 0,
-        };
-        // Lower half of an upright page.
-        assert_eq!(
-            displayed_area(crop, [0.0, 0.0, 600.0, 400.0]),
-            [0.0, 400.0, 600.0, 400.0]
-        );
-        // Turned a quarter: the page shows 800 wide and 600 high.
-        let turned = PageGeometry {
-            rotation: 90,
-            ..crop
-        };
-        assert_eq!(
-            displayed_area(turned, [0.0, 0.0, 600.0, 400.0]),
-            [0.0, 0.0, 400.0, 600.0]
-        );
     }
 
     #[test]
@@ -1046,9 +987,10 @@ mod tests {
     fn removes_thinking_blocks() {
         assert_eq!(
             strip_think_blocks("<think>hidden</think>\nanswer"),
-            "answer"
+            ("answer".to_owned(), true)
         );
-        assert!(strip_think_blocks("<think>cut").ends_with(TRUNCATION_NOTE));
+        let (text, complete) = strip_think_blocks("<think>cut");
+        assert!(text.ends_with(TRUNCATION_NOTE) && !complete);
     }
 
     #[test]
@@ -1063,7 +1005,7 @@ mod tests {
     fn winocr_cache_round_trips_word_boxes() {
         let result = OcrPageResult {
             text: "Слово".to_owned(),
-            words: vec![OcrWordBox {
+            words: vec![crate::winocr::OcrWordBox {
                 text: "Слово".to_owned(),
                 x: 1.0,
                 y: 2.0,
@@ -1072,14 +1014,16 @@ mod tests {
                 line_y: 2.0,
                 line_height: 4.0,
             }],
-            image_width: 10,
-            image_height: 20,
         };
         let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"width\":10"));
         let parsed: OcrPageResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.words[0].line_height, 4.0);
-        assert_eq!((parsed.image_width, parsed.image_height), (10, 20));
+        // Entries written before the image size was dropped still load.
+        let old = r#"{"text":"x","words":[],"width":10,"height":20}"#;
+        assert_eq!(
+            serde_json::from_str::<OcrPageResult>(old).unwrap().text,
+            "x"
+        );
     }
 
     #[test]

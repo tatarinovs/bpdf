@@ -492,6 +492,12 @@ fn page_document(source: &Document, page_id: ObjectId) -> Result<Document> {
     if let Some(info) = &mut info {
         copier.remap(info);
     }
+    // A protected source gives protected pages: same passwords and
+    // restrictions (older revisions derive their keys from the identifier).
+    target.encryption_state = source.encryption_state.clone();
+    if let Ok(id) = source.trailer.get(b"ID") {
+        target.trailer.set("ID", id.clone());
+    }
 
     while let Some((old_id, new_id)) = copier.queue.pop() {
         let mut object = source.get_object(old_id)?.clone();
@@ -783,6 +789,7 @@ fn oriented_image_matrix(orientation: u16, rect: &ImagePlacement) -> [f64; 6] {
 
 /// A one-page document showing the JPEG; with `PageSize::Fit` the page takes
 /// the image size at the resolution recorded in the JPEG.
+#[cfg(test)]
 pub(crate) fn jpeg_document(jpeg: Vec<u8>, page_size: PageSize) -> Result<Document> {
     jpeg_document_at(jpeg, page_size, None)
 }
@@ -1149,6 +1156,21 @@ mod tests {
         let unlocked = Document::load_mem(&save_to_bytes(&mut unlocked).unwrap()).unwrap();
         assert!(!unlocked.was_encrypted());
         assert!(unlocked.trailer.get(b"Encrypt").is_err());
+    }
+
+    #[test]
+    fn split_pages_keep_the_protection_of_the_source() {
+        let restrictions = Restrictions {
+            print: true,
+            ..Restrictions::default()
+        };
+        let file = protected_file("", "owner", restrictions);
+        let output = tempfile::tempdir().unwrap();
+        let pages = split_file(file.path(), output.path(), false).unwrap();
+        let page = Document::load(&pages[0]).unwrap();
+        let state = page.encryption_state.as_ref().unwrap();
+        assert!(!state.permissions().contains(Permissions::PRINTABLE));
+        assert!(load_with_password(&pages[0], Some("owner")).is_ok());
     }
 
     #[test]

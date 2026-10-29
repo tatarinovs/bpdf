@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::common::{
     DOCUMENT_SEPARATOR, batch, finish_batch, handle_results, join_numbers, reject_output_collision,
     same_path, suffixed_output, write_output,
 };
-use super::optimize_document;
+use super::optimize_options;
 use crate::cli::MergeArgs;
 use crate::config::Config;
 use crate::fileset::{InputSpec, expand};
@@ -27,6 +27,12 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
 
     if should_merge_as_text(&specs, &output) {
         return merge_text(&specs, &output, fail_fast);
+    }
+    if !formats::has_extension(&output, "pdf") {
+        bail!(
+            "{} is not a .pdf file; only text files are merged into a text file",
+            output.display()
+        );
     }
 
     let page_size = args.size.unwrap_or(config.page_size);
@@ -121,19 +127,20 @@ pub fn run(args: MergeArgs, config: &Config, fail_fast: bool) -> Result<()> {
         output::info(format!("Resizing pages to {page_size}..."));
         transform::resize_pages(&mut document, page_size.sheet(), "all")?;
     }
-    if MergeArgs::switch(args.optimize, args.no_optimize, config.optimize) {
-        output::info("Optimizing document...");
-        optimize_document(&mut document, config.image_dpi, config.jpeg_quality, false);
-    }
     if MergeArgs::switch(args.strip_meta, args.no_strip_meta, config.strip_metadata) {
         output::info("Stripping document metadata...");
         pdf::strip_document_metadata(&mut document);
     }
     transform::set_info_properties(&mut document, &config.author, &config.creator)?;
 
+    let optimize = MergeArgs::switch(args.optimize, args.no_optimize, config.optimize)
+        .then(|| optimize_options(config, false));
+    if optimize.is_some() {
+        output::info("Optimizing document...");
+    }
     write_output(
         &output,
-        &super::pdf_bytes(document, config, args.max_size, false)?,
+        &super::pdf_bytes(document, config, optimize, args.max_size)?,
     )?;
     finish_batch("merge", specs.len(), failures, 1)
 }

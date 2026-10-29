@@ -119,10 +119,7 @@ fn drawn_images(document: &Document, page_id: ObjectId) -> Option<Vec<ObjectId>>
 
 fn image_is_blank(document: &Document, id: ObjectId) -> Result<bool> {
     let stream = document.get_object(id)?.as_stream()?;
-    let image = match pdf_image::embedded_jpeg(stream) {
-        Some(jpeg) => crate::imageconv::decode_bytes(jpeg)?,
-        None => pdf_image::decode(document, stream)?,
-    };
+    let image = pdf_image::decode(document, stream)?;
     let thumbnail = image.thumbnail(THUMBNAIL_EDGE, THUMBNAIL_EDGE).to_luma8();
     Ok(is_plain_sheet(&image::DynamicImage::ImageLuma8(thumbnail)))
 }

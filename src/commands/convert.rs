@@ -184,18 +184,20 @@ impl Converter<'_> {
 
     fn convert_pdf(&self, input: &Path, pages: Option<&str>) -> Result<usize> {
         let mut document = pdf::load(input)?;
+        let page_ids = document.get_pages();
+        let numbers = pdf::parse_page_selection(pages.unwrap_or("all"), page_ids.len())?
+            .into_iter()
+            .collect::<Vec<_>>();
         // Pages with fonts carry vector text that image extraction would lose.
-        let has_text = document.get_pages().values().any(|page_id| {
-            document
-                .get_page_fonts(*page_id)
-                .is_ok_and(|fonts| !fonts.is_empty())
+        let has_text = numbers.iter().any(|number| {
+            page_ids.get(&(*number as u32)).is_some_and(|page_id| {
+                document
+                    .get_page_fonts(*page_id)
+                    .is_ok_and(|fonts| !fonts.is_empty())
+            })
         });
         if self.render || has_text {
             output::info(format!("Rendering PDF pages to JPEG: {}", input.display()));
-            let numbers =
-                pdf::parse_page_selection(pages.unwrap_or("all"), document.get_pages().len())?
-                    .into_iter()
-                    .collect::<Vec<_>>();
             let rendered =
                 crate::winpdf::render_pdf_to_jpegs(input, &numbers, &self.image_options)?
                     .into_iter()

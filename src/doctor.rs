@@ -74,15 +74,17 @@ pub fn run(config: &Config) -> Result<()> {
         Err(error) => report.check("font", Status::Fail, format!("{error:#}")),
     }
 
-    if config.ocr_cache {
-        match probe_cache(&config.ocr_cache_dir) {
-            Ok(()) => report.check(
-                "ocr_cache",
-                Status::Ok,
-                config.ocr_cache_dir.display().to_string(),
-            ),
+    match config.active_ocr_cache_dir() {
+        Some(directory) => match probe_cache(directory) {
+            Ok(()) => report.check("ocr_cache", Status::Ok, directory.display().to_string()),
             Err(error) => report.check("ocr_cache", Status::Fail, format!("{error:#}")),
-        }
+        },
+        None if config.ocr_cache => report.check(
+            "ocr_cache",
+            Status::Warn,
+            "no user cache directory is known; set ocr_cache_dir",
+        ),
+        None => {}
     }
 
     let ffmpeg = probe_command(&config.ffmpeg, &["-version"]);
@@ -220,7 +222,7 @@ fn probe_command(program: &Path, args: &[&str]) -> bool {
 }
 
 fn probe_cache(directory: &Path) -> Result<()> {
-    fs::create_dir_all(directory)?;
+    crate::ocr::create_cache_dir(directory)?;
     let path = directory.join(format!(".doctor-{}.tmp", std::process::id()));
     fs::write(&path, b"bpdf")?;
     fs::remove_file(path)?;
