@@ -15,8 +15,10 @@ const MAX_UPSCALE: f64 = 3.0;
 /// the enlarged image.
 const UNSHARP_SIGMA: f32 = 1.5;
 /// Share of the recognised characters in plausible words above which the
-/// upright reading is kept without trying the other orientations.
-const UPRIGHT_PLAUSIBILITY: f64 = 0.6;
+/// upright reading is kept without trying the other orientations. Text
+/// read upside down still scores up to about 0.6 (short Cyrillic "words"
+/// with vowels), real pages from about 0.66.
+const UPRIGHT_PLAUSIBILITY: f64 = 0.7;
 /// Characters in plausible words below which the other orientations are
 /// tried as well: a sideways page often yields a few short "words" only.
 const MIN_PLAUSIBLE: usize = 200;
@@ -231,7 +233,7 @@ fn recognize(
             min_y = min_y.min(y);
             max_bottom = max_bottom.max(y + height);
             words.push(OcrWordBox {
-                text: word.Text()?.to_string(),
+                text: correct_text(&word.Text()?.to_string()),
                 x,
                 y,
                 width: f64::from(rect.Width) * scale.0,
@@ -248,7 +250,7 @@ fn recognize(
             word.line_height = max_bottom - min_y;
         }
         lines.push(OcrLine {
-            text: line.Text()?.to_string(),
+            text: correct_text(&line.Text()?.to_string()),
             x: min_x,
             y: min_y,
             height: max_bottom - min_y,
@@ -384,6 +386,194 @@ fn layout_text(mut lines: Vec<OcrLine>) -> String {
         .join("\n")
 }
 
+/// Common misreadings fixed in every word of `text`: the number sign read
+/// as "NQ", letters that look like digits inside numbers ("6О722О"), and
+/// Latin letters inside Russian words or digits inside Latin ones.
+fn correct_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut token = Vec::new();
+    for character in text.chars().chain(std::iter::once(' ')) {
+        if character.is_whitespace() {
+            if !token.is_empty() {
+                fix_number_sign(&mut token);
+                fix_digits(&mut token);
+                fix_scripts(&mut token);
+                result.extend(token.drain(..));
+            }
+            result.push(character);
+        } else {
+            token.push(character);
+        }
+    }
+    result.pop();
+    result
+}
+
+/// "NQ", "N°" before a number or on their own, and "N9" before a long
+/// number (a document number, not a code like "N95"), are the sign "№".
+fn fix_number_sign(token: &mut Vec<char>) {
+    let digits_after = token
+        .iter()
+        .skip(2)
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let sign = match token.get(..2) {
+        Some(['N', 'Q' | 'g' | '°' | 'º']) => token.len() == 2 || digits_after > 0,
+        Some(['N', '9']) => digits_after >= 3,
+        _ => false,
+    };
+    if sign {
+        token.splice(0..2, ['№']);
+    }
+}
+
+/// The digit a letter in a number was misread for.
+fn digit_lookalike(character: char) -> Option<char> {
+    match character {
+        'О' | 'о' | 'O' | 'o' => Some('0'),
+        'З' | 'з' => Some('3'),
+        'Б' | 'б' => Some('6'),
+        'I' | 'l' => Some('1'),
+        _ => None,
+    }
+}
+
+fn is_separator(character: char) -> bool {
+    ".,/-:".contains(character)
+}
+
+/// Letters inside a number become digits. A number is a run of digits,
+/// lookalike letters and separators that is not glued to other letters
+/// and has at least two digits and no fewer digits than lookalikes.
+fn fix_digits(token: &mut [char]) {
+    let in_number = |c: char| c.is_ascii_digit() || digit_lookalike(c).is_some() || is_separator(c);
+    let mut start = 0;
+    while start < token.len() {
+        if !in_number(token[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < token.len() && in_number(token[end]) {
+            end += 1;
+        }
+        // Separators at the edges belong to the surrounding text.
+        let (mut first, mut last) = (start, end);
+        while first < last && is_separator(token[first]) {
+            first += 1;
+        }
+        while last > first && is_separator(token[last - 1]) {
+            last -= 1;
+        }
+        let run = &token[first..last];
+        let digits = run.iter().filter(|c| c.is_ascii_digit()).count();
+        let lookalikes = run
+            .iter()
+            .filter(|&&c| digit_lookalike(c).is_some())
+            .count();
+        let glued_before = first > 0 && token[first - 1].is_alphabetic();
+        let glued_after = last < token.len() && token[last].is_alphabetic();
+        if lookalikes > 0 && digits >= 2 && digits >= lookalikes && !glued_before && !glued_after {
+            for character in &mut token[first..last] {
+                if let Some(digit) = digit_lookalike(*character) {
+                    *character = digit;
+                }
+            }
+        }
+        start = end;
+    }
+}
+
+/// Cyrillic letters and the Latin ones drawn the same.
+const HOMOGLYPHS: [(char, char); 18] = [
+    ('А', 'A'),
+    ('В', 'B'),
+    ('Е', 'E'),
+    ('К', 'K'),
+    ('М', 'M'),
+    ('Н', 'H'),
+    ('О', 'O'),
+    ('Р', 'P'),
+    ('С', 'C'),
+    ('Т', 'T'),
+    ('Х', 'X'),
+    ('а', 'a'),
+    ('е', 'e'),
+    ('о', 'o'),
+    ('р', 'p'),
+    ('с', 'c'),
+    ('у', 'y'),
+    ('х', 'x'),
+];
+
+fn is_cyrillic(character: char) -> bool {
+    ('\u{400}'..='\u{4ff}').contains(&character)
+}
+
+/// In a word with letters of both scripts, the lookalike letters of the
+/// rarer script become the other's; zeros (and ones, in Latin) between
+/// the letters of a word without other digits become letters.
+fn fix_scripts(token: &mut [char]) {
+    let cyrillic = token.iter().filter(|&&c| is_cyrillic(c)).count();
+    let latin = token.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    let to_cyrillic = cyrillic > latin;
+    if cyrillic > 0 && latin > 0 && cyrillic != latin {
+        for character in token.iter_mut() {
+            let swapped = HOMOGLYPHS.iter().find_map(|&(cyr, lat)| match to_cyrillic {
+                true if *character == lat => Some(cyr),
+                false if *character == cyr => Some(lat),
+                _ => None,
+            });
+            if let Some(letter) = swapped {
+                *character = letter;
+            }
+        }
+    }
+    if cyrillic.max(latin) < 3
+        || token
+            .iter()
+            .any(|c| c.is_ascii_digit() && !"01".contains(*c))
+    {
+        return;
+    }
+    let replacement = |digit: char, upper: bool| match (digit, to_cyrillic, upper) {
+        ('0', true, true) => Some('О'),
+        ('0', true, false) => Some('о'),
+        ('0', false, true) => Some('O'),
+        ('0', false, false) => Some('o'),
+        ('1', false, true) => Some('I'),
+        ('1', false, false) => Some('l'),
+        _ => None,
+    };
+    let mut start = 0;
+    while start < token.len() {
+        if !"01".contains(token[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < token.len() && "01".contains(token[end]) {
+            end += 1;
+        }
+        if start > 0
+            && end < token.len()
+            && token[start - 1].is_alphabetic()
+            && token[end].is_alphabetic()
+        {
+            let upper = token[start - 1].is_uppercase() && token[end].is_uppercase();
+            if token[start..end]
+                .iter()
+                .all(|&c| replacement(c, upper).is_some())
+            {
+                for character in &mut token[start..end] {
+                    *character = replacement(*character, upper).unwrap_or(*character);
+                }
+            }
+        }
+        start = end;
+    }
+}
+
 /// Characters in plausible words, and all characters but spaces. A word is
 /// plausible when it is a number, or at least three letters of one script
 /// with a vowel; a page read in the wrong orientation gives few of them.
@@ -442,6 +632,30 @@ mod tests {
         assert!(score as f64 > UPRIGHT_PLAUSIBILITY * total as f64);
         let (score, total) = plausibility("dlil 'lil “llF о о [00L09GZG/t8889L9sas");
         assert!((score as f64) < UPRIGHT_PLAUSIBILITY / 2.0 * total as f64);
+    }
+
+    #[test]
+    fn corrects_common_misreadings() {
+        let cases = [
+            ("NQ5328 от 12.01.2026г", "№5328 от 12.01.2026г"),
+            ("форма NQ КО-2", "форма № КО-2"),
+            ("N9260820009", "№260820009"),
+            ("АМЗ\".6О722О", "АМЗ\".607220"),
+            ("11.О8.202Б", "11.08.2026"),
+            ("093,oo руб.", "093,00 руб."),
+            ("КросМетН,б03О74", "КросМетН,603074"),
+            ("ВМЕТАЛЛТРАНСOЙЛ", "ВМЕТАЛЛТРАНСОЙЛ"),
+            ("A1uminium V01gograd", "Aluminium Volgograd"),
+            // Left alone: real words, sizes, short and mixed codes.
+            (
+                "ООО ТК 10х500х1000 ЛС59-1 б/н ГОСТ1583-93",
+                "ООО ТК 10х500х1000 ЛС59-1 б/н ГОСТ1583-93",
+            ),
+            ("Noise No.5 N95", "Noise No.5 N95"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(correct_text(input), expected, "{input}");
+        }
     }
 
     #[test]
